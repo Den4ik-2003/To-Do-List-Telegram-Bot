@@ -1,0 +1,9 @@
+aiogram==3.20.0
+aiohttp==3.11.11
+motor
+pymongo
+matplotlib
+openpyxl
+reportlab
+pandas
+python-dotenv
