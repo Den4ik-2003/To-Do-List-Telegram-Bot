@@ -61,10 +61,6 @@ def init_mongo():
     auth_col = db["auth"]
     counters_col = db["counters"]
 
-# ---------------------------------------------------------------------------
-# Довідники: мітки (колір/терміновість), категорії
-# ---------------------------------------------------------------------------
-
 LABELS = {
     "urgent":   {"emoji": "🔴", "name": "Терміново"},
     "medium":   {"emoji": "🟡", "name": "Середньо"},
@@ -211,7 +207,6 @@ def is_today(due_str: str) -> bool:
     return bool(dt and dt.date() == datetime.now().date())
 
 def is_missed(t: dict) -> bool:
-    """Задача вже минула свій час і ще не виконана (перевіряється в реальному часі)."""
     if t.get("status") != STATUS_PENDING:
         return False
     due = parse_due(t.get("due", ""))
@@ -240,7 +235,6 @@ def time_remaining_str(due_dt: datetime) -> str:
     return f"⚫ Через {days} дн."
 
 def level_progress(xp: int):
-    """Повертає (рівень, xp у поточному рівні, xp потрібно для наступного)."""
     level = 1
     total = 0
     threshold = 100
@@ -580,10 +574,6 @@ async def check_password(msg: Message, state: FSMContext):
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
 
-# ---------------------------------------------------------------------------
-# Створення завдання
-# ---------------------------------------------------------------------------
-
 @dp.message(F.text == "➕ Нове завдання")
 async def new_task_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -708,10 +698,6 @@ async def at_time(msg: Message, state: FSMContext):
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
         return
     await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(saved)}", reply_markup=kb_main())
-
-# ---------------------------------------------------------------------------
-# Списки завдань
-# ---------------------------------------------------------------------------
 
 @dp.message(F.text == "📋 Сьогодні")
 async def today_tasks(msg: Message, state: FSMContext):
@@ -1126,10 +1112,6 @@ async def edit_field_save(msg: Message, state: FSMContext):
     else:
         await msg.answer("Завдання не знайдено.", reply_markup=kb_main())
 
-# ---------------------------------------------------------------------------
-# Серія, архів, підсумок дня, dashboard, експорт
-# ---------------------------------------------------------------------------
-
 @dp.message(F.text == "🔥 Серія")
 async def streak_view(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -1291,12 +1273,7 @@ async def archive_clear_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-# ---------------------------------------------------------------------------
-# Фонові задачі: нагадування перед часом, "перенос" тільки після півночі
-# ---------------------------------------------------------------------------
-
 async def reminder_task():
-    """Кожні 30с перевіряє, чи не час надіслати нагадування ДО настання due."""
     while True:
         await asyncio.sleep(30)
         try:
@@ -1324,7 +1301,6 @@ async def reminder_task():
             logger.exception("reminder_task loop failed")
 
 async def midnight_rollover_task():
-    """Раз на добу (після півночі) питає про перенесення того, що не встигли зробити за день."""
     while True:
         now = datetime.now()
         target = now.replace(hour=0, minute=1, second=0, microsecond=0)
@@ -1402,12 +1378,8 @@ async def daily_job_task():
 
 from aiohttp import web
 
-async def health(request):
-    try:
-        await mongo_client.admin.command("ping")
-        return web.Response(text="OK")
-    except Exception:
-        return web.Response(text="DB_DOWN", status=503)
+async def ping(request):
+    return web.Response(status=204)
 
 async def main():
     init_mongo()
@@ -1420,7 +1392,7 @@ async def main():
     await load_authorized_uids()
 
     app = web.Application()
-    app.router.add_get("/", health)
+    app.router.add_get("/", ping)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
