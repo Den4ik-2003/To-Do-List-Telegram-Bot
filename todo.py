@@ -41,11 +41,12 @@ db = None
 tasks_col = None
 users_col = None
 auth_col = None
+counters_col = None
 
 authorized_uids: set[int] = set()
 
 def init_mongo():
-    global mongo_client, db, tasks_col, users_col, auth_col
+    global mongo_client, db, tasks_col, users_col, auth_col, counters_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=8000,
@@ -58,6 +59,7 @@ def init_mongo():
     tasks_col = db["tasks"]
     users_col = db["users"]
     auth_col = db["auth"]
+    counters_col = db["counters"]
 
 PRIORITIES = ["high", "medium", "low"]
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -131,8 +133,15 @@ async def save_user_state(uid: int, fields: dict):
     await db_call(users_col.update_one({"uid": uid}, {"$set": fields}, upsert=True))
 
 async def next_task_id() -> int:
-    doc = await db_call(tasks_col.find_one(sort=[("id", -1)]))
-    return (doc["id"] + 1) if doc else 1
+    doc = await db_call(
+        counters_col.find_one_and_update(
+            {"_id": "task_id"},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=True,
+        )
+    )
+    return doc["seq"]
 
 async def add_task(task: dict):
     await db_call(tasks_col.insert_one(task))
@@ -975,9 +984,9 @@ async def daily_job_task():
                     for tid in postponed_ids:
                         await update_task(tid, {"postponed_today": False})
 
-                    if now.day == 1:
+                    if target.day == 1:
                         state = await get_user_state(uid)
-                        month_key = now.strftime("%Y-%m")
+                        month_key = target.strftime("%Y-%m")
                         if state.get("archive_prompt_month") != month_key:
                             done_count = len(await get_user_tasks(uid, statuses=[STATUS_DONE]))
                             if done_count > 0:
