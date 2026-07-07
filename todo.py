@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -28,15 +28,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tasks_bot")
 
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_PASSWORD = os.environ["BOT_PASSWORD"]
-MONGO_URI    = os.environ["MONGO_URI"]
+MONGO_URI = os.environ["MONGO_URI"]
 
-# коли надсилати нагадування заздалегідь (хв до дедлайну)
 REMINDER_BEFORE_MINUTES = int(os.environ.get("REMINDER_BEFORE_MINUTES", "10"))
-# скільки хвилин чекати після дедлайну, перш ніж вважати завдання пропущеним
 OVERDUE_GRACE_MINUTES = int(os.environ.get("OVERDUE_GRACE_MINUTES", "15"))
-# коли надсилати щоденний підсумок і оновлювати серію (гг:хх)
 DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "21:00")
 
 mongo_client: AsyncIOMotorClient | None = None
@@ -45,13 +42,15 @@ tasks_col = None
 users_col = None
 auth_col = None
 
+authorized_uids: set[int] = set()
+
 def init_mongo():
     global mongo_client, db, tasks_col, users_col, auth_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=5000,
-        socketTimeoutMS=10000,
+        serverSelectionTimeoutMS=8000,
+        connectTimeoutMS=8000,
+        socketTimeoutMS=15000,
         maxPoolSize=20,
         retryWrites=True,
     )
@@ -65,9 +64,9 @@ PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 PRIORITY_LABEL = {"high": "Високий", "medium": "Середній", "low": "Низький"}
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
-STATUS_PENDING = "pending"   # ще не настав дедлайн (або настав, але грейс-період не вийшов)
-STATUS_OVERDUE = "overdue"   # прострочено, чекає рішення користувача
-STATUS_DONE    = "done"
+STATUS_PENDING = "pending"
+STATUS_OVERDUE = "overdue"
+STATUS_DONE = "done"
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
 
@@ -76,28 +75,46 @@ MONTHS_UA = [
     "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень",
 ]
 
-async def db_call(coro, default=None):
-    try:
-        return await coro
-    except PyMongoError:
-        logger.exception("MongoDB error")
-        return default
-
-# ---------- auth ----------
+async def db_call(coro, default=None, retries=2):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return await coro
+        except PyMongoError as e:
+            last_exc = e
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+                continue
+    logger.exception("MongoDB error: %s", last_exc)
+    return default
 
 async def is_authorized(uid: int) -> bool:
+    if uid in authorized_uids:
+        return True
     doc = await db_call(auth_col.find_one({"uid": uid}))
-    return doc is not None
+    if doc is not None:
+        authorized_uids.add(uid)
+        return True
+    return False
 
 async def authorize(uid: int):
+    authorized_uids.add(uid)
     await db_call(auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True))
 
+async def load_authorized_uids():
+    cursor = auth_col.find({}, {"_id": 0, "uid": 1})
+    docs = await db_call(cursor.to_list(length=None), default=[]) or []
+    for d in docs:
+        if "uid" in d:
+            authorized_uids.add(d["uid"])
+    logger.info("Loaded %d authorized users into cache", len(authorized_uids))
+
 async def get_all_uids() -> list:
+    if authorized_uids:
+        return list(authorized_uids)
     cursor = auth_col.find({}, {"_id": 0, "uid": 1})
     docs = await db_call(cursor.to_list(length=None), default=[]) or []
     return [d["uid"] for d in docs if "uid" in d]
-
-# ---------- user state (streak, archive prompt) ----------
 
 async def get_user_state(uid: int) -> dict:
     doc = await db_call(users_col.find_one({"uid": uid}))
@@ -107,8 +124,6 @@ async def get_user_state(uid: int) -> dict:
 
 async def save_user_state(uid: int, fields: dict):
     await db_call(users_col.update_one({"uid": uid}, {"$set": fields}, upsert=True))
-
-# ---------- tasks CRUD ----------
 
 async def next_task_id() -> int:
     doc = await db_call(tasks_col.find_one(sort=[("id", -1)]))
@@ -144,8 +159,6 @@ def sort_tasks_by_priority_then_due(tasks: list) -> list:
         return (PRIORITY_ORDER.get(t.get("priority", "low"), 2), t.get("due", ""))
     return sorted(tasks, key=key)
 
-# ---------- date/time helpers ----------
-
 def parse_due(due_str: str) -> datetime | None:
     try:
         return datetime.strptime(due_str, "%d.%m.%Y %H:%M")
@@ -158,8 +171,6 @@ def fmt_due(dt: datetime) -> str:
 def is_today(due_str: str) -> bool:
     dt = parse_due(due_str)
     return bool(dt and dt.date() == datetime.now().date())
-
-# ---------- rendering ----------
 
 def fmt_task(t: dict, short: bool = False) -> str:
     pe = PRIORITY_EMOJI.get(t.get("priority", "low"), "")
@@ -188,13 +199,11 @@ def build_task_list_text(tasks: list, title: str) -> str:
         lines.append(f"{status_icon} {pe} №{t['id']} — {t.get('due','')[-5:]} {t.get('text','')[:40]}")
     return "\n".join(lines)
 
-# ---------- streak & stats ----------
-
 async def compute_daily_stats(uid: int) -> dict:
     today_str = datetime.now().strftime("%d.%m.%Y")
     tasks = await get_user_tasks(uid)
     done_today, missed_today, postponed_today = [], [], 0
-    longest = None  # (seconds, text)
+    longest = None
     for t in tasks:
         due = t.get("due", "")
         if not due.startswith(today_str):
@@ -249,31 +258,24 @@ async def get_streak(uid: int) -> int:
     state = await get_user_state(uid)
     return state.get("streak", 0)
 
-# ---------- FSM states ----------
-
 class Auth(StatesGroup):
     waiting_password = State()
 
 class AddTask(StatesGroup):
-    text     = State()
+    text = State()
     priority = State()
-    date     = State()
+    date = State()
     date_manual = State()
-    time     = State()
+    time = State()
 
 class EditField(StatesGroup):
     typing = State()
 
-class ArchiveClear(StatesGroup):
-    pass
-
-# ---------- keyboards ----------
-
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Нове завдання"), KeyboardButton(text="📋 Сьогодні")],
-        [KeyboardButton(text="📆 Всі активні"),   KeyboardButton(text="🔥 Серія")],
-        [KeyboardButton(text="📦 Архів"),         KeyboardButton(text="📖 Підсумок дня")],
+        [KeyboardButton(text="📆 Всі активні"), KeyboardButton(text="🔥 Серія")],
+        [KeyboardButton(text="📦 Архів"), KeyboardButton(text="📖 Підсумок дня")],
         [KeyboardButton(text="📤 Експорт CSV")],
     ], resize_keyboard=True)
 
@@ -358,7 +360,7 @@ def ikb_archive_clear() -> InlineKeyboardMarkup:
     ])
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-dp  = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=MemoryStorage())
 
 user_list_cache: dict = {}
 
@@ -394,8 +396,6 @@ async def check_password(msg: Message, state: FSMContext):
         await msg.answer("✅ *Пароль вірний! Ласкаво просимо.*\n\nОбери дію:", reply_markup=kb_main())
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
-
-# ---------- add task flow ----------
 
 @dp.message(F.text == "➕ Нове завдання")
 async def new_task_start(msg: Message, state: FSMContext):
@@ -477,30 +477,27 @@ async def at_time(msg: Message, state: FSMContext):
 
     created_at = datetime.now().isoformat()
     task = {
-        "id":               await next_task_id(),
-        "uid":              msg.from_user.id,
-        "text":             fd["text"],
-        "priority":         fd["priority"],
-        "due":              fmt_due(due_dt),
-        "status":           STATUS_PENDING,
-        "created_at":       created_at,
-        "completed_at":     None,
-        "reminded_before":  False,
+        "id": await next_task_id(),
+        "uid": msg.from_user.id,
+        "text": fd["text"],
+        "priority": fd["priority"],
+        "due": fmt_due(due_dt),
+        "status": STATUS_PENDING,
+        "created_at": created_at,
+        "completed_at": None,
+        "reminded_before": False,
         "overdue_notified": False,
-        "missed_flagged":   False,
-        "postponed_count":  0,
-        "postponed_today":  False,
+        "missed_flagged": False,
+        "postponed_count": 0,
+        "postponed_today": False,
     }
     if due_dt <= datetime.now():
-        # дедлайн вже минув на момент створення — одразу вважаємо простроченим
         task["status"] = STATUS_OVERDUE
         task["overdue_notified"] = True
         task["missed_flagged"] = True
 
     await add_task(task)
     await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(task)}", reply_markup=kb_main())
-
-# ---------- task list views ----------
 
 @dp.message(F.text == "📋 Сьогодні")
 async def today_tasks(msg: Message, state: FSMContext):
@@ -587,8 +584,6 @@ async def view_task(cb: CallbackQuery):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
-
-# ---------- task actions ----------
 
 @dp.callback_query(F.data.startswith("done:"))
 async def task_done(cb: CallbackQuery):
@@ -760,8 +755,6 @@ async def edit_field_save(msg: Message, state: FSMContext):
     else:
         await msg.answer("Завдання не знайдено.", reply_markup=kb_main())
 
-# ---------- streak ----------
-
 @dp.message(F.text == "🔥 Серія")
 async def streak_view(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -772,8 +765,6 @@ async def streak_view(msg: Message, state: FSMContext):
         "без пропущених завдань" if streak > 0 else "почни виконувати завдання без пропусків!",
     ]
     await msg.answer("\n".join(lines), reply_markup=kb_main())
-
-# ---------- archive ----------
 
 @dp.message(F.text == "📦 Архів")
 async def archive_view(msg: Message, state: FSMContext):
@@ -798,8 +789,6 @@ async def archive_view(msg: Message, state: FSMContext):
         lines.append("")
     await msg.answer("\n".join(lines).strip(), reply_markup=kb_main())
 
-# ---------- daily summary (on demand) ----------
-
 @dp.message(F.text == "📖 Підсумок дня")
 async def summary_on_demand(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -823,8 +812,6 @@ def build_daily_summary_text(stats: dict, streak: int) -> str:
         lines.append(f"↪️ Перенесено на пізніше\n{stats['postponed_count']} задач")
     return "\n".join(lines)
 
-# ---------- export ----------
-
 @dp.message(F.text == "📤 Експорт CSV")
 async def export_csv(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -844,8 +831,6 @@ async def export_csv(msg: Message, state: FSMContext):
         BufferedInputFile(csv_bytes, filename=filename),
         caption=f"📤 Експорт: *{len(tasks)}* завдань\n_{datetime.now().strftime('%d.%m.%Y %H:%M')}_"
     )
-
-# ---------- monthly archive cleanup ----------
 
 @dp.callback_query(F.data.startswith("archclr:"))
 async def archive_clear_cb(cb: CallbackQuery):
@@ -867,10 +852,7 @@ async def archive_clear_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-# ---------- background loops ----------
-
 async def reminder_task():
-    """Раз на ~30с: надсилає нагадування заздалегідь і фіксує прострочені завдання."""
     while True:
         await asyncio.sleep(30)
         try:
@@ -884,7 +866,6 @@ async def reminder_task():
                 if not due:
                     continue
 
-                # нагадування за N хвилин до дедлайну
                 if not t.get("reminded_before") and due - now <= timedelta(minutes=REMINDER_BEFORE_MINUTES) and due > now:
                     text = (
                         f"⏰ *Нагадування!*\n\n"
@@ -898,7 +879,6 @@ async def reminder_task():
                         logger.exception("Failed to send pre-reminder for task %s", t.get("id"))
                     await update_task(t["id"], {"reminded_before": True})
 
-                # прострочення (з урахуванням грейс-періоду)
                 if not t.get("overdue_notified") and now - due >= timedelta(minutes=OVERDUE_GRACE_MINUTES):
                     await update_task(t["id"], {
                         "status": STATUS_OVERDUE,
@@ -914,7 +894,6 @@ async def reminder_task():
             logger.exception("reminder_task loop failed")
 
 async def daily_job_task():
-    """Раз на добу о DAILY_REPORT_TIME: підсумок дня, оновлення серії, місячне очищення архіву."""
     while True:
         try:
             hh, mm = map(int, DAILY_REPORT_TIME.split(":"))
@@ -933,13 +912,11 @@ async def daily_job_task():
                     streak = await update_streak(uid, stats["missed_count"])
                     await bot.send_message(uid, build_daily_summary_text(stats, streak))
 
-                    # скидання прапорця "перенесено сьогодні" для наступної доби
                     cursor = tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
                     postponed_ids = [d["id"] for d in (await db_call(cursor.to_list(length=None), default=[]) or [])]
                     for tid in postponed_ids:
                         await update_task(tid, {"postponed_today": False})
 
-                    # раз на місяць — пропозиція очистити архів (1 числа)
                     if now.day == 1:
                         state = await get_user_state(uid)
                         month_key = now.strftime("%Y-%m")
@@ -957,8 +934,6 @@ async def daily_job_task():
         except Exception:
             logger.exception("daily_job_task outer loop failed")
 
-# ---------- web health check ----------
-
 from aiohttp import web
 
 async def health(request):
@@ -975,6 +950,8 @@ async def main():
         logger.info("MongoDB connection OK")
     except Exception:
         logger.exception("MongoDB connection FAILED at startup")
+
+    await load_authorized_uids()
 
     app = web.Application()
     app.router.add_get("/", health)
