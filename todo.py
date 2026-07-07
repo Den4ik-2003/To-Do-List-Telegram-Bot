@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+import secrets
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -33,7 +34,6 @@ BOT_PASSWORD = os.environ["BOT_PASSWORD"]
 MONGO_URI = os.environ["MONGO_URI"]
 
 REMINDER_BEFORE_MINUTES = int(os.environ.get("REMINDER_BEFORE_MINUTES", "10"))
-OVERDUE_GRACE_MINUTES = int(os.environ.get("OVERDUE_GRACE_MINUTES", "15"))
 DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "21:00")
 
 mongo_client: AsyncIOMotorClient | None = None
@@ -61,13 +61,30 @@ def init_mongo():
     auth_col = db["auth"]
     counters_col = db["counters"]
 
-PRIORITIES = ["high", "medium", "low"]
-PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-PRIORITY_LABEL = {"high": "Високий", "medium": "Середній", "low": "Низький"}
-PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+# ---------------------------------------------------------------------------
+# Довідники: мітки (колір/терміновість), категорії
+# ---------------------------------------------------------------------------
+
+LABELS = {
+    "urgent":   {"emoji": "🔴", "name": "Терміново"},
+    "medium":   {"emoji": "🟡", "name": "Середньо"},
+    "low":      {"emoji": "🟢", "name": "Не поспішає"},
+    "idea":     {"emoji": "🔵", "name": "Ідея"},
+    "personal": {"emoji": "🟣", "name": "Особисте"},
+}
+LABEL_ORDER = {"urgent": 0, "medium": 1, "low": 2, "idea": 3, "personal": 4}
+LABEL_XP = {"urgent": 25, "medium": 15, "low": 10, "idea": 10, "personal": 10}
+
+CATEGORIES = {
+    "work":    {"emoji": "💻", "name": "Робота"},
+    "finance": {"emoji": "💰", "name": "Фінанси"},
+    "home":    {"emoji": "🏠", "name": "Дім"},
+    "sport":   {"emoji": "💪", "name": "Спорт"},
+    "study":   {"emoji": "📚", "name": "Навчання"},
+    "other":   {"emoji": "🗂", "name": "Інше"},
+}
 
 STATUS_PENDING = "pending"
-STATUS_OVERDUE = "overdue"
 STATUS_DONE = "done"
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
@@ -126,7 +143,14 @@ async def get_all_uids() -> list:
 async def get_user_state(uid: int) -> dict:
     doc = await db_call(users_col.find_one({"uid": uid}))
     if not doc:
-        return {"uid": uid, "streak": 0, "last_streak_date": "", "archive_prompt_month": ""}
+        return {
+            "uid": uid, "streak": 0, "last_streak_date": "",
+            "archive_prompt_month": "", "xp": 0,
+            "total_completed": 0, "total_missed": 0,
+        }
+    doc.setdefault("xp", 0)
+    doc.setdefault("total_completed", 0)
+    doc.setdefault("total_missed", 0)
     return doc
 
 async def save_user_state(uid: int, fields: dict):
@@ -165,12 +189,12 @@ async def get_user_tasks(uid: int, statuses: list | None = None) -> list:
 
 def sort_tasks(tasks: list) -> list:
     def key(t):
-        return (t.get("due", ""), PRIORITY_ORDER.get(t.get("priority", "low"), 2))
+        return (t.get("due", ""), LABEL_ORDER.get(t.get("label", "idea"), 9))
     return sorted(tasks, key=key)
 
-def sort_tasks_by_priority_then_due(tasks: list) -> list:
+def sort_tasks_by_label_then_due(tasks: list) -> list:
     def key(t):
-        return (PRIORITY_ORDER.get(t.get("priority", "low"), 2), t.get("due", ""))
+        return (LABEL_ORDER.get(t.get("label", "idea"), 9), t.get("due", ""))
     return sorted(tasks, key=key)
 
 def parse_due(due_str: str) -> datetime | None:
@@ -186,21 +210,79 @@ def is_today(due_str: str) -> bool:
     dt = parse_due(due_str)
     return bool(dt and dt.date() == datetime.now().date())
 
+def is_missed(t: dict) -> bool:
+    """Задача вже минула свій час і ще не виконана (перевіряється в реальному часі)."""
+    if t.get("status") != STATUS_PENDING:
+        return False
+    due = parse_due(t.get("due", ""))
+    return bool(due and due <= datetime.now())
+
+def time_remaining_str(due_dt: datetime) -> str:
+    now = datetime.now()
+    secs = (due_dt - now).total_seconds()
+    if secs <= 0:
+        return "⚫ Прострочено"
+    if secs <= 1800:
+        m = max(1, int(secs // 60))
+        return f"🔴 Через {m} хв"
+    if due_dt.date() == now.date():
+        total_min = int(secs // 60)
+        h, m = divmod(total_min, 60)
+        parts = []
+        if h:
+            parts.append(f"{h} год")
+        if m:
+            parts.append(f"{m} хв")
+        return "🟢 Через " + " ".join(parts) if parts else "🟢 Скоро"
+    if due_dt.date() == (now + timedelta(days=1)).date():
+        return "🟡 Завтра"
+    days = (due_dt.date() - now.date()).days
+    return f"⚫ Через {days} дн."
+
+def level_progress(xp: int):
+    """Повертає (рівень, xp у поточному рівні, xp потрібно для наступного)."""
+    level = 1
+    total = 0
+    threshold = 100
+    while xp >= total + threshold:
+        total += threshold
+        level += 1
+        threshold = 100 + level * 150
+    into_level = xp - total
+    return level, into_level, threshold
+
 def fmt_task(t: dict, short: bool = False) -> str:
-    pe = PRIORITY_EMOJI.get(t.get("priority", "low"), "")
+    label = LABELS.get(t.get("label", "idea"), {"emoji": "", "name": "—"})
+    cat = CATEGORIES.get(t.get("category", "other"), {"emoji": "", "name": "—"})
     status = t.get("status", STATUS_PENDING)
-    status_icon = {"pending": "⏳", "overdue": "❌", "done": "✅"}.get(status, "⏳")
+    if status == STATUS_DONE:
+        status_icon = "✅"
+    elif is_missed(t):
+        status_icon = "⚠️"
+    else:
+        status_icon = "⏳"
+    pin_str = "📌 " if t.get("pinned") else ""
+
+    due_dt = parse_due(t.get("due", ""))
+    remain = ""
+    if due_dt and status != STATUS_DONE:
+        remain = "  " + time_remaining_str(due_dt)
+
     lines = [
-        f"*№{t['id']}* {pe} {status_icon}",
-        f"📝 {t.get('text','')}",
-        f"🕐 {t.get('due','')}",
-        f"⚡ Пріоритет: *{PRIORITY_LABEL.get(t.get('priority','low'),'—')}*",
+        f"{pin_str}*№{t['id']}* {label['emoji']} {status_icon}",
+        f"📝 {t.get('text', '')}",
+        f"🕐 {t.get('due', '')}{remain}",
+        f"🏷 {cat['emoji']} {cat['name']}   {label['emoji']} {label['name']}",
     ]
+    subtasks = t.get("subtasks") or []
+    if subtasks:
+        done_n = sum(1 for s in subtasks if s.get("done"))
+        lines.append(f"📝 Підзадачі: *{done_n}/{len(subtasks)}*")
     if not short:
         if t.get("postponed_count"):
             lines.append(f"🔁 Перенесено разів: *{t['postponed_count']}*")
         if status == STATUS_DONE and t.get("completed_at"):
-            lines.append(f"✅ Виконано: {t['completed_at'][:16].replace('T',' ')}")
+            lines.append(f"✅ Виконано: {t['completed_at'][:16].replace('T', ' ')}")
     return "\n".join(lines)
 
 def build_task_list_text(tasks: list, title: str) -> str:
@@ -208,9 +290,10 @@ def build_task_list_text(tasks: list, title: str) -> str:
         return f"{title}\n\n📭 Немає завдань."
     lines = [title, ""]
     for t in tasks:
-        pe = PRIORITY_EMOJI.get(t.get("priority", "low"), "")
-        status_icon = {"pending": "⏳", "overdue": "❌", "done": "✅"}.get(t.get("status"), "⏳")
-        lines.append(f"{status_icon} {pe} №{t['id']} — {t.get('due','')[-5:]} {t.get('text','')[:40]}")
+        label = LABELS.get(t.get("label", "idea"), {"emoji": ""})
+        status_icon = "✅" if t.get("status") == STATUS_DONE else ("⚠️" if is_missed(t) else "⏳")
+        pin_str = "📌" if t.get("pinned") else ""
+        lines.append(f"{status_icon} {pin_str}{label['emoji']} №{t['id']} — {t.get('due','')[-5:]} {t.get('text','')[:35]}")
     return "\n".join(lines)
 
 async def compute_daily_stats(uid: int) -> dict:
@@ -233,7 +316,7 @@ async def compute_daily_stats(uid: int) -> dict:
                         longest = (delta, t.get("text", ""))
                 except ValueError:
                     pass
-        elif t.get("missed_flagged"):
+        elif is_missed(t):
             missed_today.append(t)
         if t.get("postponed_today"):
             postponed_today += 1
@@ -277,7 +360,8 @@ class Auth(StatesGroup):
 
 class AddTask(StatesGroup):
     text = State()
-    priority = State()
+    label = State()
+    category = State()
     date = State()
     date_manual = State()
     time = State()
@@ -288,19 +372,44 @@ class EditField(StatesGroup):
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Нове завдання"), KeyboardButton(text="📋 Сьогодні")],
-        [KeyboardButton(text="📆 Всі активні"), KeyboardButton(text="🔥 Серія")],
-        [KeyboardButton(text="📦 Архів"), KeyboardButton(text="📖 Підсумок дня")],
-        [KeyboardButton(text="📤 Експорт CSV")],
+        [KeyboardButton(text="📆 Всі активні"), KeyboardButton(text="⭐ Обране")],
+        [KeyboardButton(text="🏷 Категорії"), KeyboardButton(text="📊 Dashboard")],
+        [KeyboardButton(text="🔥 Серія"), KeyboardButton(text="📦 Архів")],
+        [KeyboardButton(text="📖 Підсумок дня"), KeyboardButton(text="📤 Експорт CSV")],
     ], resize_keyboard=True)
 
 def kb_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Скасувати")]], resize_keyboard=True)
 
-def kb_priority() -> ReplyKeyboardMarkup:
+def kb_label() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔴 Високий"), KeyboardButton(text="🟡 Середній"), KeyboardButton(text="🟢 Низький")],
+        [KeyboardButton(text="🔴 Терміново"), KeyboardButton(text="🟡 Середньо")],
+        [KeyboardButton(text="🟢 Не поспішає"), KeyboardButton(text="🔵 Ідея")],
+        [KeyboardButton(text="🟣 Особисте")],
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
+
+def label_from_text(text: str) -> str | None:
+    mapping = {
+        "🔴 Терміново": "urgent", "🟡 Середньо": "medium", "🟢 Не поспішає": "low",
+        "🔵 Ідея": "idea", "🟣 Особисте": "personal",
+    }
+    return mapping.get(text)
+
+def kb_category() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="💻 Робота"), KeyboardButton(text="💰 Фінанси")],
+        [KeyboardButton(text="🏠 Дім"), KeyboardButton(text="💪 Спорт")],
+        [KeyboardButton(text="📚 Навчання"), KeyboardButton(text="🗂 Інше")],
+        [KeyboardButton(text="❌ Скасувати")],
+    ], resize_keyboard=True)
+
+def category_from_text(text: str) -> str | None:
+    mapping = {
+        "💻 Робота": "work", "💰 Фінанси": "finance", "🏠 Дім": "home",
+        "💪 Спорт": "sport", "📚 Навчання": "study", "🗂 Інше": "other",
+    }
+    return mapping.get(text)
 
 def kb_date() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
@@ -309,13 +418,14 @@ def kb_date() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
-def priority_from_text(text: str) -> str | None:
-    mapping = {"🔴 Високий": "high", "🟡 Середній": "medium", "🟢 Низький": "low"}
-    return mapping.get(text)
-
-def ikb_task_actions(tid: int) -> InlineKeyboardMarkup:
+def ikb_task_actions(tid: int, t: dict) -> InlineKeyboardMarkup:
+    if t.get("pinned"):
+        pin_btn = InlineKeyboardButton(text="📌 Відкріпити", callback_data=f"unpin:{tid}")
+    else:
+        pin_btn = InlineKeyboardButton(text="⭐ Закріпити", callback_data=f"pin:{tid}")
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Виконано", callback_data=f"done:{tid}")],
+        [pin_btn, InlineKeyboardButton(text="📝 Підзадачі", callback_data=f"subtasks:{tid}")],
         [
             InlineKeyboardButton(text="🕐 +1 год", callback_data=f"postp1h:{tid}"),
             InlineKeyboardButton(text="📅 Завтра", callback_data=f"postptom:{tid}"),
@@ -327,8 +437,9 @@ def ikb_task_actions(tid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="◀️ До списку", callback_data="back_to_list")],
     ])
 
-def ikb_overdue_actions(tid: int) -> InlineKeyboardMarkup:
+def ikb_rollover_actions(tid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Виконано", callback_data=f"done:{tid}")],
         [InlineKeyboardButton(text="🕐 Через 1 год", callback_data=f"postp1h:{tid}")],
         [InlineKeyboardButton(text="📅 Завтра", callback_data=f"postptom:{tid}")],
         [InlineKeyboardButton(text="❌ Видалити", callback_data=f"deltask:{tid}")],
@@ -340,7 +451,14 @@ def ikb_reminder_actions(tid: int) -> InlineKeyboardMarkup:
     ])
 
 def ikb_edit_fields(tid: int) -> InlineKeyboardMarkup:
-    fields = [("text", "📝 Текст"), ("priority", "⚡ Пріоритет"), ("date", "📅 Дата"), ("time", "🕐 Час")]
+    fields = [
+        ("text", "📝 Текст"),
+        ("label", "🎨 Мітка"),
+        ("category", "🏷 Категорія"),
+        ("date", "📅 Дата"),
+        ("time", "🕐 Час"),
+        ("subtasks_add", "➕ Додати підзадачі"),
+    ]
     rows = [[InlineKeyboardButton(text=label, callback_data=f"editfield:{tid}:{key}")] for key, label in fields]
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{tid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -350,10 +468,11 @@ def ikb_tasks_list(tasks: list, page: int = 0, per_page: int = 6) -> InlineKeybo
     chunk = tasks[start:start + per_page]
     rows = []
     for t in chunk:
-        pe = PRIORITY_EMOJI.get(t.get("priority", "low"), "")
-        status_icon = {"pending": "⏳", "overdue": "❌", "done": "✅"}.get(t.get("status"), "⏳")
-        label = f"{status_icon} {pe} №{t['id']} {t.get('due','')[-5:]} {t.get('text','')[:20]}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"view:{t['id']}")])
+        label = LABELS.get(t.get("label", "idea"), {"emoji": ""})
+        status_icon = "✅" if t.get("status") == STATUS_DONE else ("⚠️" if is_missed(t) else "⏳")
+        pin_str = "📌" if t.get("pinned") else ""
+        lbl = f"{status_icon} {pin_str}{label['emoji']} №{t['id']} {t.get('due','')[-5:]} {t.get('text','')[:18]}"
+        rows.append([InlineKeyboardButton(text=lbl, callback_data=f"view:{t['id']}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️", callback_data=f"page:{page-1}"))
@@ -365,6 +484,12 @@ def ikb_tasks_list(tasks: list, page: int = 0, per_page: int = 6) -> InlineKeybo
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def ikb_categories() -> InlineKeyboardMarkup:
+    rows = []
+    for key, cat in CATEGORIES.items():
+        rows.append([InlineKeyboardButton(text=f"{cat['emoji']} {cat['name']}", callback_data=f"catopen:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def ikb_archive_clear() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -372,6 +497,22 @@ def ikb_archive_clear() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Ні", callback_data="archclr:no"),
         ],
     ])
+
+def render_subtasks(tid: int, t: dict):
+    subtasks = t.get("subtasks") or []
+    if not subtasks:
+        text = f"📝 *Підзадачі* — №{tid}\n\nПоки що немає підзадач.\nДодай їх через ✏️ Редагувати → ➕ Додати підзадачі."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{tid}")]])
+        return text, kb
+    rows = []
+    for s in subtasks:
+        box = "☑" if s.get("done") else "☐"
+        rows.append([InlineKeyboardButton(text=f"{box} {s['text'][:40]}", callback_data=f"subtoggle:{tid}:{s['id']}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{tid}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    done_n = sum(1 for s in subtasks if s.get("done"))
+    text = f"📝 *Підзадачі* — №{tid}\n\n{done_n}/{len(subtasks)} виконано"
+    return text, kb
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher(storage=MemoryStorage())
@@ -439,6 +580,10 @@ async def check_password(msg: Message, state: FSMContext):
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
 
+# ---------------------------------------------------------------------------
+# Створення завдання
+# ---------------------------------------------------------------------------
+
 @dp.message(F.text == "➕ Нове завдання")
 async def new_task_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -450,19 +595,30 @@ async def at_text(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(text=msg.text.strip())
-    await state.set_state(AddTask.priority)
-    await msg.answer("⚡ Оберіть *пріоритет*:", reply_markup=kb_priority())
+    await state.set_state(AddTask.label)
+    await msg.answer("🎨 Оберіть *мітку*:", reply_markup=kb_label())
 
-@dp.message(AddTask.priority)
-async def at_priority(msg: Message, state: FSMContext):
+@dp.message(AddTask.label)
+async def at_label(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    priority = priority_from_text(msg.text)
-    if not priority:
-        return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_priority())
-    await state.update_data(priority=priority)
+    label = label_from_text(msg.text)
+    if not label:
+        return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_label())
+    await state.update_data(label=label)
+    await state.set_state(AddTask.category)
+    await msg.answer("🏷 Оберіть *категорію*:", reply_markup=kb_category())
+
+@dp.message(AddTask.category)
+async def at_category(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    category = category_from_text(msg.text)
+    if not category:
+        return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
+    await state.update_data(category=category)
     await state.set_state(AddTask.date)
-    await msg.answer("📅 Коли виконати? Оберіть дату:", reply_markup=kb_date())
+    await msg.answer("📅 Коли треба це зробити? Оберіть дату:", reply_markup=kb_date())
 
 @dp.message(AddTask.date)
 async def at_date(msg: Message, state: FSMContext):
@@ -527,21 +683,20 @@ async def at_time(msg: Message, state: FSMContext):
         "id": new_id,
         "uid": msg.from_user.id,
         "text": fd["text"],
-        "priority": fd["priority"],
+        "label": fd["label"],
+        "category": fd["category"],
         "due": fmt_due(due_dt),
         "status": STATUS_PENDING,
+        "pinned": False,
+        "subtasks": [],
         "created_at": created_at,
         "completed_at": None,
         "reminded_before": False,
-        "overdue_notified": False,
         "missed_flagged": False,
+        "missed_counted": False,
         "postponed_count": 0,
         "postponed_today": False,
     }
-    if due_dt <= datetime.now():
-        task["status"] = STATUS_OVERDUE
-        task["overdue_notified"] = True
-        task["missed_flagged"] = True
 
     try:
         await add_task(task)
@@ -554,14 +709,18 @@ async def at_time(msg: Message, state: FSMContext):
         return
     await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(saved)}", reply_markup=kb_main())
 
+# ---------------------------------------------------------------------------
+# Списки завдань
+# ---------------------------------------------------------------------------
+
 @dp.message(F.text == "📋 Сьогодні")
 async def today_tasks(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     try:
         uid = msg.from_user.id
-        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING, STATUS_OVERDUE, STATUS_DONE])
+        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING, STATUS_DONE])
         tasks = [t for t in tasks if is_today(t.get("due", ""))]
-        tasks = sort_tasks_by_priority_then_due(tasks)
+        tasks = sort_tasks_by_label_then_due(tasks)
         user_list_cache[uid] = tasks
         if not tasks:
             return await msg.answer("📭 На сьогодні завдань немає.", reply_markup=kb_main())
@@ -576,7 +735,7 @@ async def active_tasks(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     try:
         uid = msg.from_user.id
-        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING, STATUS_OVERDUE])
+        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING])
         tasks = sort_tasks(tasks)
         user_list_cache[uid] = tasks
         if not tasks:
@@ -586,6 +745,52 @@ async def active_tasks(msg: Message, state: FSMContext):
     except Exception:
         logger.exception("active_tasks failed")
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+@dp.message(F.text == "⭐ Обране")
+async def favorites_view(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    try:
+        uid = msg.from_user.id
+        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING])
+        tasks = [t for t in tasks if t.get("pinned")]
+        tasks = sort_tasks(tasks)
+        user_list_cache[uid] = tasks
+        if not tasks:
+            return await msg.answer("⭐ *Обране*\n\n📭 Немає закріплених завдань.", reply_markup=kb_main())
+        await msg.answer(f"⭐ *Важливі* — {len(tasks)} шт.", reply_markup=kb_main())
+        await msg.answer("Обери завдання:", reply_markup=ikb_tasks_list(tasks))
+    except Exception:
+        logger.exception("favorites_view failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+@dp.message(F.text == "🏷 Категорії")
+async def categories_view(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    await msg.answer("🏷 *Оберіть категорію:*", reply_markup=ikb_categories())
+
+@dp.callback_query(F.data.startswith("catopen:"))
+async def category_open(cb: CallbackQuery):
+    try:
+        key = cb.data.split(":")[1]
+        cat = CATEGORIES.get(key)
+        if not cat:
+            return await cb.answer("Невідома категорія", show_alert=True)
+        uid = cb.from_user.id
+        tasks = await get_user_tasks(uid, statuses=[STATUS_PENDING])
+        tasks = [t for t in tasks if t.get("category") == key]
+        tasks = sort_tasks_by_label_then_due(tasks)
+        user_list_cache[uid] = tasks
+        if not tasks:
+            await cb.message.edit_text(f"{cat['emoji']} *{cat['name']}*\n\n📭 Немає завдань у цій категорії.")
+        else:
+            await cb.message.edit_text(f"{cat['emoji']} *{cat['name']}* — {len(tasks)} шт.", reply_markup=ikb_tasks_list(tasks))
+        await cb.answer()
+    except Exception:
+        logger.exception("category_open failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 @dp.callback_query(F.data.startswith("page:"))
 async def page_tasks(cb: CallbackQuery):
@@ -630,8 +835,7 @@ async def view_task(cb: CallbackQuery):
         t = await get_task(tid)
         if not t:
             return await cb.answer("Не знайдено!", show_alert=True)
-        kb = ikb_overdue_actions(tid) if t.get("status") == STATUS_OVERDUE else ikb_task_actions(tid)
-        await cb.message.edit_text(fmt_task(t), reply_markup=kb)
+        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
         await cb.answer()
     except Exception:
         logger.exception("view_task failed")
@@ -647,12 +851,29 @@ async def task_done(cb: CallbackQuery):
         t = await get_task(tid)
         if not t:
             return await cb.answer("Не знайдено!", show_alert=True)
+
+        state = await get_user_state(t["uid"])
+        old_xp = state.get("xp", 0)
+        gain = LABEL_XP.get(t.get("label", "idea"), 10)
+        new_xp = old_xp + gain
+        old_level, _, _ = level_progress(old_xp)
+        new_level, _, _ = level_progress(new_xp)
+
         await update_task(tid, {"status": STATUS_DONE, "completed_at": datetime.now().isoformat()})
+        await save_user_state(t["uid"], {
+            "xp": new_xp,
+            "total_completed": state.get("total_completed", 0) + 1,
+        })
         t = await get_task(tid)
+
+        extra = f"\n\n✨ +{gain} XP"
+        if new_level > old_level:
+            extra += f"\n🏆 Новий рівень: *{new_level}*!"
+
         try:
-            await cb.message.edit_text(f"✅ *Виконано!*\n\n{fmt_task(t)}")
+            await cb.message.edit_text(f"✅ *Виконано!*\n\n{fmt_task(t)}{extra}")
         except TelegramAPIError:
-            await cb.message.answer(f"✅ *Виконано!*\n\n{fmt_task(t)}")
+            await cb.message.answer(f"✅ *Виконано!*\n\n{fmt_task(t)}{extra}")
         await cb.answer("✅ Виконано!")
     except Exception:
         logger.exception("task_done failed")
@@ -669,15 +890,15 @@ async def _postpone(cb: CallbackQuery, tid: int, new_due: datetime):
         "due": fmt_due(new_due),
         "status": STATUS_PENDING,
         "reminded_before": False,
-        "overdue_notified": False,
+        "missed_flagged": False,
         "postponed_count": t.get("postponed_count", 0) + 1,
         "postponed_today": True,
     })
     t = await get_task(tid)
     try:
-        await cb.message.edit_text(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid))
+        await cb.message.edit_text(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid, t))
     except TelegramAPIError:
-        await cb.message.answer(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid))
+        await cb.message.answer(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid, t))
     await cb.answer("🔁 Перенесено")
 
 @dp.callback_query(F.data.startswith("postp1h:"))
@@ -728,6 +949,77 @@ async def delete_task_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+@dp.callback_query(F.data.startswith("pin:"))
+async def pin_task(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":")[1])
+        await update_task(tid, {"pinned": True})
+        t = await get_task(tid)
+        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
+        await cb.answer("⭐ Закріплено!")
+    except Exception:
+        logger.exception("pin_task failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("unpin:"))
+async def unpin_task(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":")[1])
+        await update_task(tid, {"pinned": False})
+        t = await get_task(tid)
+        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
+        await cb.answer("📌 Відкріплено")
+    except Exception:
+        logger.exception("unpin_task failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("subtasks:"))
+async def subtasks_view(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":")[1])
+        t = await get_task(tid)
+        if not t:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        text, kb = render_subtasks(tid, t)
+        await cb.message.edit_text(text, reply_markup=kb)
+        await cb.answer()
+    except Exception:
+        logger.exception("subtasks_view failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("subtoggle:"))
+async def subtask_toggle(cb: CallbackQuery):
+    try:
+        _, tid_s, subid = cb.data.split(":")
+        tid = int(tid_s)
+        t = await get_task(tid)
+        if not t:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        subtasks = t.get("subtasks") or []
+        for s in subtasks:
+            if s["id"] == subid:
+                s["done"] = not s.get("done")
+        await update_task(tid, {"subtasks": subtasks})
+        t = await get_task(tid)
+        text, kb = render_subtasks(tid, t)
+        await cb.message.edit_text(text, reply_markup=kb)
+        await cb.answer()
+    except Exception:
+        logger.exception("subtask_toggle failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 @dp.callback_query(F.data.startswith("edit:"))
 async def edit_task_cb(cb: CallbackQuery):
     try:
@@ -748,13 +1040,20 @@ async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
         tid = int(tid_s)
         labels = {
             "text": "Текст завдання",
-            "priority": "Пріоритет (🔴 Високий / 🟡 Середній / 🟢 Низький)",
+            "label": "Мітка",
+            "category": "Категорія",
             "date": "Дата (дд.мм.рррр)",
             "time": "Час (гг:хх)",
+            "subtasks_add": "Нові підзадачі (кожна з нового рядка)",
         }
         await state.set_state(EditField.typing)
         await state.update_data(edit_tid=tid, edit_field=field)
-        kb = kb_priority() if field == "priority" else kb_cancel()
+        if field == "label":
+            kb = kb_label()
+        elif field == "category":
+            kb = kb_category()
+        else:
+            kb = kb_cancel()
         await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:", reply_markup=kb)
         await cb.answer()
     except Exception:
@@ -777,11 +1076,16 @@ async def edit_field_save(msg: Message, state: FSMContext):
 
     if field == "text":
         await update_task(tid, {"text": msg.text.strip()})
-    elif field == "priority":
-        priority = priority_from_text(msg.text)
-        if not priority:
-            return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_priority())
-        await update_task(tid, {"priority": priority})
+    elif field == "label":
+        label = label_from_text(msg.text)
+        if not label:
+            return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_label())
+        await update_task(tid, {"label": label})
+    elif field == "category":
+        category = category_from_text(msg.text)
+        if not category:
+            return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
+        await update_task(tid, {"category": category})
     elif field == "date":
         try:
             datetime.strptime(msg.text.strip(), "%d.%m.%Y")
@@ -791,7 +1095,7 @@ async def edit_field_save(msg: Message, state: FSMContext):
         time_part = old_due.strftime("%H:%M") if old_due else "00:00"
         new_due = f"{msg.text.strip()} {time_part}"
         await update_task(tid, {"due": new_due, "status": STATUS_PENDING,
-                                 "reminded_before": False, "overdue_notified": False})
+                                 "reminded_before": False, "missed_flagged": False})
     elif field == "time":
         try:
             datetime.strptime(msg.text.strip(), "%H:%M")
@@ -801,7 +1105,19 @@ async def edit_field_save(msg: Message, state: FSMContext):
         date_part = old_due.strftime("%d.%m.%Y") if old_due else datetime.now().strftime("%d.%m.%Y")
         new_due = f"{date_part} {msg.text.strip()}"
         await update_task(tid, {"due": new_due, "status": STATUS_PENDING,
-                                 "reminded_before": False, "overdue_notified": False})
+                                 "reminded_before": False, "missed_flagged": False})
+    elif field == "subtasks_add":
+        subtasks = t.get("subtasks") or []
+        added = 0
+        for line in msg.text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            subtasks.append({"id": secrets.token_hex(2), "text": line, "done": False})
+            added += 1
+        await update_task(tid, {"subtasks": subtasks})
+        if added == 0:
+            return await msg.answer("⚠️ Не знайшов жодного рядка з текстом. Спробуй ще раз:", reply_markup=kb_cancel())
 
     await state.clear()
     t = await get_task(tid)
@@ -809,6 +1125,10 @@ async def edit_field_save(msg: Message, state: FSMContext):
         await msg.answer(f"✅ Оновлено!\n\n{fmt_task(t)}", reply_markup=kb_main())
     else:
         await msg.answer("Завдання не знайдено.", reply_markup=kb_main())
+
+# ---------------------------------------------------------------------------
+# Серія, архів, підсумок дня, dashboard, експорт
+# ---------------------------------------------------------------------------
 
 @dp.message(F.text == "🔥 Серія")
 async def streak_view(msg: Message, state: FSMContext):
@@ -876,6 +1196,58 @@ def build_daily_summary_text(stats: dict, streak: int) -> str:
         lines.append(f"↪️ Перенесено на пізніше\n{stats['postponed_count']} задач")
     return "\n".join(lines)
 
+@dp.message(F.text == "📊 Dashboard")
+async def dashboard_view(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    try:
+        uid = msg.from_user.id
+        tasks = await get_user_tasks(uid)
+        active = [t for t in tasks if t.get("status") == STATUS_PENDING]
+        done_all = [t for t in tasks if t.get("status") == STATUS_DONE]
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        done_today = [t for t in done_all if (t.get("completed_at") or "").startswith(today_str)]
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+        tomorrow_tasks = [t for t in active if t.get("due", "").startswith(tomorrow_str)]
+        overdue_tasks = [t for t in active if is_missed(t)]
+        important = [t for t in active if t.get("pinned")]
+
+        state_doc = await get_user_state(uid)
+        streak = state_doc.get("streak", 0)
+        total_completed = state_doc.get("total_completed", 0)
+        total_missed = state_doc.get("total_missed", 0)
+        denom = total_completed + total_missed
+        completion = round(total_completed / denom * 100) if denom > 0 else 100
+
+        xp = state_doc.get("xp", 0)
+        level, into_level, threshold = level_progress(xp)
+        bar_len = 12
+        filled = int(bar_len * into_level / threshold) if threshold else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        name = msg.from_user.first_name or msg.from_user.username or "Друже"
+        text = (
+            f"👤 *{name}*\n\n"
+            "━━━━━━━━━━━━\n\n"
+            f"📋 Активних\n*{len(active)}*\n\n"
+            f"🔥 Серія\n*{streak} днів*\n\n"
+            f"✅ Виконано сьогодні\n*{len(done_today)}*\n\n"
+            f"📅 На завтра\n*{len(tomorrow_tasks)}*\n\n"
+            f"⏰ Прострочено\n*{len(overdue_tasks)}*\n\n"
+            f"⭐ Важливих\n*{len(important)}*\n\n"
+            f"📦 Архів\n*{len(done_all)}*\n\n"
+            f"📈 Виконання\n*{completion}%*\n\n"
+            "━━━━━━━━━━━━\n\n"
+            f"🏆 Level {level}\n"
+            f"{bar}\n"
+            f"{into_level} / {threshold} XP"
+        )
+        await msg.answer(text, reply_markup=kb_main())
+    except DBUnavailable:
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+    except Exception:
+        logger.exception("dashboard_view failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
 @dp.message(F.text == "📤 Експорт CSV")
 async def export_csv(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -887,7 +1259,7 @@ async def export_csv(msg: Message, state: FSMContext):
     if not tasks:
         return await msg.answer("📭 Немає завдань для експорту.", reply_markup=kb_main())
     output = io.StringIO()
-    fieldnames = ["id", "text", "priority", "due", "status", "completed_at", "postponed_count"]
+    fieldnames = ["id", "text", "label", "category", "due", "status", "pinned", "completed_at", "postponed_count"]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for t in tasks:
@@ -919,25 +1291,28 @@ async def archive_clear_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+# ---------------------------------------------------------------------------
+# Фонові задачі: нагадування перед часом, "перенос" тільки після півночі
+# ---------------------------------------------------------------------------
+
 async def reminder_task():
+    """Кожні 30с перевіряє, чи не час надіслати нагадування ДО настання due."""
     while True:
         await asyncio.sleep(30)
         try:
-            now = datetime.now()
-            cursor = tasks_col.find({"status": STATUS_PENDING}, {"_id": 0})
+            cursor = tasks_col.find({"status": STATUS_PENDING, "reminded_before": False}, {"_id": 0})
             pending = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
-            pending = sort_tasks_by_priority_then_due(pending)
-
+            now = datetime.now()
             for t in pending:
                 due = parse_due(t.get("due", ""))
                 if not due:
                     continue
-
-                if not t.get("reminded_before") and due - now <= timedelta(minutes=REMINDER_BEFORE_MINUTES) and due > now:
+                if due > now and due - now <= timedelta(minutes=REMINDER_BEFORE_MINUTES):
                     text = (
                         f"⏰ *Нагадування!*\n\n"
                         f"Через {REMINDER_BEFORE_MINUTES} хв: *{t.get('text','')}*\n"
-                        f"{PRIORITY_EMOJI.get(t.get('priority','low'),'')} {PRIORITY_LABEL.get(t.get('priority','low'),'')}\n"
+                        f"{LABELS.get(t.get('label','idea'),{}).get('emoji','')} "
+                        f"{LABELS.get(t.get('label','idea'),{}).get('name','')}\n"
                         f"🕐 {t.get('due','')}"
                     )
                     try:
@@ -945,20 +1320,44 @@ async def reminder_task():
                     except Exception:
                         logger.exception("Failed to send pre-reminder for task %s", t.get("id"))
                     await update_task(t["id"], {"reminded_before": True})
-
-                if not t.get("overdue_notified") and now - due >= timedelta(minutes=OVERDUE_GRACE_MINUTES):
-                    await update_task(t["id"], {
-                        "status": STATUS_OVERDUE,
-                        "overdue_notified": True,
-                        "missed_flagged": True,
-                    })
-                    text = f"❌ *Ви не виконали*\n\n\"{t.get('text','')}\"\n\nПеренести?"
-                    try:
-                        await bot.send_message(t["uid"], text, reply_markup=ikb_overdue_actions(t["id"]))
-                    except Exception:
-                        logger.exception("Failed to send overdue notice for task %s", t.get("id"))
         except Exception:
             logger.exception("reminder_task loop failed")
+
+async def midnight_rollover_task():
+    """Раз на добу (після півночі) питає про перенесення того, що не встигли зробити за день."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=0, minute=1, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            cursor = tasks_col.find({"status": STATUS_PENDING}, {"_id": 0})
+            pending = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
+            today_date = datetime.now().date()
+            for t in pending:
+                due = parse_due(t.get("due", ""))
+                if not due:
+                    continue
+                if due.date() < today_date:
+                    updates = {"missed_flagged": True}
+                    if not t.get("missed_counted"):
+                        updates["missed_counted"] = True
+                        state = await get_user_state(t["uid"])
+                        await save_user_state(t["uid"], {"total_missed": state.get("total_missed", 0) + 1})
+                    await update_task(t["id"], updates)
+                    text = (
+                        f"❌ *Не встигли зробити вчасно*\n\n"
+                        f"\"{t.get('text','')}\"\n"
+                        f"🕐 Було заплановано: {t.get('due','')}\n\n"
+                        f"Перенести?"
+                    )
+                    try:
+                        await bot.send_message(t["uid"], text, reply_markup=ikb_rollover_actions(t["id"]))
+                    except Exception:
+                        logger.exception("Failed to send rollover notice for task %s", t.get("id"))
+        except Exception:
+            logger.exception("midnight_rollover_task failed")
 
 async def daily_job_task():
     while True:
@@ -1028,6 +1427,7 @@ async def main():
     await site.start()
 
     asyncio.create_task(reminder_task())
+    asyncio.create_task(midnight_rollover_task())
     asyncio.create_task(daily_job_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
