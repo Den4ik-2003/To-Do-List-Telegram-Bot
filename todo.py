@@ -75,7 +75,10 @@ MONTHS_UA = [
     "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень",
 ]
 
-async def db_call(coro, default=None, retries=2):
+class DBUnavailable(Exception):
+    pass
+
+async def db_call(coro, default=None, retries=2, raise_on_fail=True):
     last_exc = None
     for attempt in range(retries + 1):
         try:
@@ -86,6 +89,8 @@ async def db_call(coro, default=None, retries=2):
                 await asyncio.sleep(0.5)
                 continue
     logger.exception("MongoDB error: %s", last_exc)
+    if raise_on_fail:
+        raise DBUnavailable(str(last_exc)) from last_exc
     return default
 
 async def is_authorized(uid: int) -> bool:
@@ -103,7 +108,7 @@ async def authorize(uid: int):
 
 async def load_authorized_uids():
     cursor = auth_col.find({}, {"_id": 0, "uid": 1})
-    docs = await db_call(cursor.to_list(length=None), default=[]) or []
+    docs = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
     for d in docs:
         if "uid" in d:
             authorized_uids.add(d["uid"])
@@ -113,7 +118,7 @@ async def get_all_uids() -> list:
     if authorized_uids:
         return list(authorized_uids)
     cursor = auth_col.find({}, {"_id": 0, "uid": 1})
-    docs = await db_call(cursor.to_list(length=None), default=[]) or []
+    docs = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
     return [d["uid"] for d in docs if "uid" in d]
 
 async def get_user_state(uid: int) -> dict:
@@ -365,7 +370,12 @@ dp = Dispatcher(storage=MemoryStorage())
 user_list_cache: dict = {}
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
-    if await is_authorized(msg.from_user.id):
+    try:
+        authed = await is_authorized(msg.from_user.id)
+    except DBUnavailable:
+        await msg.answer(DB_ERROR_TEXT)
+        return False
+    if authed:
         return True
     current_state = await state.get_state()
     if current_state != Auth.waiting_password:
@@ -377,12 +387,31 @@ async def require_auth(msg: Message, state: FSMContext) -> bool:
 async def global_error_handler(event, exception=None):
     exc = exception if exception is not None else getattr(event, "exception", None)
     logger.exception("Unhandled error while processing update: %s", exc)
+    update = getattr(event, "update", None)
+    chat_id = None
+    try:
+        if update and update.message:
+            chat_id = update.message.chat.id
+        elif update and update.callback_query and update.callback_query.message:
+            chat_id = update.callback_query.message.chat.id
+    except Exception:
+        chat_id = None
+    if chat_id is not None:
+        try:
+            await bot.send_message(chat_id, DB_ERROR_TEXT, reply_markup=kb_main())
+        except Exception:
+            pass
     return True
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
-    if await is_authorized(msg.from_user.id):
+    try:
+        authed = await is_authorized(msg.from_user.id)
+    except DBUnavailable:
+        await msg.answer(DB_ERROR_TEXT)
+        return
+    if authed:
         await msg.answer("👋 *Менеджер завдань*\n\nОбери дію:", reply_markup=kb_main())
     else:
         await state.set_state(Auth.waiting_password)
@@ -391,7 +420,11 @@ async def cmd_start(msg: Message, state: FSMContext):
 @dp.message(Auth.waiting_password)
 async def check_password(msg: Message, state: FSMContext):
     if msg.text == BOT_PASSWORD:
-        await authorize(msg.from_user.id)
+        try:
+            await authorize(msg.from_user.id)
+        except DBUnavailable:
+            await msg.answer(DB_ERROR_TEXT)
+            return
         await state.clear()
         await msg.answer("✅ *Пароль вірний! Ласкаво просимо.*\n\nОбери дію:", reply_markup=kb_main())
     else:
@@ -476,8 +509,13 @@ async def at_time(msg: Message, state: FSMContext):
     await state.clear()
 
     created_at = datetime.now().isoformat()
+    try:
+        new_id = await next_task_id()
+    except DBUnavailable:
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+        return
     task = {
-        "id": await next_task_id(),
+        "id": new_id,
         "uid": msg.from_user.id,
         "text": fd["text"],
         "priority": fd["priority"],
@@ -496,8 +534,16 @@ async def at_time(msg: Message, state: FSMContext):
         task["overdue_notified"] = True
         task["missed_flagged"] = True
 
-    await add_task(task)
-    await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(task)}", reply_markup=kb_main())
+    try:
+        await add_task(task)
+        saved = await get_task(task["id"])
+    except DBUnavailable:
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+        return
+    if not saved:
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+        return
+    await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(saved)}", reply_markup=kb_main())
 
 @dp.message(F.text == "📋 Сьогодні")
 async def today_tasks(msg: Message, state: FSMContext):
@@ -758,7 +804,10 @@ async def edit_field_save(msg: Message, state: FSMContext):
 @dp.message(F.text == "🔥 Серія")
 async def streak_view(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
-    streak = await get_streak(msg.from_user.id)
+    try:
+        streak = await get_streak(msg.from_user.id)
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     lines = [
         "🔥 *Серія*", "",
         f"{streak} {'день' if streak % 10 == 1 and streak % 100 != 11 else 'днів'}",
@@ -770,7 +819,10 @@ async def streak_view(msg: Message, state: FSMContext):
 async def archive_view(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     uid = msg.from_user.id
-    tasks = await get_user_tasks(uid, statuses=[STATUS_DONE])
+    try:
+        tasks = await get_user_tasks(uid, statuses=[STATUS_DONE])
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     if not tasks:
         return await msg.answer("📦 *Архів*\n\nВиконаних завдань ще немає.", reply_markup=kb_main())
     by_month: dict = {}
@@ -792,8 +844,11 @@ async def archive_view(msg: Message, state: FSMContext):
 @dp.message(F.text == "📖 Підсумок дня")
 async def summary_on_demand(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
-    stats = await compute_daily_stats(msg.from_user.id)
-    streak = await get_streak(msg.from_user.id)
+    try:
+        stats = await compute_daily_stats(msg.from_user.id)
+        streak = await get_streak(msg.from_user.id)
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     await msg.answer(build_daily_summary_text(stats, streak), reply_markup=kb_main())
 
 def build_daily_summary_text(stats: dict, streak: int) -> str:
@@ -816,7 +871,10 @@ def build_daily_summary_text(stats: dict, streak: int) -> str:
 async def export_csv(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     uid = msg.from_user.id
-    tasks = sort_tasks(await get_user_tasks(uid))
+    try:
+        tasks = sort_tasks(await get_user_tasks(uid))
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     if not tasks:
         return await msg.answer("📭 Немає завдань для експорту.", reply_markup=kb_main())
     output = io.StringIO()
@@ -858,7 +916,7 @@ async def reminder_task():
         try:
             now = datetime.now()
             cursor = tasks_col.find({"status": STATUS_PENDING}, {"_id": 0})
-            pending = await db_call(cursor.to_list(length=None), default=[]) or []
+            pending = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
             pending = sort_tasks_by_priority_then_due(pending)
 
             for t in pending:
@@ -913,7 +971,7 @@ async def daily_job_task():
                     await bot.send_message(uid, build_daily_summary_text(stats, streak))
 
                     cursor = tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
-                    postponed_ids = [d["id"] for d in (await db_call(cursor.to_list(length=None), default=[]) or [])]
+                    postponed_ids = [d["id"] for d in (await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or [])]
                     for tid in postponed_ids:
                         await update_task(tid, {"postponed_today": False})
 
