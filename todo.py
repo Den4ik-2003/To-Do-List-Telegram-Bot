@@ -7,6 +7,7 @@ import os
 import secrets
 from datetime import datetime, timedelta
 
+import openai
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -31,6 +32,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("tasks_bot")
+
+logger.info("openai SDK version: %s", getattr(openai, "__version__", "unknown"))
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_PASSWORD = os.environ["BOT_PASSWORD"]
@@ -575,7 +578,7 @@ XP: {st.get('xp', 0)}
 - Задачі не обов'язково повинні стосуватись проєктів — врахуй, що в користувача є й інша робота.
 - Враховуй активні проєкти при виборі фокуса дня, якщо вони давно не рухались.
 
-Поверни ВИКЛЮЧНО валідний JSON без жодного тексту навколо, у форматі:
+Поверни ВИКЛЮЧНО валідний JSON без жодного тексту навколо, без коментарів, без markdown-розмітки (без ```), у форматі:
 {{
   "focus": "короткий головний фокус дня",
   "reason": "одне речення чому саме такий фокус",
@@ -585,11 +588,20 @@ XP: {st.get('xp', 0)}
   ]
 }}"""
 
-        resp = await openai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-        )
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            logger.warning("AI Планер: модель не підтримує response_format=json_object, повторюю без нього")
+            resp = await openai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+            )
         raw = _strip_json_fence(resp.choices[0].message.content or "")
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -710,8 +722,9 @@ def ikb_ai_plan_preview(tasks: list, selected: set) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=f"{mark} {t['text'][:35]}", callback_data=f"aiptoggle:{i}")])
     rows.append([
         InlineKeyboardButton(text="🚀 Створити план", callback_data="aip_add"),
-        InlineKeyboardButton(text="❌ Відхилити", callback_data="aip_cancel"),
+        InlineKeyboardButton(text="🔄 Перегенерувати", callback_data="ai_regenerate"),
     ])
+    rows.append([InlineKeyboardButton(text="❌ Відхилити", callback_data="aip_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_ai_menu() -> InlineKeyboardMarkup:
@@ -1796,25 +1809,43 @@ async def ai_menu_back_cb(cb: CallbackQuery):
     await cb.message.edit_text("🤖 *AI Планер*\n\nЩо зробити?", reply_markup=ikb_ai_menu())
     await cb.answer()
 
+async def _generate_and_show_plan(cb: CallbackQuery):
+    """Спільна логіка генерації та показу AI-плану (використовується і для нового плану, і для перегенерації)."""
+    await cb.message.edit_text("☀️ Аналізую твої задачі, цілі, проєкти та статистику, зачекай кілька секунд...")
+    plan = await generate_ai_plan(cb.from_user.id)
+    if not plan or not plan.get("tasks"):
+        return await cb.message.edit_text(AI_ERROR_TEXT)
+    selected = set(range(len(plan["tasks"])))
+    ai_suggestions_cache[cb.from_user.id] = {"plan": plan, "selected": selected}
+    await save_user_state(cb.from_user.id, {"last_ai_plan_date": datetime.now().strftime("%Y-%m-%d")})
+    await cb.message.edit_text(
+        fmt_ai_plan_preview(plan, selected),
+        reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
+    )
+
 @dp.callback_query(F.data == "ai_plan")
 async def ai_plan_cb(cb: CallbackQuery):
     if not openai_client:
         return await cb.message.edit_text(AI_ERROR_TEXT)
     try:
         await cb.answer("Генерую...")
-        await cb.message.edit_text("☀️ Аналізую твої задачі, цілі, проєкти та статистику, зачекай кілька секунд...")
-        plan = await generate_ai_plan(cb.from_user.id)
-        if not plan or not plan.get("tasks"):
-            return await cb.message.edit_text(AI_ERROR_TEXT)
-        selected = set(range(len(plan["tasks"])))
-        ai_suggestions_cache[cb.from_user.id] = {"plan": plan, "selected": selected}
-        await save_user_state(cb.from_user.id, {"last_ai_plan_date": datetime.now().strftime("%Y-%m-%d")})
-        await cb.message.edit_text(
-            fmt_ai_plan_preview(plan, selected),
-            reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
-        )
+        await _generate_and_show_plan(cb)
     except Exception:
         logger.exception("ai_plan_cb failed")
+        try:
+            await cb.message.edit_text(AI_ERROR_TEXT)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "ai_regenerate")
+async def ai_regenerate_cb(cb: CallbackQuery):
+    if not openai_client:
+        return await cb.answer(AI_ERROR_TEXT, show_alert=True)
+    try:
+        await cb.answer("Перегенеровую...")
+        await _generate_and_show_plan(cb)
+    except Exception:
+        logger.exception("ai_regenerate_cb failed")
         try:
             await cb.message.edit_text(AI_ERROR_TEXT)
         except TelegramAPIError:
