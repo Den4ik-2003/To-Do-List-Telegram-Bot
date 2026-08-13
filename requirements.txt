@@ -7,3 +7,4 @@ openpyxl
 reportlab
 pandas
 python-dotenv
+openai
