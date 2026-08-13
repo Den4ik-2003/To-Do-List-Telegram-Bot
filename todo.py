@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
 import secrets
@@ -22,6 +23,8 @@ from aiogram.types import (
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
+from bson import ObjectId
+from openai import AsyncOpenAI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,17 +39,33 @@ MONGO_URI = os.environ["MONGO_URI"]
 REMINDER_BEFORE_MINUTES = int(os.environ.get("REMINDER_BEFORE_MINUTES", "10"))
 DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "21:00")
 
+# ---- OpenAI / AI Планер ----
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+AI_DAILY_PLAN_TIME = os.environ.get("AI_DAILY_PLAN_TIME", "09:00")
+AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().lower() == "true"
+
+# Робочий графік користувача (враховується AI при плануванні часу задач)
+WORK_HOURS_TEXT = "09:00–18:00"
+
+openai_client: AsyncOpenAI | None = None
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+else:
+    logger.warning("OPENAI_API_KEY не задано — AI Планер вимкнено (звичайний функціонал бота працює як завжди)")
+
 mongo_client: AsyncIOMotorClient | None = None
 db = None
 tasks_col = None
 users_col = None
 auth_col = None
 counters_col = None
+goals_col = None
 
 authorized_uids: set[int] = set()
 
 def init_mongo():
-    global mongo_client, db, tasks_col, users_col, auth_col, counters_col
+    global mongo_client, db, tasks_col, users_col, auth_col, counters_col, goals_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=8000,
@@ -60,6 +79,7 @@ def init_mongo():
     users_col = db["users"]
     auth_col = db["auth"]
     counters_col = db["counters"]
+    goals_col = db["goals"]
 
 LABELS = {
     "urgent":   {"emoji": "🔴", "name": "Терміново"},
@@ -80,10 +100,13 @@ CATEGORIES = {
     "other":   {"emoji": "🗂", "name": "Інше"},
 }
 
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
 STATUS_PENDING = "pending"
 STATUS_DONE = "done"
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
+AI_ERROR_TEXT = "⚠️ AI-планувальник тимчасово недоступний. Спробуй пізніше — решта бота працює як завжди."
 
 MONTHS_UA = [
     "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
@@ -142,11 +165,15 @@ async def get_user_state(uid: int) -> dict:
         return {
             "uid": uid, "streak": 0, "last_streak_date": "",
             "archive_prompt_month": "", "xp": 0,
-            "total_completed": 0, "total_missed": 0,
+            "total_completed": 0, "total_missed": 0, "total_postponed": 0,
+            "last_ai_plan_date": "", "ai_morning_enabled": True,
         }
     doc.setdefault("xp", 0)
     doc.setdefault("total_completed", 0)
     doc.setdefault("total_missed", 0)
+    doc.setdefault("total_postponed", 0)
+    doc.setdefault("last_ai_plan_date", "")
+    doc.setdefault("ai_morning_enabled", True)
     return doc
 
 async def save_user_state(uid: int, fields: dict):
@@ -262,8 +289,10 @@ def fmt_task(t: dict, short: bool = False) -> str:
     if due_dt and status != STATUS_DONE:
         remain = "  " + time_remaining_str(due_dt)
 
+    src = " 🤖" if t.get("source") == "ai" else ""
+
     lines = [
-        f"{pin_str}*№{t['id']}* {label['emoji']} {status_icon}",
+        f"{pin_str}*№{t['id']}* {label['emoji']} {status_icon}{src}",
         f"📝 {t.get('text', '')}",
         f"🕐 {t.get('due', '')}{remain}",
         f"🏷 {cat['emoji']} {cat['name']}   {label['emoji']} {label['name']}",
@@ -349,6 +378,280 @@ async def get_streak(uid: int) -> int:
     state = await get_user_state(uid)
     return state.get("streak", 0)
 
+# =========================================================
+# GOALS (довгострокові цілі користувача)
+# =========================================================
+
+async def get_active_goals(uid: int) -> list:
+    cursor = goals_col.find({"uid": uid, "active": True})
+    return await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
+
+async def get_all_goals(uid: int) -> list:
+    cursor = goals_col.find({"uid": uid}).sort("created_at", -1)
+    return await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
+
+async def add_goal(uid: int, title: str, description: str, priority: str):
+    await db_call(goals_col.insert_one({
+        "uid": uid,
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "active": True,
+        "created_at": datetime.now().isoformat(),
+    }))
+
+async def toggle_goal(gid: str, active: bool):
+    await db_call(goals_col.update_one({"_id": ObjectId(gid)}, {"$set": {"active": active}}))
+
+async def delete_goal(gid: str):
+    await db_call(goals_col.delete_one({"_id": ObjectId(gid)}))
+
+def fmt_goals_list(goals: list) -> str:
+    if not goals:
+        return "🎯 *Мої цілі*\n\nЩе немає жодної цілі.\nНатисни «➕ Додати ціль», щоб задати першу — AI буде враховувати її при плануванні."
+    lines = ["🎯 *Мої цілі*", ""]
+    for g in goals:
+        status = "✅" if g.get("active") else "⏸ (неактивна)"
+        pr = PRIORITY_EMOJI.get(g.get("priority", "medium"), "🟡")
+        lines.append(f"{pr} *{g.get('title','')}* — {status}")
+        if g.get("description"):
+            lines.append(f"   _{g['description'][:80]}_")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+def ikb_goals(goals: list) -> InlineKeyboardMarkup:
+    rows = []
+    for g in goals:
+        gid = str(g["_id"])
+        toggle_text = "⏸ Деактивувати" if g.get("active") else "▶️ Активувати"
+        title = g.get("title", "")[:24]
+        rows.append([InlineKeyboardButton(text=f"🎯 {title}", callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton(text=toggle_text, callback_data=f"goaltoggle:{gid}"),
+            InlineKeyboardButton(text="🗑 Видалити", callback_data=f"goaldel:{gid}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Додати ціль", callback_data="goal_add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ai_menu_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_priority() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🔴 Високий"), KeyboardButton(text="🟡 Середній"), KeyboardButton(text="🟢 Низький")],
+        [KeyboardButton(text="❌ Скасувати")],
+    ], resize_keyboard=True)
+
+def priority_from_text(text: str) -> str | None:
+    return {"🔴 Високий": "high", "🟡 Середній": "medium", "🟢 Низький": "low"}.get(text)
+
+# =========================================================
+# AI ПЛАНЕР (OpenAI)
+# =========================================================
+# ai_suggestions_cache[uid] = {"plan": {"focus", "reason", "tasks": [...]}, "selected": set[int]}
+ai_suggestions_cache: dict = {}
+
+def _strip_json_fence(raw: str) -> str:
+    raw = raw.strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```")
+    return raw.strip()
+
+async def generate_ai_plan(uid: int) -> dict | None:
+    """Аналізує активні задачі, виконані сьогодні, прострочені, streak/XP та активні
+    цілі користувача і повертає структурований план: {"focus","reason","tasks":[...]}."""
+    if not openai_client:
+        return None
+    try:
+        active = sort_tasks(await get_user_tasks(uid, statuses=[STATUS_PENDING]))[:20]
+        done_all = await get_user_tasks(uid, statuses=[STATUS_DONE])
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        done_today = [t for t in done_all if (t.get("completed_at") or "").startswith(today_key)]
+        overdue = [t for t in active if is_missed(t)]
+        goals = await get_active_goals(uid)
+        st = await get_user_state(uid)
+
+        active_text = "\n".join(
+            f"- {t.get('text','')} | {t.get('due','')} | "
+            f"{LABELS.get(t.get('label',''), {}).get('name','')} | "
+            f"{CATEGORIES.get(t.get('category',''), {}).get('name','')}"
+            for t in active
+        ) or "(активних задач немає)"
+
+        done_text = "\n".join(f"- {t.get('text','')}" for t in done_today) or "(ще нічого не виконано)"
+        goals_text = "\n".join(
+            f"- [{g.get('priority','medium')}] {g.get('title','')}" + (f" — {g.get('description','')[:80]}" if g.get("description") else "")
+            for g in goals
+        ) or "(довгострокові цілі не задані)"
+
+        now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+        prompt = f"""Ти — персональний AI-планувальник задач. Відповідай виключно українською.
+
+Поточний час: {now_str}
+Робочий графік користувача (основна робота): {WORK_HOURS_TEXT}
+
+Активні задачі користувача:
+{active_text}
+
+Вже виконано сьогодні:
+{done_text}
+
+Прострочених активних задач: {len(overdue)}
+Серія (streak): {st.get('streak', 0)} днів
+XP: {st.get('xp', 0)}
+
+Довгострокові цілі користувача (від найважливіших):
+{goals_text}
+
+Запропонуй 3-6 НОВИХ конкретних задач на сьогодні, реалістичних для виконання за день.
+Правила:
+- Не дублюй активні задачі (якщо задача вже покриває дію — не пропонуй схожу).
+- Задачі мають бути конкретними ("Додати 1 товар з фото й ціною у Telegram"), а не абстрактними ("Попрацювати над бізнесом").
+- Врахуй робочий графік: задачі про IT/навчання/пошук роботи став до початку або після завершення робочого дня, якщо немає інших вказівок.
+- Не став дві задачі на однаковий час і не став задачу поверх уже запланованої активної задачі.
+- Балансуй між напрямками (бізнес, IT/розвиток, поточні справи) — не роби весь план лише про одне.
+- Враховуй пріоритет цілей (high > medium > low) при виборі фокуса дня.
+
+Поверни ВИКЛЮЧНО валідний JSON без жодного тексту навколо, у форматі:
+{{
+  "focus": "короткий головний фокус дня",
+  "reason": "одне речення чому саме такий фокус",
+  "tasks": [
+    {{"text": "конкретна дія", "label": "urgent|medium|low|idea|personal", "category": "work|finance|home|sport|study|other", "time": "гг:хх", "estimated_minutes": 30}}
+  ]
+}}"""
+
+        resp = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        raw = _strip_json_fence(resp.choices[0].message.content or "")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("AI повернув не об'єкт JSON")
+
+        tasks_out = []
+        for it in data.get("tasks", []):
+            if not isinstance(it, dict):
+                continue
+            label = it.get("label") if it.get("label") in LABELS else "medium"
+            category = it.get("category") if it.get("category") in CATEGORIES else "other"
+            time_str = str(it.get("time", "12:00")).strip()
+            try:
+                datetime.strptime(time_str, "%H:%M")
+            except ValueError:
+                time_str = "12:00"
+            try:
+                est = int(it.get("estimated_minutes", 30))
+            except (TypeError, ValueError):
+                est = 30
+            est = max(5, min(est, 240))
+            text = str(it.get("text") or "").strip()[:200]
+            if not text:
+                continue
+            tasks_out.append({
+                "text": text, "label": label, "category": category,
+                "time": time_str, "estimated_minutes": est,
+            })
+
+        if not tasks_out:
+            return None
+
+        return {
+            "focus": str(data.get("focus", "")).strip()[:120],
+            "reason": str(data.get("reason", "")).strip()[:250],
+            "tasks": tasks_out[:6],
+        }
+    except (json.JSONDecodeError, ValueError):
+        logger.exception("AI Планер: не вдалося розпарсити відповідь OpenAI")
+        return None
+    except Exception:
+        logger.exception("generate_ai_plan failed для uid=%s", uid)
+        return None
+
+async def generate_ai_analysis(uid: int) -> str | None:
+    """Короткий текстовий аналіз продуктивності за сьогодні (для кнопки і для вечірнього AI-підсумку)."""
+    if not openai_client:
+        return None
+    try:
+        stats = await compute_daily_stats(uid)
+        st = await get_user_state(uid)
+        prompt = f"""Ти — персональний AI-аналітик продуктивності. Відповідай українською, коротко (до 120 слів), без формальних компліментів.
+
+Дані за сьогодні:
+Виконано задач: {stats['done_count']}
+Пропущено (прострочено): {stats['missed_count']}
+Перенесено на пізніше: {stats['postponed_count']}
+Серія (streak): {st.get('streak', 0)} днів
+XP: {st.get('xp', 0)}
+
+Дай короткий, конкретний і корисний аналіз у форматі (українською, збережи ці підзаголовки):
+🎯 Найкраще: ...
+⚠️ Проблема: ...
+💡 Що змінити завтра: ..."""
+        resp = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text or None
+    except Exception:
+        logger.exception("generate_ai_analysis failed для uid=%s", uid)
+        return None
+
+def fmt_ai_plan_preview(plan: dict, selected: set) -> str:
+    tasks = plan.get("tasks", [])
+    total_minutes = sum(t.get("estimated_minutes", 30) for i, t in enumerate(tasks) if i in selected)
+    lines = ["☀️ *AI План на сьогодні*", ""]
+    if plan.get("focus"):
+        lines.append(f"🎯 Головний фокус: *{plan['focus']}*")
+    if plan.get("reason"):
+        lines.append(f"_{plan['reason']}_")
+    lines.append("")
+    lines.append("🔥 *Пріоритети:*")
+    for i, t in enumerate(tasks):
+        mark = "☑️" if i in selected else "⬜️"
+        label = LABELS.get(t["label"], {})
+        cat = CATEGORIES.get(t["category"], {})
+        lines.append(
+            f"{mark} {label.get('emoji','')} *{t['time']}* — {t['text']} "
+            f"({cat.get('emoji','')} {cat.get('name','')}, ~{t.get('estimated_minutes', 30)} хв)"
+        )
+    h, m = divmod(total_minutes, 60)
+    load_parts = ([f"{h} год"] if h else []) + ([f"{m} хв"] if m else [])
+    lines.append("")
+    lines.append(f"📊 Заплановане навантаження: ~{' '.join(load_parts) or '0 хв'}")
+    lines.append("")
+    lines.append("Натисни на задачу, щоб зняти/додати позначку, потім підтверди.")
+    return "\n".join(lines)
+
+def ikb_ai_plan_preview(tasks: list, selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    for i, t in enumerate(tasks):
+        mark = "☑️" if i in selected else "⬜️"
+        rows.append([InlineKeyboardButton(text=f"{mark} {t['text'][:35]}", callback_data=f"aiptoggle:{i}")])
+    rows.append([
+        InlineKeyboardButton(text="🚀 Створити план", callback_data="aip_add"),
+        InlineKeyboardButton(text="❌ Відхилити", callback_data="aip_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_ai_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="☀️ План на сьогодні", callback_data="ai_plan")],
+        [InlineKeyboardButton(text="📊 Аналіз продуктивності", callback_data="ai_analysis")],
+        [InlineKeyboardButton(text="🎯 Мої цілі", callback_data="ai_goals")],
+        [InlineKeyboardButton(text="⚙️ Налаштування AI", callback_data="ai_settings")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="ai_close")],
+    ])
+
+def ikb_ai_settings(morning_enabled: bool) -> InlineKeyboardMarkup:
+    label = "🔔 Ранковий план: Увімкнено (для мене)" if morning_enabled else "🔕 Ранковий план: Вимкнено (для мене)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data="ai_toggle_morning")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="ai_menu_back")],
+    ])
+
 class Auth(StatesGroup):
     waiting_password = State()
 
@@ -363,11 +666,17 @@ class AddTask(StatesGroup):
 class EditField(StatesGroup):
     typing = State()
 
+class AddGoal(StatesGroup):
+    title = State()
+    description = State()
+    priority = State()
+
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Нове завдання"), KeyboardButton(text="📋 Сьогодні")],
         [KeyboardButton(text="📆 Всі активні"), KeyboardButton(text="⭐ Обране")],
         [KeyboardButton(text="🏷 Категорії"), KeyboardButton(text="📊 Dashboard")],
+        [KeyboardButton(text="🤖 AI Планер"), KeyboardButton(text="📈 Статистика")],
         [KeyboardButton(text="🔥 Серія"), KeyboardButton(text="📦 Архів")],
         [KeyboardButton(text="📖 Підсумок дня"), KeyboardButton(text="📤 Експорт CSV")],
     ], resize_keyboard=True)
@@ -686,6 +995,7 @@ async def at_time(msg: Message, state: FSMContext):
         "missed_counted": False,
         "postponed_count": 0,
         "postponed_today": False,
+        "source": "manual",
     }
 
     try:
@@ -880,6 +1190,8 @@ async def _postpone(cb: CallbackQuery, tid: int, new_due: datetime):
         "postponed_count": t.get("postponed_count", 0) + 1,
         "postponed_today": True,
     })
+    state = await get_user_state(t["uid"])
+    await save_user_state(t["uid"], {"total_postponed": state.get("total_postponed", 0) + 1})
     t = await get_task(tid)
     try:
         await cb.message.edit_text(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid, t))
@@ -1230,6 +1542,300 @@ async def dashboard_view(msg: Message, state: FSMContext):
         logger.exception("dashboard_view failed")
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
 
+@dp.message(F.text == "📈 Статистика")
+async def stats_view(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    uid = msg.from_user.id
+    try:
+        st = await get_user_state(uid)
+        tasks = await get_user_tasks(uid)
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+    total_completed = st.get("total_completed", 0)
+    total_missed = st.get("total_missed", 0)
+    total_postponed = st.get("total_postponed", 0)
+    denom = total_completed + total_missed
+    completion = round(total_completed / denom * 100) if denom else 100
+
+    today = datetime.now().date()
+    by_day = {today - timedelta(days=i): {"done": 0, "missed": 0} for i in range(7)}
+
+    for t in tasks:
+        if t.get("status") == STATUS_DONE and t.get("completed_at"):
+            try:
+                d = datetime.fromisoformat(t["completed_at"]).date()
+            except ValueError:
+                continue
+            if d in by_day:
+                by_day[d]["done"] += 1
+        elif is_missed(t):
+            due = parse_due(t.get("due", ""))
+            if due and due.date() in by_day:
+                by_day[due.date()]["missed"] += 1
+
+    active = [t for t in tasks if t.get("status") == STATUS_PENDING]
+    by_cat: dict = {}
+    for t in active:
+        key = t.get("category", "other")
+        by_cat[key] = by_cat.get(key, 0) + 1
+
+    lines = [
+        "📈 *Статистика*", "",
+        f"✅ Всього виконано: *{total_completed}*",
+        f"❌ Всього пропущено: *{total_missed}*",
+        f"🔁 Всього перенесено: *{total_postponed}*",
+        f"📊 Відсоток виконання: *{completion}%*",
+        "",
+        "*Останні 7 днів:*",
+    ]
+    for d in sorted(by_day.keys()):
+        stat = by_day[d]
+        lines.append(f"{d.strftime('%d.%m')} — ✅ {stat['done']}  ❌ {stat['missed']}")
+
+    if by_cat:
+        lines.append("")
+        lines.append("*Активні задачі за категоріями:*")
+        for key, cnt in sorted(by_cat.items(), key=lambda x: -x[1]):
+            cat = CATEGORIES.get(key, {"emoji": "", "name": key})
+            lines.append(f"{cat['emoji']} {cat['name']} — {cnt}")
+
+    await msg.answer("\n".join(lines), reply_markup=kb_main())
+
+# =========================================================
+# AI ПЛАНЕР — хендлери
+# =========================================================
+
+@dp.message(F.text == "🤖 AI Планер")
+async def ai_menu(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    if not openai_client:
+        return await msg.answer(
+            "⚠️ AI Планер не налаштований.\nДодай змінну середовища `OPENAI_API_KEY`, щоб увімкнути цю функцію.",
+            reply_markup=kb_main(),
+        )
+    await msg.answer("🤖 *AI Планер*\n\nЩо зробити?", reply_markup=ikb_ai_menu())
+
+@dp.callback_query(F.data == "ai_close")
+async def ai_close_cb(cb: CallbackQuery):
+    try:
+        await cb.message.delete()
+    except TelegramAPIError:
+        pass
+    await cb.answer()
+
+@dp.callback_query(F.data == "ai_menu_back")
+async def ai_menu_back_cb(cb: CallbackQuery):
+    await cb.message.edit_text("🤖 *AI Планер*\n\nЩо зробити?", reply_markup=ikb_ai_menu())
+    await cb.answer()
+
+@dp.callback_query(F.data == "ai_plan")
+async def ai_plan_cb(cb: CallbackQuery):
+    if not openai_client:
+        return await cb.message.edit_text(AI_ERROR_TEXT)
+    try:
+        await cb.answer("Генерую...")
+        await cb.message.edit_text("☀️ Аналізую твої задачі, цілі та статистику, зачекай кілька секунд...")
+        plan = await generate_ai_plan(cb.from_user.id)
+        if not plan or not plan.get("tasks"):
+            return await cb.message.edit_text(AI_ERROR_TEXT)
+        selected = set(range(len(plan["tasks"])))
+        ai_suggestions_cache[cb.from_user.id] = {"plan": plan, "selected": selected}
+        await save_user_state(cb.from_user.id, {"last_ai_plan_date": datetime.now().strftime("%Y-%m-%d")})
+        await cb.message.edit_text(
+            fmt_ai_plan_preview(plan, selected),
+            reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
+        )
+    except Exception:
+        logger.exception("ai_plan_cb failed")
+        try:
+            await cb.message.edit_text(AI_ERROR_TEXT)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("aiptoggle:"))
+async def aiptoggle_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    data = ai_suggestions_cache.get(uid)
+    if not data:
+        return await cb.answer("Сесія застаріла, згенеруй план заново.", show_alert=True)
+    idx = int(cb.data.split(":")[1])
+    sel = data["selected"]
+    if idx in sel:
+        sel.discard(idx)
+    else:
+        sel.add(idx)
+    plan = data["plan"]
+    await cb.message.edit_text(fmt_ai_plan_preview(plan, sel), reply_markup=ikb_ai_plan_preview(plan["tasks"], sel))
+    await cb.answer()
+
+@dp.callback_query(F.data == "aip_add")
+async def aip_add_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    data = ai_suggestions_cache.pop(uid, None)
+    if not data or not data["selected"]:
+        return await cb.answer("Нічого не обрано.", show_alert=True)
+    tasks = data["plan"]["tasks"]
+    today = datetime.now().strftime("%d.%m.%Y")
+    added = 0
+    try:
+        for i in sorted(data["selected"]):
+            it = tasks[i]
+            new_id = await next_task_id()
+            task = {
+                "id": new_id,
+                "uid": uid,
+                "text": it["text"],
+                "label": it["label"],
+                "category": it["category"],
+                "due": f"{today} {it['time']}",
+                "status": STATUS_PENDING,
+                "pinned": False,
+                "subtasks": [],
+                "created_at": datetime.now().isoformat(),
+                "completed_at": None,
+                "reminded_before": False,
+                "missed_flagged": False,
+                "missed_counted": False,
+                "postponed_count": 0,
+                "postponed_today": False,
+                "source": "ai",
+            }
+            await add_task(task)
+            added += 1
+    except DBUnavailable:
+        pass
+    await cb.message.edit_text(f"✅ *Створено план!*\n\nДодано {added} задач(і) — вони вже в твоєму списку активних, з нагадуваннями та XP як завжди.")
+    await cb.answer()
+
+@dp.callback_query(F.data == "aip_cancel")
+async def aip_cancel_cb(cb: CallbackQuery):
+    ai_suggestions_cache.pop(cb.from_user.id, None)
+    await cb.message.edit_text("❌ План відхилено. Задачі не додано.")
+    await cb.answer()
+
+@dp.callback_query(F.data == "ai_analysis")
+async def ai_analysis_cb(cb: CallbackQuery):
+    if not openai_client:
+        return await cb.message.edit_text(AI_ERROR_TEXT)
+    try:
+        await cb.answer("Аналізую...")
+        await cb.message.edit_text("📊 Аналізую твою продуктивність...")
+        text = await generate_ai_analysis(cb.from_user.id)
+        if not text:
+            return await cb.message.edit_text(AI_ERROR_TEXT)
+        await cb.message.edit_text(f"📊 *Аналіз продуктивності*\n\n{text}")
+    except Exception:
+        logger.exception("ai_analysis_cb failed")
+        try:
+            await cb.message.edit_text(AI_ERROR_TEXT)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "ai_goals")
+async def ai_goals_cb(cb: CallbackQuery):
+    try:
+        goals = await get_all_goals(cb.from_user.id)
+        await cb.message.edit_text(fmt_goals_list(goals), reply_markup=ikb_goals(goals))
+        await cb.answer()
+    except DBUnavailable:
+        await cb.message.edit_text(DB_ERROR_TEXT)
+
+@dp.callback_query(F.data.startswith("goaltoggle:"))
+async def goal_toggle_cb(cb: CallbackQuery):
+    try:
+        gid = cb.data.split(":", 1)[1]
+        goals = await get_all_goals(cb.from_user.id)
+        cur = next((g for g in goals if str(g["_id"]) == gid), None)
+        if not cur:
+            return await cb.answer("Не знайдено", show_alert=True)
+        await toggle_goal(gid, not cur.get("active", True))
+        goals = await get_all_goals(cb.from_user.id)
+        await cb.message.edit_text(fmt_goals_list(goals), reply_markup=ikb_goals(goals))
+        await cb.answer("Оновлено")
+    except Exception:
+        logger.exception("goal_toggle_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("goaldel:"))
+async def goal_delete_cb(cb: CallbackQuery):
+    try:
+        gid = cb.data.split(":", 1)[1]
+        await delete_goal(gid)
+        goals = await get_all_goals(cb.from_user.id)
+        await cb.message.edit_text(fmt_goals_list(goals), reply_markup=ikb_goals(goals))
+        await cb.answer("Видалено")
+    except Exception:
+        logger.exception("goal_delete_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "goal_add")
+async def goal_add_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddGoal.title)
+    await cb.message.answer("🎯 Введи назву цілі (коротко):", reply_markup=kb_cancel())
+    await cb.answer()
+
+@dp.message(AddGoal.title)
+async def goal_add_title(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    await state.update_data(title=msg.text.strip()[:100])
+    await state.set_state(AddGoal.description)
+    await msg.answer("📝 Опиши ціль детальніше (або напиши «-», щоб пропустити):", reply_markup=kb_cancel())
+
+@dp.message(AddGoal.description)
+async def goal_add_desc(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    desc = "" if msg.text.strip() == "-" else msg.text.strip()[:300]
+    await state.update_data(description=desc)
+    await state.set_state(AddGoal.priority)
+    await msg.answer("🎚 Обери пріоритет цілі:", reply_markup=kb_priority())
+
+@dp.message(AddGoal.priority)
+async def goal_add_priority(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    priority = priority_from_text(msg.text)
+    if not priority:
+        return await msg.answer("⚠️ Оберіть варіант на клавіатурі:", reply_markup=kb_priority())
+    fd = await state.get_data()
+    try:
+        await add_goal(msg.from_user.id, fd["title"], fd.get("description", ""), priority)
+    except DBUnavailable:
+        await state.clear()
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+    await state.clear()
+    await msg.answer("✅ Ціль додано! AI буде враховувати її при плануванні.", reply_markup=kb_main())
+
+@dp.callback_query(F.data == "ai_settings")
+async def ai_settings_cb(cb: CallbackQuery):
+    st = await get_user_state(cb.from_user.id)
+    enabled = st.get("ai_morning_enabled", True)
+    global_status = "увімкнено адміністратором" if AI_DAILY_PLAN_ENABLED else "вимкнено адміністратором (env AI_DAILY_PLAN_ENABLED=false)"
+    text = (
+        "⚙️ *Налаштування AI*\n\n"
+        f"🕐 Час ранкового плану: *{AI_DAILY_PLAN_TIME}*\n"
+        f"🌐 Глобально: {global_status}\n\n"
+        "Можеш увімкнути/вимкнути ранковий план особисто для себе:"
+    )
+    await cb.message.edit_text(text, reply_markup=ikb_ai_settings(enabled))
+    await cb.answer()
+
+@dp.callback_query(F.data == "ai_toggle_morning")
+async def ai_toggle_morning_cb(cb: CallbackQuery):
+    st = await get_user_state(cb.from_user.id)
+    new_val = not st.get("ai_morning_enabled", True)
+    await save_user_state(cb.from_user.id, {"ai_morning_enabled": new_val})
+    await cb.message.edit_reply_markup(reply_markup=ikb_ai_settings(new_val))
+    await cb.answer("Оновлено!")
+
 @dp.message(F.text == "📤 Експорт CSV")
 async def export_csv(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -1241,7 +1847,7 @@ async def export_csv(msg: Message, state: FSMContext):
     if not tasks:
         return await msg.answer("📭 Немає завдань для експорту.", reply_markup=kb_main())
     output = io.StringIO()
-    fieldnames = ["id", "text", "label", "category", "due", "status", "pinned", "completed_at", "postponed_count"]
+    fieldnames = ["id", "text", "label", "category", "due", "status", "pinned", "completed_at", "postponed_count", "source"]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for t in tasks:
@@ -1354,6 +1960,15 @@ async def daily_job_task():
                     streak = await update_streak(uid, stats["missed_count"])
                     await bot.send_message(uid, build_daily_summary_text(stats, streak))
 
+                    # Вечірній AI-аналіз дня (не ламає звичайний підсумок, якщо AI недоступний)
+                    if openai_client:
+                        try:
+                            analysis = await generate_ai_analysis(uid)
+                            if analysis:
+                                await bot.send_message(uid, f"🌙 *AI Підсумок дня*\n\n{analysis}")
+                        except Exception:
+                            logger.exception("Вечірній AI-аналіз не вдався для uid %s", uid)
+
                     cursor = tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
                     postponed_ids = [d["id"] for d in (await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or [])]
                     for tid in postponed_ids:
@@ -1375,6 +1990,52 @@ async def daily_job_task():
                     logger.exception("daily_job_task failed for uid %s", uid)
         except Exception:
             logger.exception("daily_job_task outer loop failed")
+
+async def ai_morning_plan_task():
+    """Раз на день о AI_DAILY_PLAN_TIME генерує AI-план для кожного авторизованого
+    користувача (якщо AI увімкнений глобально й особисто для нього) і надсилає
+    пропозицію з кнопками. Задачі в MongoDB НЕ створюються без підтвердження.
+    last_ai_plan_date позначається ДО генерації, щоб рестарт бота не спричинив дубль."""
+    if not AI_DAILY_PLAN_ENABLED or not openai_client:
+        logger.info("Автоматичний AI ранковий план вимкнено (немає ключа або AI_DAILY_PLAN_ENABLED=false)")
+        return
+    while True:
+        try:
+            hh, mm = map(int, AI_DAILY_PLAN_TIME.split(":"))
+        except ValueError:
+            hh, mm = 9, 0
+        now = datetime.now()
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            uids = await get_all_uids()
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for uid in uids:
+                try:
+                    state = await get_user_state(uid)
+                    if not state.get("ai_morning_enabled", True):
+                        continue
+                    if state.get("last_ai_plan_date") == today_str:
+                        continue
+                    # Позначаємо ДО генерації — захист від повторної відправки після рестарту
+                    await save_user_state(uid, {"last_ai_plan_date": today_str})
+
+                    plan = await generate_ai_plan(uid)
+                    if not plan or not plan.get("tasks"):
+                        continue
+                    selected = set(range(len(plan["tasks"])))
+                    ai_suggestions_cache[uid] = {"plan": plan, "selected": selected}
+                    intro = "☀️ *Доброго ранку!*\n\n" + fmt_ai_plan_preview(plan, selected)
+                    await bot.send_message(
+                        uid, intro,
+                        reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
+                    )
+                except Exception:
+                    logger.exception("ai_morning_plan_task failed for uid %s", uid)
+        except Exception:
+            logger.exception("ai_morning_plan_task outer loop failed")
 
 from aiohttp import web
 
@@ -1401,6 +2062,7 @@ async def main():
     asyncio.create_task(reminder_task())
     asyncio.create_task(midnight_rollover_task())
     asyncio.create_task(daily_job_task())
+    asyncio.create_task(ai_morning_plan_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Бот завдань запущено (MongoDB)...")
