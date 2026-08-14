@@ -61,3 +61,25 @@ async def get_user_state(uid: int) -> dict:
 
 async def save_user_state(uid: int, fields: dict):
     await db_call(m.users_col.update_one({"uid": uid}, {"$set": fields}, upsert=True))
+
+
+async def update_streak(uid: int, missed_count: int) -> int:
+    """
+    Оновлює денну серію (streak) користувача. Викликається раз на день
+    (у вечірньому звіті) — якщо за день не було жодної пропущеної задачі,
+    серія зростає, інакше скидається в 0.
+    """
+    from datetime import datetime as _dt
+
+    state = await get_user_state(uid)
+    today_str = _dt.now().strftime("%d.%m.%Y")
+    if state.get("last_streak_date") == today_str:
+        return state.get("streak", 0)
+
+    streak = state.get("streak", 0)
+    if missed_count == 0:
+        streak += 1
+    else:
+        streak = 0
+    await save_user_state(uid, {"streak": streak, "last_streak_date": today_str})
+    return streak

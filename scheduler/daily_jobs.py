@@ -5,30 +5,30 @@ from datetime import datetime, timedelta
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
-from config.constants import LABELS
+from config.constants import LABELS, STATUS_PENDING, STATUS_DONE
 from config.settings import (
     REMINDER_BEFORE_MINUTES,
     DAILY_REPORT_TIME,
     AI_DAILY_PLAN_TIME,
     AI_DAILY_PLAN_ENABLED,
 )
+from database import mongo as m
+from database import tasks as tasks_db
 from database.mongo import db_call
-from database.tasks import (
-    tasks_col,
-    get_user_tasks,
-    update_task,
-    STATUS_PENDING,
-    STATUS_DONE,
-)
-from database.users import get_user_state, save_user_state, get_all_uids
-from services.ai_service import openai_client, generate_ai_analysis
-from services.planner_service import generate_ai_plan, ai_suggestions_cache
-from services.statistics_service import compute_daily_stats, update_streak
+from database.tasks import get_user_tasks, update_task
+from database.users import get_user_state, save_user_state, get_all_uids, update_streak
+from services import ai_service
+from services.planner_service import generate_daily_plan, generate_daily_analysis
 from utils.dates import parse_due
 from utils.formatting import build_daily_summary_text, fmt_ai_plan_preview
 from keyboards.ai import ikb_ai_plan_preview
 from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
+from handlers.common import compute_daily_stats
+
+# Кеш AI-планів на сьогодні (ранковий автоплан), щоб handlers/ai_planner.py
+# міг підхопити той самий план, коли користувач тисне кнопки "toggle"/"додати"
+ai_suggestions_cache: dict = {}
 
 logger = logging.getLogger("scheduler.daily_jobs")
 
@@ -37,7 +37,7 @@ async def reminder_task(bot: Bot):
     while True:
         await asyncio.sleep(30)
         try:
-            cursor = tasks_col.find({"status": STATUS_PENDING, "reminded_before": False}, {"_id": 0})
+            cursor = m.tasks_col.find({"status": STATUS_PENDING, "reminded_before": False}, {"_id": 0})
             pending = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
             now = datetime.now()
             for t in pending:
@@ -69,7 +69,7 @@ async def midnight_rollover_task(bot: Bot):
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         try:
-            cursor = tasks_col.find({"status": STATUS_PENDING}, {"_id": 0})
+            cursor = m.tasks_col.find({"status": STATUS_PENDING}, {"_id": 0})
             pending = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
             today_date = datetime.now().date()
             for t in pending:
@@ -112,19 +112,19 @@ async def daily_job_task(bot: Bot):
             uids = await get_all_uids()
             for uid in uids:
                 try:
-                    stats = await compute_daily_stats(uid)
+                    stats = await compute_daily_stats(uid, tasks_db)
                     streak = await update_streak(uid, stats["missed_count"])
                     await bot.send_message(uid, build_daily_summary_text(stats, streak))
 
-                    if openai_client:
+                    if ai_service.is_available():
                         try:
-                            analysis = await generate_ai_analysis(uid)
+                            analysis = await generate_daily_analysis(uid, stats)
                             if analysis:
                                 await bot.send_message(uid, f"🌙 *AI Підсумок дня*\n\n{analysis}")
                         except Exception:
                             logger.exception("Вечірній AI-аналіз не вдався для uid %s", uid)
 
-                    cursor = tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
+                    cursor = m.tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
                     postponed_ids = [d["id"] for d in (await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or [])]
                     for tid in postponed_ids:
                         await update_task(tid, {"postponed_today": False})
@@ -148,7 +148,7 @@ async def daily_job_task(bot: Bot):
 
 
 async def ai_morning_plan_task(bot: Bot):
-    if not AI_DAILY_PLAN_ENABLED or not openai_client:
+    if not AI_DAILY_PLAN_ENABLED or not ai_service.is_available():
         logger.info("Автоматичний AI ранковий план вимкнено (немає ключа або AI_DAILY_PLAN_ENABLED=false)")
         return
     while True:
@@ -173,7 +173,7 @@ async def ai_morning_plan_task(bot: Bot):
                         continue
                     await save_user_state(uid, {"last_ai_plan_date": today_str})
 
-                    plan = await generate_ai_plan(uid)
+                    plan = await generate_daily_plan(uid)
                     if not plan or not plan.get("tasks"):
                         continue
                     selected = set(range(len(plan["tasks"])))
