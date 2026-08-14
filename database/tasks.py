@@ -1,9 +1,11 @@
-from database.mongo import tasks_col, counters_col, db_call
+from database import mongo as m
+from database.mongo import db_call
+from config.constants import LABEL_ORDER
 
 
 async def next_task_id() -> int:
     doc = await db_call(
-        counters_col.find_one_and_update(
+        m.counters_col.find_one_and_update(
             {"_id": "task_id"},
             {"$inc": {"seq": 1}},
             upsert=True,
@@ -14,48 +16,46 @@ async def next_task_id() -> int:
 
 
 async def add_task(task: dict):
-    await db_call(tasks_col.insert_one(task))
+    await db_call(m.tasks_col.insert_one(task))
 
 
 async def get_task(tid: int) -> dict | None:
-    return await db_call(tasks_col.find_one({"id": tid}, {"_id": 0}))
+    return await db_call(m.tasks_col.find_one({"id": tid}, {"_id": 0}))
 
 
 async def update_task(tid: int, fields: dict):
-    await db_call(tasks_col.update_one({"id": tid}, {"$set": fields}))
+    await db_call(m.tasks_col.update_one({"id": tid}, {"$set": fields}))
 
 
 async def delete_task(tid: int):
-    await db_call(tasks_col.delete_one({"id": tid}))
+    await db_call(m.tasks_col.delete_one({"id": tid}))
 
 
 async def get_user_tasks(uid: int, statuses: list | None = None) -> list:
     query = {"uid": uid}
     if statuses:
         query["status"] = {"$in": statuses}
-    cursor = tasks_col.find(query, {"_id": 0})
-    return await db_call(cursor.to_list(length=None), default=[]) or []
+    cursor = m.tasks_col.find(query, {"_id": 0})
+    tasks = await db_call(cursor.to_list(length=None), default=[]) or []
+    return tasks
 
 
-async def get_project_tasks(uid: int, project_id: str, statuses: list | None = None) -> list:
-    query = {"uid": uid, "project_id": project_id}
-    if statuses:
-        query["status"] = {"$in": statuses}
-    cursor = tasks_col.find(query, {"_id": 0})
-    return await db_call(cursor.to_list(length=None), default=[]) or []
-
-
-async def get_pending_with_reminder_due() -> list:
-    cursor = tasks_col.find({"status": "pending", "reminded_before": False}, {"_id": 0})
+async def find_pending(extra_filter: dict | None = None) -> list:
+    """Використовується фоновими job'ами (нагадування, rollover)."""
+    query = {"status": "pending"}
+    if extra_filter:
+        query.update(extra_filter)
+    cursor = m.tasks_col.find(query, {"_id": 0})
     return await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
 
 
-async def get_all_pending() -> list:
-    cursor = tasks_col.find({"status": "pending"}, {"_id": 0})
-    return await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
+def sort_tasks(tasks: list) -> list:
+    def key(t):
+        return (t.get("due", ""), LABEL_ORDER.get(t.get("label", "idea"), 9))
+    return sorted(tasks, key=key)
 
 
-async def get_postponed_today_ids(uid: int) -> list:
-    cursor = tasks_col.find({"uid": uid, "postponed_today": True}, {"_id": 0, "id": 1})
-    docs = await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
-    return [d["id"] for d in docs]
+def sort_tasks_by_label_then_due(tasks: list) -> list:
+    def key(t):
+        return (LABEL_ORDER.get(t.get("label", "idea"), 9), t.get("due", ""))
+    return sorted(tasks, key=key)
