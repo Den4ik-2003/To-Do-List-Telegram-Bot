@@ -6,12 +6,30 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
 
-from config.settings import BOT_TOKEN, MONGO_URI
+from config.settings import BOT_TOKEN, MONGO_URI, PORT
 from database.mongo import init_mongo, close_mongo
 from database.users import load_authorized_uids
 
 logger = logging.getLogger("tasks_bot")
+
+
+async def start_health_server() -> web.AppRunner:
+    """
+    Мінімальний HTTP-сервер лише для того, щоб Render (Web Service)
+    бачив відкритий порт і не вважав контейнер "нездоровим".
+    Бот працює через long polling, а не через цей сервер — тут просто
+    health-check endpoint.
+    """
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info("Health-check server started on port %s", PORT)
+    return runner
 
 
 def setup_logging() -> None:
@@ -43,6 +61,8 @@ def register_routers(dp: Dispatcher) -> None:
         settings as settings_handlers,
     )
 
+    # Порядок важливий: специфічні FSM-роутери — перед загальним menu-роутером,
+    # інакше menu.py може "перехопити" повідомлення, призначені для FSM-стейтів.
     dp.include_router(start.router)
     dp.include_router(tasks.router)
     dp.include_router(ai_planner.router)
@@ -52,8 +72,9 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(finances.router)
     dp.include_router(statistics.router)
     dp.include_router(settings_handlers.router)
-    dp.include_router(menu.router)  
-    
+    dp.include_router(menu.router)  # menu — останній, як "fallback" на головне меню
+
+
 async def main() -> None:
     setup_logging()
     logger.info("Starting Personal AI Planner bot...")
@@ -71,16 +92,25 @@ async def main() -> None:
 
     register_routers(dp)
 
+    # 3. Health-check сервер для Render (Web Service вимагає відкритий порт)
+    health_runner = await start_health_server()
+
+    # 4. Scheduler (нагадування / опівнічний rollover / вечірній звіт /
+    # ранковий AI-план — усі запускаються як background asyncio-таски,
+    # НЕ як другий polling-інстанс, інакше отримаємо TelegramConflictError)
     from scheduler.daily_jobs import register_scheduler_jobs
 
     register_scheduler_jobs(bot)
     logger.info("Scheduler jobs registered")
 
     try:
+        # На випадок якщо раніше залишився webhook — скидаємо його,
+        # інакше polling впаде з TelegramConflictError
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Starting polling...")
         await dp.start_polling(bot)
     finally:
+        await health_runner.cleanup()
         await close_mongo()
         await bot.session.close()
         logger.info("Bot stopped cleanly")
