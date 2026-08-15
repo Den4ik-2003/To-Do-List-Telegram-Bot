@@ -15,15 +15,29 @@ from database.users import load_authorized_uids
 logger = logging.getLogger("tasks_bot")
 
 
+async def health_check(request: web.Request) -> web.Response:
+    """
+    Легкий health-check endpoint для cron-job.org / Render keep-alive пінгів.
+    Повертає мінімальний текст, щоб не впиратись у ліміт розміру відповіді
+    зовнішніх cron-сервісів ("output too large").
+    """
+    return web.Response(text="OK")
+
+
 async def start_health_server() -> web.AppRunner:
     """
     Мінімальний HTTP-сервер лише для того, щоб Render (Web Service)
     бачив відкритий порт і не вважав контейнер "нездоровим".
     Бот працює через long polling, а не через цей сервер — тут просто
-    health-check endpoint.
+    health-check endpoint(и).
     """
     app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    # Кореневий маршрут — для Render'a, щоб бачив, що сервіс живий.
+    app.router.add_get("/", health_check)
+    # Окремий /health — саме його треба вказувати в cron-job.org,
+    # щоб уникнути помилки "Failed (output too large)".
+    app.router.add_get("/health", health_check)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
