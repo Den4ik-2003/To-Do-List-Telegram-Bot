@@ -4,7 +4,7 @@ from bson import ObjectId
 
 from database import mongo as m
 from database.mongo import db_call
-from config.constants import GOAL_ACTIVE, GOAL_INACTIVE
+from config.constants import GOAL_ACTIVE
 
 
 async def get_active_goals(uid: int) -> list:
