@@ -54,6 +54,16 @@ async def set_goal_status(gid: str, status: str):
     await db_call(m.goals_col.update_one({"_id": ObjectId(gid)}, {"$set": {"status": status}}))
 
 
+async def toggle_goal(gid: str, active: bool):
+    """
+    Сумісність зі старою назвою функції (приймає bool замість рядка статусу),
+    на випадок якщо services/goal_service.py досі викликає саме її.
+    TODO: прибрати цей алiас, коли підтвердимо реальний виклик у goal_service.py.
+    """
+    status = GOAL_ACTIVE if active else "paused"
+    await set_goal_status(gid, status)
+
+
 async def update_goal_progress(gid: str, delta_amount: float):
     await db_call(m.goals_col.update_one({"_id": ObjectId(gid)}, {"$inc": {"current_amount": delta_amount}}))
 
