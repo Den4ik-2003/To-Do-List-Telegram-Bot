@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 from openai import AsyncOpenAI
 
@@ -13,6 +14,27 @@ if not client:
     logger.warning("AI_API_KEY не задано — AI-функції вимкнено, решта бота працює як завжди")
 
 _model_verified = False
+
+# Деякі AI-провайдери (гейтвеї з вбудованою модерацією) дописують у кінець
+# (або й замість) відповіді службові рядки на кшталт:
+#   User Safety: safe
+#   Response Safety: safe
+# Це не частина реальної відповіді моделі — прибираємо їх, інакше вони
+# протікають користувачу як "англійський сміттєвий текст" і ламають
+# json.loads() у generate_json().
+_SAFETY_LINE_RE = re.compile(
+    r"^\s*(user|response|input|output|prompt)\s*safety\s*:\s*\S+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_safety_noise(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _SAFETY_LINE_RE.sub("", text)
+    # прибираємо зайві порожні рядки, що лишились після видалення міток
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 
 def is_available() -> bool:
@@ -45,6 +67,40 @@ def _strip_json_fence(raw: str) -> str:
     return raw.strip()
 
 
+def _extract_json_object(raw: str) -> str | None:
+    """
+    Витягує перший повний JSON-об'єкт { ... } з тексту, ігноруючи будь-який
+    сміттєвий текст до чи після нього (напр. safety-мітки провайдера).
+    Рахує баланс дужок, враховуючи рядкові літерали, щоб не збитись
+    на '{' / '}' всередині рядків JSON.
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start:i + 1]
+    return None
+
+
 async def _complete(prompt: str, temperature: float, json_mode: bool) -> str | None:
     if not client:
         return None
@@ -67,7 +123,8 @@ async def _complete(prompt: str, temperature: float, json_mode: bool) -> str | N
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
             )
-        return (resp.choices[0].message.content or "").strip()
+        raw = (resp.choices[0].message.content or "").strip()
+        return _strip_safety_noise(raw)
     except Exception:
         logger.exception("AI request failed (model=%s)", AI_MODEL)
         return None
@@ -81,8 +138,9 @@ async def generate_json(prompt: str, temperature: float = 0.7) -> dict | None:
     raw = await _complete(prompt, temperature, json_mode=True)
     if raw is None:
         return None
+    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
     try:
-        data = json.loads(_strip_json_fence(raw))
+        data = json.loads(candidate)
     except json.JSONDecodeError:
         logger.exception("AI повернув некоректний JSON: %s", raw[:300])
         return None
@@ -100,7 +158,8 @@ async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
             messages=messages,
             temperature=temperature,
         )
-        return (resp.choices[0].message.content or "").strip()
+        raw = (resp.choices[0].message.content or "").strip()
+        return _strip_safety_noise(raw)
     except Exception:
         logger.exception("AI chat request failed (model=%s)", AI_MODEL)
         return None
