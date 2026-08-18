@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -34,6 +35,48 @@ QUICK_QUESTIONS = {
     "spend_advice": "Чи варто мені зараз витрачати гроші, зважаючи на мій баланс і бюджети?",
 }
 
+# ---------------------------------------------------------------------------
+# Опис функцій, які AI може викликати під час чату.
+# Модель сама вирішує, чи треба викликати функцію, виходячи з фрази
+# користувача (напр. "додай мені таску купити молоко на завтра").
+# ---------------------------------------------------------------------------
+AI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": (
+                "Додає нову задачу (to-do) користувачу в його список задач у базі даних. "
+                "Викликай цю функцію, коли користувач явно просить щось додати, записати, "
+                "нагадати зробити, внести в задачі тощо."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Короткий, зрозумілий опис задачі, напр. 'Купити молоко'.",
+                    },
+                    "due": {
+                        "type": "string",
+                        "description": (
+                            "Дедлайн у форматі YYYY-MM-DD, якщо користувач його вказав "
+                            "(в т.ч. 'завтра', 'у п'ятницю' — перерахуй у конкретну дату сам). "
+                            "Якщо дедлайну немає — залиш порожній рядок."
+                        ),
+                    },
+                    "label": {
+                        "type": "string",
+                        "enum": ["work", "personal", "idea"],
+                        "description": "Категорія задачі, якщо очевидна з контексту. Якщо незрозуміло — 'idea'.",
+                    },
+                },
+                "required": ["title"],
+            },
+        },
+    },
+]
+
 
 @router.message(F.text == "💬 AI Чат")
 async def ai_chat_start(msg: Message, state: FSMContext):
@@ -48,6 +91,8 @@ async def ai_chat_start(msg: Message, state: FSMContext):
         "💬 *AI Чат*\n\n"
         "Постав будь-яке питання про свої задачі, цілі, проєкти чи фінанси — "
         "я відповім, спираючись на твої реальні дані.\n\n"
+        "Також можеш попросити мене додати задачу прямо тут, напр.: "
+        "«додай таску купити молоко на завтра».\n\n"
         f"🤖 Залишилось запитів сьогодні: *{remaining}*\n\n"
         "Щоб завершити — натисни «❌ Скасувати» або кнопку нижче.",
         reply_markup=kb_cancel(),
@@ -118,7 +163,11 @@ async def _build_context_text(uid: int) -> str:
         for p in projects
     ) or "(немає активних проєктів)"
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
     return f"""Контекст користувача (реальні дані, не вигадуй нічого поверх цього):
+
+Сьогоднішня дата: {today_str}
 
 Активних задач: {len(active)}
 Прострочених задач: {len(overdue)}
@@ -136,7 +185,36 @@ async def _build_context_text(uid: int) -> str:
 
 Якщо для відповіді на питання даних недостатньо — чесно скажи:
 "У мене поки недостатньо даних для точної рекомендації."
+Якщо користувач просить додати задачу — виклич функцію add_task з потрібними параметрами.
 Відповідай українською, коротко і по суті."""
+
+
+async def _execute_tool_call(uid: int, name: str, args: dict) -> str:
+    """Виконує реальну дію в БД і повертає короткий текстовий результат — цей текст
+    піде назад у модель, щоб вона сформувала фінальну відповідь користувачу."""
+    if name == "add_task":
+        title = (args.get("title") or "").strip()
+        if not title:
+            return "Помилка: не вказано назву задачі, задачу не додано."
+        try:
+            tid = await tasks_db.next_task_id()
+            task = {
+                "id": tid,
+                "uid": uid,
+                "title": title,
+                "due": (args.get("due") or "").strip(),
+                "label": args.get("label") or "idea",
+                "status": STATUS_PENDING,
+                "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            await tasks_db.add_task(task)
+            return f"Задачу успішно додано (id={tid}): «{title}»."
+        except DBUnavailable:
+            return "Помилка: база даних тимчасово недоступна, задачу не додано."
+        except Exception:
+            logger.exception("Не вдалося додати задачу через AI tool call для uid=%s", uid)
+            return "Помилка: не вдалося додати задачу через технічну проблему."
+    return f"Невідома функція: {name}"
 
 
 async def _handle_chat_message(uid: int, text: str, target: Message):
@@ -160,7 +238,33 @@ async def _handle_chat_message(uid: int, text: str, target: Message):
         messages.extend(history)
         messages.append({"role": "user", "content": text})
 
-        reply = await ai_service.chat(messages)
+        ai_message = await ai_service.chat_with_tools(messages, AI_TOOLS)
+        if ai_message is None:
+            return await thinking.edit_text(AI_ERROR_TEXT)
+
+        tool_calls = getattr(ai_message, "tool_calls", None)
+
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": ai_message.content or "",
+                "tool_calls": [tc.model_dump() for tc in tool_calls],
+            })
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = await _execute_tool_call(uid, tc.function.name, args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+            reply = await ai_service.chat(messages)
+        else:
+            reply = ai_message.content
+
         if not reply:
             return await thinking.edit_text(AI_ERROR_TEXT)
 

@@ -163,3 +163,38 @@ async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
     except Exception:
         logger.exception("AI chat request failed (model=%s)", AI_MODEL)
         return None
+
+
+async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: float = 0.7):
+    """
+    Запит до моделі з підтримкою function calling.
+    Повертає message-об'єкт відповіді провайдера (може містити .content
+    і/або .tool_calls), або None при помилці запиту.
+
+    Якщо модель не підтримує tools — провайдер зазвичай або ігнорує
+    параметр, або кидає виняток; у другому випадку робимо fallback
+    на звичайний запит без tools, щоб чат не падав повністю.
+    """
+    if not client:
+        return None
+    try:
+        resp = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=temperature,
+        )
+        return resp.choices[0].message
+    except Exception:
+        logger.warning("Модель %s не прийняла tools, повторюю без них", AI_MODEL, exc_info=True)
+        try:
+            resp = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=temperature,
+            )
+            return resp.choices[0].message
+        except Exception:
+            logger.exception("AI chat_with_tools request failed (model=%s)", AI_MODEL)
+            return None
