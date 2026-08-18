@@ -201,14 +201,16 @@ async def _execute_tool_call(uid: int, name: str, args: dict) -> str:
             task = {
                 "id": tid,
                 "uid": uid,
-                "title": title,
+                "text": title,
                 "due": (args.get("due") or "").strip(),
-                "label": args.get("label") or "idea",
+                "label": args.get("label") or "medium",
                 "status": STATUS_PENDING,
+                "reminded_before": False,
                 "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             }
             await tasks_db.add_task(task)
-            return f"Задачу успішно додано (id={tid}): «{title}»."
+            due_text = f" на {task['due']}" if task["due"] else ""
+            return f"Задачу успішно додано (id={tid}): «{title}»{due_text}."
         except DBUnavailable:
             return "Помилка: база даних тимчасово недоступна, задачу не додано."
         except Exception:

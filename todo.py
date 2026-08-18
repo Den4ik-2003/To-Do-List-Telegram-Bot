@@ -58,16 +58,14 @@ def setup_logging() -> None:
 
 
 def register_routers(dp: Dispatcher) -> None:
-    """
-    Реєструє всі handlers. Імпорти навмисно тут, а не на верхньому рівні
-    файлу, щоб уникнути циклічних імпортів між handlers <-> keyboards.
-    """
     from handlers import (
         start,
         menu,
         tasks,
         ai_planner,
         ai_chat,
+        ai_command,
+        insights,
         goals,
         projects,
         finances,
@@ -75,27 +73,18 @@ def register_routers(dp: Dispatcher) -> None:
         settings as settings_handlers,
     )
 
-    # Порядок важливий: специфічні FSM-роутери і роутери з ТОЧНИМИ
-    # текстовими кнопками — перед будь-якими "catch-all" роутерами.
-    #
-    # УВАГА: finances.router містить quick_add_catch_all — хендлер
-    # @router.message(StateFilter(None), F.text), який збігається з
-    # БУДЬ-ЯКИМ текстовим повідомленням (спроба розпізнати "швидку
-    # транзакцію"). Якщо цей роутер зареєструвати РАНІШЕ за menu.router,
-    # він перехопить на себе кнопки на кшталт "◀️ Головне меню" та
-    # "💡 Поради" ще до того, як їх побачить menu.router — бот мовчатиме,
-    # ніби кнопка не працює. Тому finances.router має йти САМИМ ОСТАННІМ.
     dp.include_router(start.router)
     dp.include_router(tasks.router)
     dp.include_router(ai_planner.router)
     dp.include_router(ai_chat.router)
+    dp.include_router(ai_command.router)
+    dp.include_router(insights.router)
     dp.include_router(goals.router)
     dp.include_router(projects.router)
     dp.include_router(statistics.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
     dp.include_router(finances.router)  # має бути справді останнім (catch-all)
-
 
 async def main() -> None:
     setup_logging()

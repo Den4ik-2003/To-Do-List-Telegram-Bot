@@ -19,9 +19,10 @@ from database.tasks import get_user_tasks, update_task
 from database.users import get_user_state, save_user_state, get_all_uids, update_streak
 from services import ai_service
 from services.planner_service import generate_daily_plan, generate_daily_analysis
+from services.insights_service import detect_stalled_goal, generate_insight_text
 from utils.dates import parse_due
 from utils.formatting import build_daily_summary_text, fmt_ai_plan_preview
-from keyboards.ai import ikb_ai_plan_preview
+from keyboards.ai import ikb_ai_plan_preview, ikb_insight_actions
 from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
 from handlers.common import compute_daily_stats
@@ -31,6 +32,9 @@ from handlers.common import compute_daily_stats
 ai_suggestions_cache: dict = {}
 
 logger = logging.getLogger("scheduler.daily_jobs")
+
+INSIGHT_CHECK_INTERVAL_DAYS = 7  # раз на тиждень перевіряємо кожного користувача
+INSIGHT_CHECK_TIME = "12:00"     # у який час дня запускати перевірку
 
 
 async def reminder_task(bot: Bot):
@@ -189,8 +193,67 @@ async def ai_morning_plan_task(bot: Bot):
             logger.exception("ai_morning_plan_task outer loop failed")
 
 
+async def proactive_insights_task(bot: Bot):
+    """
+    Раз на INSIGHT_CHECK_INTERVAL_DAYS днів для кожного користувача перевіряє,
+    чи не зависла якась ціль без прогресу, поки виконується купа дрібних задач.
+    Якщо так — бот сам пише повідомлення-спостереження з пропозицією розібрати причини.
+    """
+    if not ai_service.is_available():
+        logger.info("Проактивні AI-інсайти вимкнено (немає AI ключа)")
+        return
+    while True:
+        try:
+            hh, mm = map(int, INSIGHT_CHECK_TIME.split(":"))
+        except ValueError:
+            hh, mm = 12, 0
+        now = datetime.now()
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            uids = await get_all_uids()
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for uid in uids:
+                try:
+                    state = await get_user_state(uid)
+                    if not state.get("ai_insights_enabled", True):
+                        continue
+                    last_sent = state.get("last_insight_date")
+                    if last_sent:
+                        try:
+                            days_since = (datetime.now() - datetime.strptime(last_sent, "%Y-%m-%d")).days
+                        except ValueError:
+                            days_since = INSIGHT_CHECK_INTERVAL_DAYS
+                        if days_since < INSIGHT_CHECK_INTERVAL_DAYS:
+                            continue
+
+                    context = await detect_stalled_goal(uid)
+                    if not context:
+                        continue
+
+                    text = await generate_insight_text(context)
+                    if not text:
+                        continue
+
+                    goal = context["goal"]
+                    gid = str(goal.get("_id") or goal.get("id") or "")
+                    await bot.send_message(
+                        uid,
+                        f"🧠 {text}",
+                        reply_markup=ikb_insight_actions(gid),
+                    )
+                    await save_user_state(uid, {"last_insight_date": today_str})
+                except Exception:
+                    logger.exception("proactive_insights_task failed for uid %s", uid)
+        except Exception:
+            logger.exception("proactive_insights_task outer loop failed")
+
+
 def register_scheduler_jobs(bot: Bot):
     asyncio.create_task(reminder_task(bot))
     asyncio.create_task(midnight_rollover_task(bot))
     asyncio.create_task(daily_job_task(bot))
     asyncio.create_task(ai_morning_plan_task(bot))
+    asyncio.create_task(proactive_insights_task(bot))

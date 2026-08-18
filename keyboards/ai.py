@@ -55,3 +55,10 @@ def ikb_chat_context_actions() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 Чи варто зараз витрачати гроші?", callback_data="chat_quick:spend_advice")],
         [InlineKeyboardButton(text="◀️ Завершити чат", callback_data="chat_close")],
     ])
+
+
+def ikb_insight_actions(goal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔍 Розібрати причини", callback_data=f"insight_breakdown:{goal_id}"),
+        InlineKeyboardButton(text="Не зараз", callback_data=f"insight_dismiss:{goal_id}"),
+    ]])
