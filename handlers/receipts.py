@@ -63,15 +63,17 @@ async def receipt_photo(msg: Message, state: FSMContext, bot):
     except Exception:
         logger.exception("Не вдалося завантажити фото чека для uid=%s", msg.from_user.id)
         await state.clear()
-        return await wait_msg.edit_text("⚠️ Не вдалося завантажити фото. Спробуй ще раз.")
+        await wait_msg.edit_text("⚠️ Не вдалося завантажити фото. Спробуй ще раз.")
+        return await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
     data = await ai_service.extract_receipt(image_bytes)
     await state.clear()
 
     if not data or not data.get("total"):
-        return await wait_msg.edit_text(
+        await wait_msg.edit_text(
             "🤔 Не вдалося розпізнати чек. Спробуй чіткіше фото або введи витрату вручну через «💰 Фінанси».",
         )
+        return await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
     category = data.get("category") or "other"
     if category not in EXPENSE_CATEGORIES:
@@ -109,6 +111,7 @@ async def receipt_photo(msg: Message, state: FSMContext, bot):
         "Додати цю витрату у фінанси?"
     )
     await wait_msg.edit_text(text, reply_markup=_ikb_receipt_confirm())
+    await msg.answer("🏠 Або натисни кнопку нижче, щоб вийти без збереження:", reply_markup=kb_main())
 
 
 @router.message(ReceiptFlow.waiting_photo)
@@ -135,6 +138,7 @@ async def receipt_confirm_cb(cb: CallbackQuery):
     )
     await cb.answer("Додано ✅")
     await cb.message.edit_text(f"✅ Витрату {data['uah_total']:.2f} грн додано у фінанси.")
+    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
 
 
 @router.callback_query(F.data == "receipt_cancel")
@@ -142,3 +146,4 @@ async def receipt_cancel_cb(cb: CallbackQuery):
     _pending_receipts.pop(cb.from_user.id, None)
     await cb.answer()
     await cb.message.edit_text("❌ Скасовано, витрату не додано.")
+    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())

@@ -9,13 +9,14 @@ from aiogram.types import (
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📋 Мої задачі"), KeyboardButton(text="🤖 AI Планер")],
-        [KeyboardButton(text="💬 AI Чат"), KeyboardButton(text="🗣 AI Команди")],
-        [KeyboardButton(text="🎯 Мої цілі"), KeyboardButton(text="📁 Мої проєкти")],
-        [KeyboardButton(text="💰 Фінанси"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="💱 Курс валют"), KeyboardButton(text="💰 Конвертер")],
-        [KeyboardButton(text="📅 Дні до дати"), KeyboardButton(text="🌤️ Погода")],
-        [KeyboardButton(text="🧾 Чек"), KeyboardButton(text="💡 Поради")],
-        [KeyboardButton(text="⚙️ Налаштування")],
+        [KeyboardButton(text="💬 AI Чат"), KeyboardButton(text="🌐 Переклад")],
+        [KeyboardButton(text="✍️ Редактор"), KeyboardButton(text="🗺 Що поруч")],
+        [KeyboardButton(text="⚖️ Рішення"), KeyboardButton(text="🎯 Мої цілі")],
+        [KeyboardButton(text="📁 Мої проєкти"), KeyboardButton(text="💰 Фінанси")],
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="💱 Курс валют")],
+        [KeyboardButton(text="💰 Конвертер"), KeyboardButton(text="📅 Дні до дати")],
+        [KeyboardButton(text="🌤️ Погода"), KeyboardButton(text="🧾 Чек")],
+        [KeyboardButton(text="💡 Поради"), KeyboardButton(text="⚙️ Налаштування")],
     ], resize_keyboard=True)
 
 

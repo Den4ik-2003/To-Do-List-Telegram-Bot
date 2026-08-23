@@ -49,7 +49,10 @@ def register_routers(dp: Dispatcher) -> None:
         tasks,
         ai_planner,
         ai_chat,
-        ai_command,
+        voice,
+        translator,
+        nearby,
+        decision,
         insights,
         goals,
         projects,
@@ -66,7 +69,10 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(tasks.router)
     dp.include_router(ai_planner.router)
     dp.include_router(ai_chat.router)
-    dp.include_router(ai_command.router)
+    dp.include_router(voice.router)
+    dp.include_router(translator.router)
+    dp.include_router(nearby.router)
+    dp.include_router(decision.router)
     dp.include_router(insights.router)
     dp.include_router(goals.router)
     dp.include_router(projects.router)
@@ -77,7 +83,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(receipts.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
-    dp.include_router(finances.router)  # має бути справді останнім (catch-all)
+    dp.include_router(finances.router)
 
 
 async def main() -> None:

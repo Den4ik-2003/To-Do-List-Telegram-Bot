@@ -5,24 +5,20 @@ import base64
 
 from openai import AsyncOpenAI
 
-from config.settings import AI_API_KEY, AI_BASE_URL, AI_MODEL
+from config.settings import AI_API_KEY, AI_BASE_URL, AI_MODEL, WHISPER_API_KEY, WHISPER_BASE_URL, WHISPER_MODEL
 
 logger = logging.getLogger("tasks_bot")
 
 client: AsyncOpenAI | None = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL) if AI_API_KEY else None
+whisper_client: AsyncOpenAI | None = AsyncOpenAI(api_key=WHISPER_API_KEY, base_url=WHISPER_BASE_URL) if WHISPER_API_KEY else None
 
 if not client:
     logger.warning("AI_API_KEY не задано — AI-функції вимкнено, решта бота працює як завжди")
+if not whisper_client:
+    logger.warning("WHISPER_API_KEY не задано — розпізнавання голосових повідомлень вимкнено")
 
 _model_verified = False
 
-# Деякі AI-провайдери (гейтвеї з вбудованою модерацією) дописують у кінець
-# (або й замість) відповіді службові рядки на кшталт:
-#   User Safety: safe
-#   Response Safety: safe
-# Це не частина реальної відповіді моделі — прибираємо їх, інакше вони
-# протікають користувачу як "англійський сміттєвий текст" і ламають
-# json.loads() у generate_json().
 _SAFETY_LINE_RE = re.compile(
     r"^\s*(user|response|input|output|prompt)\s*safety\s*:\s*\S+\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -33,13 +29,16 @@ def _strip_safety_noise(text: str) -> str:
     if not text:
         return text
     cleaned = _SAFETY_LINE_RE.sub("", text)
-    # прибираємо зайві порожні рядки, що лишились після видалення міток
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
 
 def is_available() -> bool:
     return client is not None
+
+
+def voice_available() -> bool:
+    return whisper_client is not None
 
 
 async def verify_model() -> bool:
@@ -69,12 +68,6 @@ def _strip_json_fence(raw: str) -> str:
 
 
 def _extract_json_object(raw: str) -> str | None:
-    """
-    Витягує перший повний JSON-об'єкт { ... } з тексту, ігноруючи будь-який
-    сміттєвий текст до чи після нього (напр. safety-мітки провайдера).
-    Рахує баланс дужок, враховуючи рядкові літерали, щоб не збитись
-    на '{' / '}' всередині рядків JSON.
-    """
     start = raw.find("{")
     if start == -1:
         return None
@@ -167,15 +160,6 @@ async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
 
 
 async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: float = 0.7):
-    """
-    Запит до моделі з підтримкою function calling.
-    Повертає message-об'єкт відповіді провайдера (може містити .content
-    і/або .tool_calls), або None при помилці запиту.
-
-    Якщо модель не підтримує tools — провайдер зазвичай або ігнорує
-    параметр, або кидає виняток; у другому випадку робимо fallback
-    на звичайний запит без tools, щоб чат не падав повністю.
-    """
     if not client:
         return None
     try:
@@ -202,12 +186,6 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
 
 
 async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict | None:
-    """
-    Надсилає фото чека в AI-модель (vision) і повертає:
-    {"total": float, "currency": "UAH"/"PLN", "category": str, "items": [str, ...]}
-    Повертає None, якщо клієнт недоступний, модель не має vision, або
-    відповідь не вдалося розпарсити як JSON.
-    """
     if not client:
         return None
 
@@ -259,3 +237,19 @@ async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
     if not isinstance(data, dict):
         return None
     return data
+
+
+async def transcribe_voice(audio_bytes: bytes) -> str | None:
+    if not whisper_client:
+        return None
+    try:
+        resp = await whisper_client.audio.transcriptions.create(
+            model=WHISPER_MODEL,
+            file=("voice.ogg", audio_bytes),
+            language="uk",
+        )
+        text = (resp.text or "").strip()
+        return text or None
+    except Exception:
+        logger.exception("Voice transcription failed")
+        return None

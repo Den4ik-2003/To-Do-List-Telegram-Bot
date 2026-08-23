@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -37,11 +37,6 @@ QUICK_QUESTIONS = {
     "spend_advice": "Чи варто мені зараз витрачати гроші, зважаючи на мій баланс і бюджети?",
 }
 
-# ---------------------------------------------------------------------------
-# Опис функцій, які AI може викликати під час чату.
-# Модель сама вирішує, чи треба викликати функцію, виходячи з фрази
-# користувача (напр. "додай мені таску купити молоко на завтра").
-# ---------------------------------------------------------------------------
 AI_TOOLS = [
     {
         "type": "function",
@@ -49,8 +44,10 @@ AI_TOOLS = [
             "name": "add_task",
             "description": (
                 "Додає нову задачу (to-do) користувачу в його список задач у базі даних. "
-                "Викликай цю функцію, коли користувач явно просить щось додати, записати, "
-                "нагадати зробити, внести в задачі тощо."
+                "Викликай цю функцію ЩОРАЗУ, коли користувач явно просить щось зробити, "
+                "купити, оплатити, записати, нагадати, зателефонувати тощо. "
+                "Якщо в одному повідомленні кілька окремих дій — виклич цю функцію "
+                "ОКРЕМО для кожної дії, кількома tool_calls в одній відповіді."
             ),
             "parameters": {
                 "type": "object",
@@ -94,7 +91,8 @@ async def ai_chat_start(msg: Message, state: FSMContext):
         "Постав будь-яке питання про свої задачі, цілі, проєкти чи фінанси — "
         "я відповім, спираючись на твої реальні дані.\n\n"
         "Також можеш попросити мене додати задачу прямо тут, напр.: "
-        "«додай таску купити молоко на завтра».\n\n"
+        "«додай таску купити молоко на завтра» або «завтра після роботи купити "
+        "шампунь і оплатити доставку» (додасть одразу дві задачі).\n\n"
         "А ще можна просто написати конвертацію валют, напр.: `1500 PLN → UAH`, "
         "або запитати «скільки днів до 1 січня» — відповім миттєво, без AI.\n\n"
         f"🤖 Залишилось запитів сьогодні: *{remaining}*\n\n"
@@ -124,7 +122,7 @@ async def chat_quick_cb(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AIChat.chatting)
     await cb.answer()
     await cb.message.answer(f"❓ {question}")
-    await _handle_chat_message(cb.from_user.id, question, cb.message)
+    await handle_text_message(cb.from_user.id, question, cb.message)
 
 
 @router.message(AIChat.chatting)
@@ -132,7 +130,7 @@ async def ai_chat_message(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear()
         return await msg.answer("💬 Чат завершено.", reply_markup=kb_main())
-    await _handle_chat_message(msg.from_user.id, msg.text or "", msg)
+    await handle_text_message(msg.from_user.id, msg.text or "", msg)
 
 
 async def _build_context_text(uid: int) -> str:
@@ -187,15 +185,17 @@ async def _build_context_text(uid: int) -> str:
 Дохід цього місяця: {month['income']} {DEFAULT_CURRENCY}
 Витрати цього місяця: {month['expense']} {DEFAULT_CURRENCY}
 
+ВАЖЛИВО: якщо в повідомленні користувача є прохання щось зробити, купити, оплатити,
+записати чи нагадати — ти ЗОБОВ'ЯЗАНИЙ викликати функцію add_task. Не відповідай
+просто текстом на кшталт "добре, я запам'ятаю" — це НЕ додасть задачу в базу.
+Якщо дій кілька в одному повідомленні — виклич add_task окремо для кожної.
+
 Якщо для відповіді на питання даних недостатньо — чесно скажи:
 "У мене поки недостатньо даних для точної рекомендації."
-Якщо користувач просить додати задачу — виклич функцію add_task з потрібними параметрами.
 Відповідай українською, коротко і по суті."""
 
 
 async def _execute_tool_call(uid: int, name: str, args: dict) -> str:
-    """Виконує реальну дію в БД і повертає короткий текстовий результат — цей текст
-    піде назад у модель, щоб вона сформувала фінальну відповідь користувачу."""
     if name == "add_task":
         title = (args.get("title") or "").strip()
         if not title:
@@ -223,16 +223,14 @@ async def _execute_tool_call(uid: int, name: str, args: dict) -> str:
     return f"Невідома функція: {name}"
 
 
-async def _handle_chat_message(uid: int, text: str, target: Message):
+async def handle_text_message(uid: int, text: str, target: Message):
     if not text.strip():
         return
 
-    # Конвертер валют перевіряємо ДО AI — це швидше і не витрачає денний ліміт
     converted = await currency_service.try_convert(text)
     if converted:
         return await target.answer(converted)
 
-    # Дні до дати — теж перевіряємо без AI, якщо розпізналось однозначно
     countdown_answer = await countdown_service.try_answer(uid, text)
     if countdown_answer:
         return await target.answer(countdown_answer)
