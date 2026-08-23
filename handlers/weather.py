@@ -1,5 +1,5 @@
 import logging
-import json
+from datetime import date, datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -23,6 +23,10 @@ class WeatherCity(StatesGroup):
     waiting_city = State()
 
 
+class WeatherDate(StatesGroup):
+    waiting_date = State()
+
+
 def _ikb_city_options(options: list[dict]) -> InlineKeyboardMarkup:
     rows = []
     for i, opt in enumerate(options):
@@ -36,7 +40,18 @@ def _ikb_city_options(options: list[dict]) -> InlineKeyboardMarkup:
 
 def _ikb_change_city() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Погодинно на день", callback_data="weather_hourly")],
         [InlineKeyboardButton(text="🌍 Змінити місто/країну", callback_data="weather_change_city")],
+    ])
+
+
+def _ikb_date_choice() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Сьогодні", callback_data="weather_date:0"),
+            InlineKeyboardButton(text="Завтра", callback_data="weather_date:1"),
+        ],
+        [InlineKeyboardButton(text="✏️ Ввести іншу дату", callback_data="weather_date_custom")],
     ])
 
 
@@ -77,6 +92,82 @@ async def weather_change_city_cb(cb: CallbackQuery, state: FSMContext):
         cb.message, state,
         "🌍 Напиши нове місто (можна з країною через кому, напр. `Кельн, Німеччина`):",
     )
+
+
+@router.callback_query(F.data == "weather_hourly")
+async def weather_hourly_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer("На яку дату показати погодинний прогноз?", reply_markup=_ikb_date_choice())
+
+
+@router.callback_query(F.data.startswith("weather_date:"))
+async def weather_date_pick_cb(cb: CallbackQuery, state: FSMContext):
+    days_offset = int(cb.data.split(":", 1)[1])
+    target_date = date.today() + timedelta(days=days_offset)
+    await cb.answer()
+    await _send_hourly_day(cb.message, cb.from_user.id, target_date)
+
+
+@router.callback_query(F.data == "weather_date_custom")
+async def weather_date_custom_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(WeatherDate.waiting_date)
+    await cb.message.answer(
+        "✏️ Напиши дату у форматі `ДД.ММ` або `ДД.ММ.РРРР` (напр. `25.12`):",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(WeatherDate.waiting_date)
+async def weather_date_text(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+
+    raw = msg.text.strip()
+    target_date = None
+    for fmt in ("%d.%m.%Y", "%d.%m"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            year = parsed.year if fmt == "%d.%m.%Y" else date.today().year
+            candidate = date(year, parsed.month, parsed.day)
+            if fmt == "%d.%m" and candidate < date.today():
+                candidate = date(year + 1, parsed.month, parsed.day)
+            target_date = candidate
+            break
+        except ValueError:
+            continue
+
+    if target_date is None:
+        return await msg.answer("🤔 Не зрозумів дату. Формат: `ДД.ММ` або `ДД.ММ.РРРР`, напр. `25.12`.")
+
+    await state.clear()
+    await _send_hourly_day(msg, msg.from_user.id, target_date)
+
+
+async def _send_hourly_day(target: Message, uid: int, target_date: date):
+    if target_date < date.today():
+        return await target.answer("⚠️ Прогноз доступний лише на сьогодні й наперед.")
+
+    user_state = await users_db.get_user_state(uid)
+    lat = user_state.get("city_lat")
+    lon = user_state.get("city_lon")
+    display_name = user_state.get("city_display")
+
+    if lat is None or lon is None:
+        return await target.answer(
+            "⚠️ Спершу вкажи місто через «🌤️ Погода».",
+            reply_markup=kb_main(),
+        )
+
+    wait_msg = await target.answer("📅 Формую погодинний прогноз...")
+    report = await weather_service.build_hourly_day_report(lat, lon, display_name, target_date)
+    if not report:
+        return await wait_msg.edit_text(
+            "⚠️ Не вдалося отримати погодинний прогноз на цю дату. "
+            "Можливо, вона задалеко в майбутньому (доступно до 16 днів)."
+        )
+    await wait_msg.edit_text(report, reply_markup=_ikb_change_city())
 
 
 @router.message(WeatherCity.waiting_city)

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import aiohttp
 
@@ -76,13 +76,16 @@ def format_option_label(opt: dict) -> str:
     return ", ".join(parts)
 
 
-async def get_weather(lat: float, lon: float, attempts: int = 2) -> dict | None:
+async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: int = 2) -> dict | None:
+    # ВАЖЛИВО: сучасне Open-Meteo API очікує "weather_code" (з підкресленням).
+    # Стара назва "weathercode" в актуальній документації/SDK більше не
+    # використовується і могла призводити до некоректної/порожньої відповіді.
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "temperature_2m,precipitation,weathercode,wind_speed_10m",
-        "hourly": "temperature_2m,precipitation_probability,weathercode",
-        "forecast_days": 2,
+        "current": "temperature_2m,precipitation,weather_code,wind_speed_10m",
+        "hourly": "temperature_2m,precipitation_probability,weather_code",
+        "forecast_days": max(1, min(forecast_days, 16)),
         "timezone": "auto",
     }
     last_error = None
@@ -92,7 +95,7 @@ async def get_weather(lat: float, lon: float, attempts: int = 2) -> dict | None:
                 async with session.get(FORECAST_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning("Open-Meteo status=%s body=%s (attempt %s)", resp.status, body[:200], attempt)
+                        logger.warning("Open-Meteo status=%s body=%s (attempt %s)", resp.status, body[:300], attempt)
                         last_error = f"status {resp.status}"
                         continue
                     return await resp.json()
@@ -129,13 +132,13 @@ def weather_code_description(code: int) -> str:
     return WEATHER_CODE_DESCRIPTIONS.get(code, "🌡 Погода")
 
 
-def _extract_hourly_window(hourly: dict, hours_ahead: int = 15) -> list[dict]:
+def _extract_hourly_window(hourly: dict, local_now: datetime, hours_ahead: int = 15) -> list[dict]:
     times = hourly.get("time", [])
     temps = hourly.get("temperature_2m", [])
     precs = hourly.get("precipitation_probability", [])
-    codes = hourly.get("weathercode", [])
+    codes = hourly.get("weather_code", [])
 
-    now = datetime.now()
+    now = local_now
     limit = now + timedelta(hours=hours_ahead)
     window = []
     for i, t in enumerate(times):
@@ -195,7 +198,7 @@ def _build_day_plan_lines(window: list[dict]) -> list[str]:
 
 
 async def build_weather_report(lat: float, lon: float, display_name: str) -> str | None:
-    data = await get_weather(lat, lon)
+    data = await get_weather(lat, lon, forecast_days=2)
     if not data:
         return None
 
@@ -205,7 +208,7 @@ async def build_weather_report(lat: float, lon: float, display_name: str) -> str
 
     temp = current.get("temperature_2m")
     precipitation = current.get("precipitation", 0)
-    code = current.get("weathercode", 0)
+    code = current.get("weather_code", 0)
     wind = current.get("wind_speed_10m")
 
     lines = [
@@ -221,7 +224,62 @@ async def build_weather_report(lat: float, lon: float, display_name: str) -> str
 
     hourly = data.get("hourly")
     if hourly:
-        window = _extract_hourly_window(hourly)
+        # Використовуємо ЛОКАЛЬНИЙ час міста, який повертає сам API
+        # (data["current"]["time"]), а не час сервера — інакше вікно
+        # "найближчих годин" рахується з рознобою в часових поясах.
+        current_time_str = current.get("time")
+        try:
+            local_now = datetime.strptime(current_time_str, "%Y-%m-%dT%H:%M") if current_time_str else datetime.now()
+        except ValueError:
+            local_now = datetime.now()
+        window = _extract_hourly_window(hourly, local_now)
         lines.extend(_build_day_plan_lines(window))
+
+    return "\n".join(lines)
+
+
+async def build_hourly_day_report(lat: float, lon: float, display_name: str, target_date: date) -> str | None:
+    """Погодинний прогноз (00:00–23:00) на конкретну дату."""
+    today = date.today()
+    days_ahead = (target_date - today).days
+    if days_ahead < 0:
+        return None  # погода на минулу дату недоступна через forecast API
+    forecast_days = max(1, min(days_ahead + 1, 16))
+
+    data = await get_weather(lat, lon, forecast_days=forecast_days)
+    if not data:
+        return None
+
+    hourly = data.get("hourly")
+    if not hourly:
+        return None
+
+    times = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    precs = hourly.get("precipitation_probability", [])
+    codes = hourly.get("weather_code", [])
+
+    date_prefix = target_date.isoformat()  # "YYYY-MM-DD"
+    lines = [f"📅 *Погодинно на {target_date.strftime('%d.%m.%Y')} — {display_name}*", ""]
+    found = False
+
+    for i, t in enumerate(times):
+        if not t.startswith(date_prefix):
+            continue
+        found = True
+        hour_label = t.split("T", 1)[1]
+        temp = temps[i] if i < len(temps) else None
+        precip = precs[i] if i < len(precs) else 0
+        code = codes[i] if i < len(codes) else 0
+
+        icon = weather_code_description(code).split(" ", 1)[0]
+        temp_str = f"{temp:.0f}°C" if temp is not None else "?"
+        line = f"{hour_label}  {icon}  {temp_str}"
+        if precip and precip >= 40:
+            line += f"  💧{precip:.0f}%"
+        lines.append(line)
+
+    if not found:
+        return None
 
     return "\n".join(lines)

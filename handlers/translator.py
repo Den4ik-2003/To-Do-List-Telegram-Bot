@@ -88,8 +88,7 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
         return await cb.message.edit_text(AI_ERROR_TEXT)
 
     await ai_usage_db.increment_usage(uid)
-    await cb.message.edit_text(f"🌐 *Переклад:*\n\n{result}")
-    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
+    await cb.message.edit_text(result)
 
 
 @router.message(F.text == "✍️ Редактор")
@@ -133,5 +132,4 @@ async def rewrite_text_received(msg: Message, state: FSMContext):
         return await wait_msg.edit_text(AI_ERROR_TEXT)
 
     await ai_usage_db.increment_usage(uid)
-    await wait_msg.edit_text(f"✍️ *Готове повідомлення:*\n\n{result}")
-    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
+    await wait_msg.edit_text(result)

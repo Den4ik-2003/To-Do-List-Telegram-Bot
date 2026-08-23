@@ -5,7 +5,7 @@ import aiohttp
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
 from keyboards.main_menu import kb_main, kb_cancel
 from handlers.common import require_auth
@@ -76,7 +76,11 @@ async def _geocode(query: str) -> tuple[float, float] | None:
 async def nearby_location(msg: Message, state: FSMContext):
     _pending_location[msg.from_user.id] = (msg.location.latitude, msg.location.longitude)
     await state.clear()
-    await msg.answer("✅ Локацію отримано. Що шукаємо поруч?", reply_markup=_ikb_categories())
+    # Прибираємо стару reply-клавіатуру з "❌ Скасувати" — вона більше
+    # ні на що не реагує, бо стан вже очищений, і далі працюємо тільки
+    # через inline-кнопки категорій.
+    await msg.answer("✅ Локацію отримано.", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
 
 
 @router.message(Nearby.waiting_address)
@@ -94,7 +98,10 @@ async def nearby_address(msg: Message, state: FSMContext):
 
     _pending_location[msg.from_user.id] = coords
     await state.clear()
-    await msg.answer("✅ Місце знайдено. Що шукаємо поруч?", reply_markup=_ikb_categories())
+    # Те саме — прибираємо стару reply-клавіатуру "❌ Скасувати", вона
+    # вже нерелевантна на цьому кроці.
+    await msg.answer("✅ Місце знайдено.", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
 
 
 async def _query_overpass(query: str) -> list[dict] | None:
@@ -103,7 +110,8 @@ async def _query_overpass(query: str) -> list[dict] | None:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status != 200:
-                        logger.warning("Overpass %s returned status=%s", url, resp.status)
+                        body = await resp.text()
+                        logger.warning("Overpass %s returned status=%s body=%s", url, resp.status, body[:500])
                         continue
                     data = await resp.json()
                     return data.get("elements", [])
@@ -132,9 +140,12 @@ async def nearby_category(cb: CallbackQuery):
     lat, lon = coords
     await cb.answer("Шукаю...")
 
+    # ВАЖЛИВО: ключ і значення тега в Overpass QL мають бути в лапках,
+    # інакше запит падає з синтаксичною помилкою і завжди повертає None
+    # (що раніше маскувалось під "сервіс перевантажений").
     query = f"""
 [out:json][timeout:18];
-node[{tag_key}={tag_val}](around:1500,{lat},{lon});
+node["{tag_key}"="{tag_val}"](around:1500,{lat},{lon});
 out body 15;
 """
     elements = await _query_overpass(query)

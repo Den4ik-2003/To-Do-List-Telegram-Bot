@@ -5,20 +5,57 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+# Мапа: текст кнопки-категорії -> список кнопок у її підменю.
+# Використовується і для побудови клавіатур, і в handlers/menu.py для
+# розпізнавання натискання категорії та повернення потрібного підменю.
+CATEGORY_TASKS_AI = "📝 Задачі та AI"
+CATEGORY_FINANCE = "💰 Фінанси"
+CATEGORY_GOALS = "🎯 Цілі та проєкти"
+CATEGORY_LIFE = "🌍 Побут"
+
+MAIN_CATEGORIES = {
+    CATEGORY_TASKS_AI: [
+        "📋 Мої задачі", "🤖 AI Планер",
+        "💬 AI Чат", "✍️ Редактор",
+        "🌐 Переклад", "⚖️ Рішення",
+    ],
+    CATEGORY_FINANCE: [
+        "💰 Фінанси", "📊 Статистика",
+        "💱 Курс валют", "💰 Конвертер",
+        "🧾 Чек", "📉 OLX Ціни",
+    ],
+    CATEGORY_GOALS: [
+        "🎯 Мої цілі", "📁 Мої проєкти",
+    ],
+    CATEGORY_LIFE: [
+        "🗺 Що поруч", "🌤️ Погода",
+        "📅 Дні до дати", "💡 Поради",
+    ],
+}
+
+BACK_TO_MAIN = "⬅️ Головне меню"
+
+
+def _rows_of_two(items: list[str]) -> list[list[KeyboardButton]]:
+    rows = []
+    for i in range(0, len(items), 2):
+        pair = items[i:i + 2]
+        rows.append([KeyboardButton(text=t) for t in pair])
+    return rows
+
 
 def kb_main() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📋 Мої задачі"), KeyboardButton(text="🤖 AI Планер")],
-        [KeyboardButton(text="💬 AI Чат"), KeyboardButton(text="🌐 Переклад")],
-        [KeyboardButton(text="✍️ Редактор"), KeyboardButton(text="🗺 Що поруч")],
-        [KeyboardButton(text="⚖️ Рішення"), KeyboardButton(text="📉 OLX Ціни")],
-        [KeyboardButton(text="🎯 Мої цілі"), KeyboardButton(text="📁 Мої проєкти")],
-        [KeyboardButton(text="💰 Фінанси"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="💱 Курс валют"), KeyboardButton(text="💰 Конвертер")],
-        [KeyboardButton(text="📅 Дні до дати"), KeyboardButton(text="🌤️ Погода")],
-        [KeyboardButton(text="🧾 Чек"), KeyboardButton(text="💡 Поради")],
-        [KeyboardButton(text="⚙️ Налаштування")],
-    ], resize_keyboard=True)
+    keyboard = _rows_of_two(list(MAIN_CATEGORIES.keys()))
+    keyboard.append([KeyboardButton(text="⚙️ Налаштування")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def kb_category(category: str) -> ReplyKeyboardMarkup:
+    """Підменю конкретної категорії + кнопка повернення в головне меню."""
+    items = MAIN_CATEGORIES.get(category, [])
+    keyboard = _rows_of_two(items)
+    keyboard.append([KeyboardButton(text=BACK_TO_MAIN)])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def kb_cancel() -> ReplyKeyboardMarkup:

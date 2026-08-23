@@ -62,6 +62,7 @@ def register_routers(dp: Dispatcher) -> None:
         countdown,
         weather,
         receipts,
+        olx,
         settings as settings_handlers,
     )
 
@@ -81,6 +82,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(countdown.router)
     dp.include_router(weather.router)
     dp.include_router(receipts.router)
+    dp.include_router(olx.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
     dp.include_router(finances.router)
