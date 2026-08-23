@@ -15,9 +15,13 @@ AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
-WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY", "")
-WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL", "https://api.openai.com/v1")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+# За замовчуванням Whisper тепер іде через OpenRouter (той самий ключ і base_url,
+# що й основний AI), а не напряму через OpenAI. Якщо WHISPER_API_KEY не заданий
+# окремо в env — падаємо назад на AI_API_KEY/AI_BASE_URL, щоб не треба було
+# заводити окремий акаунт на platform.openai.com.
+WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY") or AI_API_KEY
+WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL") or AI_BASE_URL
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-1")
 
 OLX_CHECK_INTERVAL_MINUTES = int(os.environ.get("OLX_CHECK_INTERVAL_MINUTES", "180"))
 
