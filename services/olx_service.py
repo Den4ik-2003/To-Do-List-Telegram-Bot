@@ -49,13 +49,16 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
     try:
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
+                final_url = str(resp.url)
                 if resp.status != 200:
-                    logger.warning("OLX listing fetch status=%s for %s", resp.status, url)
+                    logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status, url, final_url)
                     return None
                 html = await resp.text()
     except Exception:
         logger.exception("OLX listing fetch failed for %s", url)
         return None
+
+    logger.info("OLX listing fetch OK, final_url=%s, html_len=%s", final_url, len(html))
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -71,7 +74,15 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
             try:
                 return float(meta["content"]), (currency_meta["content"] if currency_meta else "UAH")
             except (ValueError, KeyError):
-                return None
+                pass
+
+        # Debug fallback: log a snippet so we can see what actually came back
+        title_tag = soup.find("title")
+        logger.warning(
+            "OLX listing: price not found. page_title=%r, snippet=%r",
+            title_tag.get_text(strip=True) if title_tag else None,
+            html[:500],
+        )
         return None
 
     return _parse_price(text)
