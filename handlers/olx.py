@@ -50,7 +50,7 @@ async def olx_add_listing_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(OlxListing.waiting_url)
     await cb.answer()
     await cb.message.answer(
-        "🔗 Встав посилання на оголошення OLX (https://www.olx.pl/d/oferta/...):",
+        "🔗 Встав посилання на оголошення OLX (https://www.olx.ua/d/uk/obyavlenie/...):",
         reply_markup=kb_cancel(),
     )
 
@@ -100,7 +100,7 @@ async def olx_search_title(msg: Message, state: FSMContext):
         return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(title_query=msg.text.strip())
     await state.set_state(OlxSearch.waiting_price)
-    await msg.answer("💰 Максимальна ціна (в PLN), або напиши «немає»:")
+    await msg.answer("💰 Максимальна ціна (в грн), або напиши «немає»:")
 
 
 @router.message(OlxSearch.waiting_price)
@@ -119,7 +119,7 @@ async def olx_search_price(msg: Message, state: FSMContext):
 
     await state.update_data(max_price=max_price)
     await state.set_state(OlxSearch.waiting_location)
-    await msg.answer("📍 Місто пошуку (напр. `Warszawa`), або «немає»:")
+    await msg.answer("📍 Місто пошуку (напр. `Київ`), або «немає»:")
 
 
 @router.message(OlxSearch.waiting_location)
@@ -162,7 +162,7 @@ async def _finish_search_tracker(msg: Message, state: FSMContext, radius_km: int
 
     await olx_db.add_search_tracker(msg.from_user.id, title_query, max_price, location, radius_km)
 
-    price_text = f"до {max_price:.0f} PLN" if max_price else "без обмеження ціни"
+    price_text = f"до {max_price:.0f} грн" if max_price else "без обмеження ціни"
     loc_text = f"{location} +{radius_km} км" if location else "без прив'язки до міста"
     await msg.answer(
         f"✅ Автопошук додано!\n\n"
@@ -189,7 +189,7 @@ async def olx_list_trackers(cb: CallbackQuery):
         if t.get("type") == "listing":
             lines.append(f"🔗 {t.get('url', '')[:50]} — {t.get('last_price', '?')} {t.get('currency', '')}")
         else:
-            lines.append(f"🔥 {t.get('title_query', '')} до {t.get('max_price') or '∞'} PLN, {t.get('location') or 'будь-де'}")
+            lines.append(f"🔥 {t.get('title_query', '')} до {t.get('max_price') or '∞'} грн, {t.get('location') or 'будь-де'}")
         rows.append([InlineKeyboardButton(text=f"🗑 {t.get('title_query') or t.get('url', '')[:25]}", callback_data=f"olx_del:{tid}")])
 
     await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
