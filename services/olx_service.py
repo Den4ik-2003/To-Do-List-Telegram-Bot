@@ -90,7 +90,6 @@ def _build_search_url(title_query: str, max_price: float | None, location: str, 
     return base
 
 
-<<<<<<< HEAD
 async def search_listings(title_query: str, max_price: float | None, location: str, radius_km: int) -> list[dict]:
     url = _build_search_url(title_query, max_price, location, radius_km)
     try:
@@ -139,15 +138,3 @@ async def search_listings(title_query: str, max_price: float | None, location: s
         })
 
     return results
-=======
-@router.callback_query(F.data.startswith("olx_del:"))
-async def olx_delete_tracker(cb: CallbackQuery):
-    tid = cb.data.split(":", 1)[1]
-    ok = await olx_db.delete_tracker(tid, cb.from_user.id)
-    await cb.answer("Видалено ✅" if ok else "Не знайдено", show_alert=not ok)
-    if ok:
-        try:
-            await cb.message.edit_text("🗑 Підписку видалено.")
-        except Exception:
-            pass 
->>>>>>> 8be552f596599c8cd9d4cd56ac2c1cfcfc0b82bd
