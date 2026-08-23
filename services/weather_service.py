@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -75,7 +76,7 @@ def format_option_label(opt: dict) -> str:
     return ", ".join(parts)
 
 
-async def get_weather(lat: float, lon: float) -> dict | None:
+async def get_weather(lat: float, lon: float, attempts: int = 2) -> dict | None:
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -84,15 +85,25 @@ async def get_weather(lat: float, lon: float) -> dict | None:
         "forecast_days": 2,
         "timezone": "auto",
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(FORECAST_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.json()
-    except Exception:
-        logger.exception("Не вдалося отримати погоду для (%s, %s)", lat, lon)
-        return None
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(FORECAST_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning("Open-Meteo status=%s body=%s (attempt %s)", resp.status, body[:200], attempt)
+                        last_error = f"status {resp.status}"
+                        continue
+                    return await resp.json()
+        except asyncio.TimeoutError:
+            logger.warning("Open-Meteo timeout (attempt %s) для (%s, %s)", attempt, lat, lon)
+            last_error = "timeout"
+        except Exception:
+            logger.exception("Не вдалося отримати погоду для (%s, %s), спроба %s", lat, lon, attempt)
+            last_error = "exception"
+    logger.warning("get_weather failed after %s attempts: %s", attempts, last_error)
+    return None
 
 
 def clothing_advice(temp: float, precipitation: float) -> str:

@@ -19,6 +19,8 @@ WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY", "")
 WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL", "https://api.openai.com/v1")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 
+OLX_CHECK_INTERVAL_MINUTES = int(os.environ.get("OLX_CHECK_INTERVAL_MINUTES", "180"))
+
 CURRENCY_UPDATE_TIME = os.environ.get("CURRENCY_UPDATE_TIME", "08:00")
 WEATHER_MORNING_TIME = os.environ.get("WEATHER_MORNING_TIME", "07:30")
 

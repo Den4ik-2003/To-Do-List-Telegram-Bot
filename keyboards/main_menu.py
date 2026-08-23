@@ -11,12 +11,13 @@ def kb_main() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📋 Мої задачі"), KeyboardButton(text="🤖 AI Планер")],
         [KeyboardButton(text="💬 AI Чат"), KeyboardButton(text="🌐 Переклад")],
         [KeyboardButton(text="✍️ Редактор"), KeyboardButton(text="🗺 Що поруч")],
-        [KeyboardButton(text="⚖️ Рішення"), KeyboardButton(text="🎯 Мої цілі")],
-        [KeyboardButton(text="📁 Мої проєкти"), KeyboardButton(text="💰 Фінанси")],
-        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="💱 Курс валют")],
-        [KeyboardButton(text="💰 Конвертер"), KeyboardButton(text="📅 Дні до дати")],
-        [KeyboardButton(text="🌤️ Погода"), KeyboardButton(text="🧾 Чек")],
-        [KeyboardButton(text="💡 Поради"), KeyboardButton(text="⚙️ Налаштування")],
+        [KeyboardButton(text="⚖️ Рішення"), KeyboardButton(text="📉 OLX Ціни")],
+        [KeyboardButton(text="🎯 Мої цілі"), KeyboardButton(text="📁 Мої проєкти")],
+        [KeyboardButton(text="💰 Фінанси"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="💱 Курс валют"), KeyboardButton(text="💰 Конвертер")],
+        [KeyboardButton(text="📅 Дні до дати"), KeyboardButton(text="🌤️ Погода")],
+        [KeyboardButton(text="🧾 Чек"), KeyboardButton(text="💡 Поради")],
+        [KeyboardButton(text="⚙️ Налаштування")],
     ], resize_keyboard=True)
 
 

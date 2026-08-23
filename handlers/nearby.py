@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import aiohttp
@@ -13,7 +14,10 @@ logger = logging.getLogger("tasks_bot")
 router = Router(name="nearby")
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
 
 NEARBY_CATEGORIES = {
     "pharmacy": ("💊 Аптека", "amenity", "pharmacy"),
@@ -22,6 +26,11 @@ NEARBY_CATEGORIES = {
     "atm": ("🏧 Банкомат", "amenity", "atm"),
 }
 
+# lat/lon зберігаємо ОКРЕМО від FSM-стану, а не в ньому — інакше після
+# вибору першої категорії стан чиститься і повторний пошук іншої
+# категорії для того ж місця стає неможливим.
+_pending_location: dict[int, tuple[float, float]] = {}
+
 
 class Nearby(StatesGroup):
     waiting_address = State()
@@ -29,6 +38,7 @@ class Nearby(StatesGroup):
 
 def _ikb_categories() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"nb:{key}")] for key, (label, _, _) in NEARBY_CATEGORIES.items()]
+    rows.append([InlineKeyboardButton(text="🏠 Завершити", callback_data="nb_exit")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -49,8 +59,9 @@ async def _geocode(query: str) -> tuple[float, float] | None:
     headers = {"User-Agent": "todo-list-telegram-bot"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(NOMINATIM_URL, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(NOMINATIM_URL, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status != 200:
+                    logger.warning("Nominatim status=%s for query=%s", resp.status, query)
                     return None
                 data = await resp.json()
                 if not data:
@@ -63,9 +74,9 @@ async def _geocode(query: str) -> tuple[float, float] | None:
 
 @router.message(Nearby.waiting_address, F.location)
 async def nearby_location(msg: Message, state: FSMContext):
-    await state.update_data(lat=msg.location.latitude, lon=msg.location.longitude)
-    await state.set_state(None)
-    await msg.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
+    _pending_location[msg.from_user.id] = (msg.location.latitude, msg.location.longitude)
+    await state.clear()
+    await msg.answer("✅ Локацію отримано. Що шукаємо поруч?", reply_markup=_ikb_categories())
 
 
 @router.message(Nearby.waiting_address)
@@ -76,52 +87,83 @@ async def nearby_address(msg: Message, state: FSMContext):
 
     coords = await _geocode(msg.text.strip())
     if not coords:
-        return await msg.answer("🤔 Не знайшов таку адресу. Спробуй точніше або надішли геолокацію.")
+        return await msg.answer(
+            "🤔 Не знайшов таку адресу. Спробуй точніше (напр. з містом і країною) "
+            "або надішли геолокацію."
+        )
 
-    await state.update_data(lat=coords[0], lon=coords[1])
-    await state.set_state(None)
+    _pending_location[msg.from_user.id] = coords
+    await state.clear()
     await msg.answer("✅ Місце знайдено. Що шукаємо поруч?", reply_markup=_ikb_categories())
 
 
+async def _query_overpass(query: str) -> list[dict] | None:
+    for url in OVERPASS_URLS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status != 200:
+                        logger.warning("Overpass %s returned status=%s", url, resp.status)
+                        continue
+                    data = await resp.json()
+                    return data.get("elements", [])
+        except asyncio.TimeoutError:
+            logger.warning("Overpass %s timed out", url)
+            continue
+        except Exception:
+            logger.exception("Overpass %s failed", url)
+            continue
+    return None
+
+
 @router.callback_query(F.data.startswith("nb:"))
-async def nearby_category(cb: CallbackQuery, state: FSMContext):
+async def nearby_category(cb: CallbackQuery):
     key = cb.data.split(":", 1)[1]
     entry = NEARBY_CATEGORIES.get(key)
     if not entry:
         return await cb.answer()
     label, tag_key, tag_val = entry
 
-    fd = await state.get_data()
-    lat, lon = fd.get("lat"), fd.get("lon")
-    if lat is None or lon is None:
+    coords = _pending_location.get(cb.from_user.id)
+    if not coords:
         await cb.answer()
         return await cb.message.edit_text("⚠️ Локація втрачена, почни спочатку через «🗺 Що поруч».")
 
+    lat, lon = coords
     await cb.answer("Шукаю...")
-    await state.clear()
 
     query = f"""
-[out:json][timeout:15];
+[out:json][timeout:18];
 node[{tag_key}={tag_val}](around:1500,{lat},{lon});
 out body 15;
 """
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OVERPASS_URL, data={"data": query}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return await cb.message.edit_text("⚠️ Сервіс пошуку тимчасово недоступний.")
-                data = await resp.json()
-    except Exception:
-        logger.exception("Overpass query failed")
-        return await cb.message.edit_text("⚠️ Не вдалося отримати дані. Спробуй пізніше.")
+    elements = await _query_overpass(query)
 
-    elements = data.get("elements", [])
+    if elements is None:
+        return await cb.message.edit_text(
+            f"{label}\n\n⚠️ Сервіс пошуку тимчасово перевантажений. Спробуй ще раз за хвилину.",
+            reply_markup=_ikb_categories(),
+        )
+
     if not elements:
-        return await cb.message.edit_text(f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км).")
+        text = f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км)."
+    else:
+        lines = [f"{label} поруч:\n"]
+        for el in elements[:10]:
+            name = el.get("tags", {}).get("name", "Без назви")
+            lines.append(f"• {name}")
+        text = "\n".join(lines)
 
-    lines = [f"{label} поруч:\n"]
-    for el in elements[:10]:
-        name = el.get("tags", {}).get("name", "Без назви")
-        lines.append(f"• {name}")
-    await cb.message.edit_text("\n".join(lines))
+    await cb.message.edit_text(text)
+    await cb.message.answer("Шукати ще щось поруч?", reply_markup=_ikb_categories())
+
+
+@router.callback_query(F.data == "nb_exit")
+async def nearby_exit(cb: CallbackQuery):
+    _pending_location.pop(cb.from_user.id, None)
+    await cb.answer()
+    try:
+        await cb.message.edit_text("🗺 Пошук завершено.")
+    except Exception:
+        pass
     await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())

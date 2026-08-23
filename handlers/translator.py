@@ -15,6 +15,12 @@ from handlers.common import require_auth
 logger = logging.getLogger("tasks_bot")
 router = Router(name="translator")
 
+TRANSLATE_LANGUAGES = {
+    "pl": ("🇵🇱 Польська", "польську"),
+    "en": ("🇬🇧 Англійська", "англійську"),
+    "zh": ("🇨🇳 Китайська", "китайську"),
+}
+
 
 class Translate(StatesGroup):
     waiting_text = State()
@@ -24,11 +30,9 @@ class Rewrite(StatesGroup):
     waiting_text = State()
 
 
-def _ikb_lang(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🇵🇱 Польська", callback_data=f"{prefix}:pl"),
-        InlineKeyboardButton(text="🇬🇧 Англійська", callback_data=f"{prefix}:en"),
-    ]])
+def _ikb_translate_lang() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"tr:{code}")] for code, (label, _) in TRANSLATE_LANGUAGES.items()]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(F.text == "🌐 Переклад")
@@ -50,12 +54,17 @@ async def translate_text_received(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(text=msg.text)
-    await msg.answer("Обери мову перекладу:", reply_markup=_ikb_lang("tr"))
+    await msg.answer("Обери мову перекладу:", reply_markup=_ikb_translate_lang())
 
 
 @router.callback_query(F.data.startswith("tr:"))
 async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
-    lang = cb.data.split(":", 1)[1]
+    code = cb.data.split(":", 1)[1]
+    entry = TRANSLATE_LANGUAGES.get(code)
+    if not entry:
+        return await cb.answer()
+    _, lang_name = entry
+
     fd = await state.get_data()
     text = fd.get("text", "")
     await state.clear()
@@ -63,7 +72,6 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return await cb.message.edit_text("⚠️ Текст втрачено, спробуй ще раз.")
 
-    lang_name = "польську" if lang == "pl" else "англійську"
     await cb.answer("Перекладаю...")
 
     uid = cb.from_user.id
@@ -72,7 +80,7 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
         return await cb.message.edit_text(AI_LIMIT_TEXT)
 
     prompt = (
-        f"Переклади наступний текст з української на {lang_name} мову. "
+        f"Переклади наступний текст на {lang_name} мову. "
         "Поверни ЛИШЕ переклад, без пояснень і лапок:\n\n" + text
     )
     result = await ai_service.generate_text(prompt, temperature=0.3)
@@ -93,7 +101,7 @@ async def rewrite_start(msg: Message, state: FSMContext):
     await state.set_state(Rewrite.waiting_text)
     await msg.answer(
         "✍️ *AI Редактор повідомлень*\n\n"
-        "Напиши криво, як думаєш — я перетворю на нормальне ввічливе повідомлення.",
+        "Напиши криво, як думаєш — я зроблю нормальне ввічливе повідомлення тією ж мовою.",
         reply_markup=kb_cancel(),
     )
 
@@ -103,37 +111,27 @@ async def rewrite_text_received(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear()
         return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.update_data(text=msg.text)
-    await msg.answer("Якою мовою написати повідомлення?", reply_markup=_ikb_lang("rw"))
 
-
-@router.callback_query(F.data.startswith("rw:"))
-async def rewrite_pick_lang(cb: CallbackQuery, state: FSMContext):
-    lang = cb.data.split(":", 1)[1]
-    fd = await state.get_data()
-    text = fd.get("text", "")
+    text = msg.text.strip()
     await state.clear()
-    if not text:
-        await cb.answer()
-        return await cb.message.edit_text("⚠️ Текст втрачено, спробуй ще раз.")
 
-    lang_name = "польській" if lang == "pl" else "англійській"
-    await cb.answer("Складаю повідомлення...")
-
-    uid = cb.from_user.id
+    uid = msg.from_user.id
     remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
     if remaining <= 0:
-        return await cb.message.edit_text(AI_LIMIT_TEXT)
+        return await msg.answer(AI_LIMIT_TEXT, reply_markup=kb_main())
+
+    wait_msg = await msg.answer("✍️ Складаю повідомлення...")
 
     prompt = (
-        f"Користувач написав українською неформально, з помилками: \"{text}\". "
-        f"Перепиши це як ввічливе, грамотне повідомлення на {lang_name} мові, "
-        "збережи суть і зроби тон робочим/ввічливим. Поверни ЛИШЕ готове повідомлення."
+        f"Користувач написав неформально, можливо з помилками: \"{text}\". "
+        "Визнач мову, якою це написано, і перепиши як ввічливе, грамотне повідомлення "
+        "ТІЄЮ Ж САМОЮ мовою (не перекладай на іншу мову), збережи суть, зроби тон "
+        "ввічливим/робочим. Поверни ЛИШЕ готове повідомлення, без пояснень."
     )
     result = await ai_service.generate_text(prompt, temperature=0.4)
     if not result:
-        return await cb.message.edit_text(AI_ERROR_TEXT)
+        return await wait_msg.edit_text(AI_ERROR_TEXT)
 
     await ai_usage_db.increment_usage(uid)
-    await cb.message.edit_text(f"✍️ *Готове повідомлення:*\n\n{result}")
-    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
+    await wait_msg.edit_text(f"✍️ *Готове повідомлення:*\n\n{result}")
+    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
