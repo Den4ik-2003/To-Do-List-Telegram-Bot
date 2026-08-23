@@ -17,6 +17,8 @@ from database import finances as finances_db
 from database import ai_usage as ai_usage_db
 from database import conversations as conversations_db
 from services import ai_service
+from services import currency_service
+from services import countdown_service
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.ai import ikb_chat_context_actions
 from handlers.common import require_auth, is_missed
@@ -93,6 +95,8 @@ async def ai_chat_start(msg: Message, state: FSMContext):
         "я відповім, спираючись на твої реальні дані.\n\n"
         "Також можеш попросити мене додати задачу прямо тут, напр.: "
         "«додай таску купити молоко на завтра».\n\n"
+        "А ще можна просто написати конвертацію валют, напр.: `1500 PLN → UAH`, "
+        "або запитати «скільки днів до 1 січня» — відповім миттєво, без AI.\n\n"
         f"🤖 Залишилось запитів сьогодні: *{remaining}*\n\n"
         "Щоб завершити — натисни «❌ Скасувати» або кнопку нижче.",
         reply_markup=kb_cancel(),
@@ -222,6 +226,17 @@ async def _execute_tool_call(uid: int, name: str, args: dict) -> str:
 async def _handle_chat_message(uid: int, text: str, target: Message):
     if not text.strip():
         return
+
+    # Конвертер валют перевіряємо ДО AI — це швидше і не витрачає денний ліміт
+    converted = await currency_service.try_convert(text)
+    if converted:
+        return await target.answer(converted)
+
+    # Дні до дати — теж перевіряємо без AI, якщо розпізналось однозначно
+    countdown_answer = await countdown_service.try_answer(uid, text)
+    if countdown_answer:
+        return await target.answer(countdown_answer)
+
     if not ai_service.is_available():
         return await target.answer(AI_ERROR_TEXT)
 

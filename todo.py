@@ -16,26 +16,12 @@ logger = logging.getLogger("tasks_bot")
 
 
 async def health_check(request: web.Request) -> web.Response:
-    """
-    Легкий health-check endpoint для cron-job.org / Render keep-alive пінгів.
-    Повертає мінімальний текст, щоб не впиратись у ліміт розміру відповіді
-    зовнішніх cron-сервісів ("output too large").
-    """
     return web.Response(text="OK")
 
 
 async def start_health_server() -> web.AppRunner:
-    """
-    Мінімальний HTTP-сервер лише для того, щоб Render (Web Service)
-    бачив відкритий порт і не вважав контейнер "нездоровим".
-    Бот працює через long polling, а не через цей сервер — тут просто
-    health-check endpoint(и).
-    """
     app = web.Application()
-    # Кореневий маршрут — для Render'a, щоб бачив, що сервіс живий.
     app.router.add_get("/", health_check)
-    # Окремий /health — саме його треба вказувати в cron-job.org,
-    # щоб уникнути помилки "Failed (output too large)".
     app.router.add_get("/health", health_check)
 
     runner = web.AppRunner(app)
@@ -52,7 +38,6 @@ def setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    # Шумні бібліотеки — тихіше, щоб не забивати Render logs
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("pymongo").setLevel(logging.WARNING)
 
@@ -70,6 +55,10 @@ def register_routers(dp: Dispatcher) -> None:
         projects,
         finances,
         statistics,
+        currency,
+        countdown,
+        weather,
+        receipts,
         settings as settings_handlers,
     )
 
@@ -82,19 +71,22 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(goals.router)
     dp.include_router(projects.router)
     dp.include_router(statistics.router)
+    dp.include_router(currency.router)
+    dp.include_router(countdown.router)
+    dp.include_router(weather.router)
+    dp.include_router(receipts.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
     dp.include_router(finances.router)  # має бути справді останнім (catch-all)
+
 
 async def main() -> None:
     setup_logging()
     logger.info("Starting Personal AI Planner bot...")
 
-    # 1. Mongo
     await init_mongo(MONGO_URI)
     await load_authorized_uids()
 
-    # 2. Bot & Dispatcher
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
@@ -103,20 +95,13 @@ async def main() -> None:
 
     register_routers(dp)
 
-    # 3. Health-check сервер для Render (Web Service вимагає відкритий порт)
     health_runner = await start_health_server()
 
-    # 4. Scheduler (нагадування / опівнічний rollover / вечірній звіт /
-    # ранковий AI-план — усі запускаються як background asyncio-таски,
-    # НЕ як другий polling-інстанс, інакше отримаємо TelegramConflictError)
     from scheduler.daily_jobs import register_scheduler_jobs
-
     register_scheduler_jobs(bot)
     logger.info("Scheduler jobs registered")
 
     try:
-        # На випадок якщо раніше залишився webhook — скидаємо його,
-        # інакше polling впаде з TelegramConflictError
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Starting polling...")
         await dp.start_polling(bot)

@@ -14,9 +14,8 @@ auth_col = None
 counters_col = None
 goals_col = None
 projects_col = None
-# Нижче — заготовки під майбутні розділи (фінанси, AI usage, AI чат),
-# яких ще немає в поточному боті. Колекції не використовуються, поки
-# відповідні database/*.py модулі не реалізовані.
+rates_col = None
+events_col = None
 transactions_col = None
 budgets_col = None
 ai_usage_col = None
@@ -24,15 +23,8 @@ ai_conversations_col = None
 
 
 async def init_mongo(mongo_uri: str):
-    """
-    Ініціалізує з'єднання з MongoDB і повертає об'єкт db.
-    Повертає db, щоб todo.py міг покласти його в dp["db"] за потреби,
-    але самі модулі database/*.py як і раніше користуються глобальними
-    змінними цього файлу (m.tasks_col і т.д.) — це узгоджено з тим,
-    як вони вже написані.
-    """
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
-    global goals_col, projects_col
+    global goals_col, projects_col, rates_col, events_col
     global transactions_col, budgets_col, ai_usage_col, ai_conversations_col
 
     mongo_client = AsyncIOMotorClient(
@@ -50,10 +42,9 @@ async def init_mongo(mongo_uri: str):
     counters_col = db["counters"]
     goals_col = db["goals"]
     projects_col = db["projects"]
+    rates_col = db["rates"]
+    events_col = db["events"]
 
-    # Колекції під фінанси, AI usage, AI чат — вже використовуються
-    # відповідними database/*.py модулями (finances.py, ai_usage.py,
-    # conversations.py)
     transactions_col = db["transactions"]
     budgets_col = db["budgets"]
     ai_usage_col = db["ai_usage"]
@@ -64,14 +55,12 @@ async def init_mongo(mongo_uri: str):
 
 
 async def close_mongo() -> None:
-    """Акуратно закриває з'єднання з MongoDB при зупинці бота."""
     if mongo_client is not None:
         mongo_client.close()
         logger.info("MongoDB connection closed")
 
 
 async def ping() -> bool:
-    """Перевірка з'єднання при старті (як admin.command('ping') в оригіналі)."""
     try:
         await mongo_client.admin.command("ping")
         logger.info("MongoDB connection OK")

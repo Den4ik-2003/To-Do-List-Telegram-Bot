@@ -11,6 +11,8 @@ from config.settings import (
     DAILY_REPORT_TIME,
     AI_DAILY_PLAN_TIME,
     AI_DAILY_PLAN_ENABLED,
+    CURRENCY_UPDATE_TIME,
+    WEATHER_MORNING_TIME,
 )
 from database import mongo as m
 from database import tasks as tasks_db
@@ -18,6 +20,8 @@ from database.mongo import db_call
 from database.tasks import get_user_tasks, update_task
 from database.users import get_user_state, save_user_state, get_all_uids, update_streak
 from services import ai_service
+from services import currency_service
+from services import weather_service
 from services.planner_service import generate_daily_plan, generate_daily_analysis
 from services.insights_service import detect_stalled_goal, generate_insight_text
 from utils.dates import parse_due
@@ -27,14 +31,12 @@ from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
 from handlers.common import compute_daily_stats
 
-# Кеш AI-планів на сьогодні (ранковий автоплан), щоб handlers/ai_planner.py
-# міг підхопити той самий план, коли користувач тисне кнопки "toggle"/"додати"
 ai_suggestions_cache: dict = {}
 
 logger = logging.getLogger("scheduler.daily_jobs")
 
-INSIGHT_CHECK_INTERVAL_DAYS = 7  # раз на тиждень перевіряємо кожного користувача
-INSIGHT_CHECK_TIME = "12:00"     # у який час дня запускати перевірку
+INSIGHT_CHECK_INTERVAL_DAYS = 7
+INSIGHT_CHECK_TIME = "12:00"
 
 
 async def reminder_task(bot: Bot):
@@ -194,11 +196,6 @@ async def ai_morning_plan_task(bot: Bot):
 
 
 async def proactive_insights_task(bot: Bot):
-    """
-    Раз на INSIGHT_CHECK_INTERVAL_DAYS днів для кожного користувача перевіряє,
-    чи не зависла якась ціль без прогресу, поки виконується купа дрібних задач.
-    Якщо так — бот сам пише повідомлення-спостереження з пропозицією розібрати причини.
-    """
     if not ai_service.is_available():
         logger.info("Проактивні AI-інсайти вимкнено (немає AI ключа)")
         return
@@ -251,9 +248,62 @@ async def proactive_insights_task(bot: Bot):
             logger.exception("proactive_insights_task outer loop failed")
 
 
+async def currency_update_task():
+    while True:
+        try:
+            hh, mm = map(int, CURRENCY_UPDATE_TIME.split(":"))
+        except ValueError:
+            hh, mm = 8, 0
+        now = datetime.now()
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            result = await currency_service.update_rates()
+            if not result:
+                logger.warning("currency_update_task: курси не оновлено (порожня відповідь)")
+        except Exception:
+            logger.exception("currency_update_task failed")
+
+
+async def weather_morning_task(bot: Bot):
+    """Щоранку о WEATHER_MORNING_TIME шле погоду + пораду щодо одягу тим, у кого задано місто."""
+    while True:
+        try:
+            hh, mm = map(int, WEATHER_MORNING_TIME.split(":"))
+        except ValueError:
+            hh, mm = 7, 30
+        now = datetime.now()
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            uids = await get_all_uids()
+            for uid in uids:
+                try:
+                    state = await get_user_state(uid)
+                    if not state.get("weather_morning_enabled", True):
+                        continue
+                    lat = state.get("city_lat")
+                    lon = state.get("city_lon")
+                    display_name = state.get("city_display")
+                    if lat is None or lon is None:
+                        continue
+                    report = await weather_service.build_weather_report(lat, lon, display_name)
+                    if report:
+                        await bot.send_message(uid, f"☀️ *Доброго ранку!*\n\n{report}")
+                except Exception:
+                    logger.exception("weather_morning_task failed for uid %s", uid)
+        except Exception:
+            logger.exception("weather_morning_task outer loop failed")
+
 def register_scheduler_jobs(bot: Bot):
     asyncio.create_task(reminder_task(bot))
     asyncio.create_task(midnight_rollover_task(bot))
     asyncio.create_task(daily_job_task(bot))
     asyncio.create_task(ai_morning_plan_task(bot))
     asyncio.create_task(proactive_insights_task(bot))
+    asyncio.create_task(currency_update_task())
+    asyncio.create_task(weather_morning_task(bot))

@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import base64
 
 from openai import AsyncOpenAI
 
@@ -198,3 +199,63 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
         except Exception:
             logger.exception("AI chat_with_tools request failed (model=%s)", AI_MODEL)
             return None
+
+
+async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict | None:
+    """
+    Надсилає фото чека в AI-модель (vision) і повертає:
+    {"total": float, "currency": "UAH"/"PLN", "category": str, "items": [str, ...]}
+    Повертає None, якщо клієнт недоступний, модель не має vision, або
+    відповідь не вдалося розпарсити як JSON.
+    """
+    if not client:
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode()
+    prompt_text = (
+        "Це фото чека з магазину (українською або польською). "
+        "Витягни дані та поверни ЛИШЕ JSON без пояснень:\n"
+        '{"total": число, "currency": "UAH або PLN", '
+        '"category": одне з ["food","transport","home","health","entertainment","shopping","project","other"], '
+        '"items": ["назва товару", ...]}\n'
+        "Якщо валюта не вказана явно — визнач з мови/контексту або постав UAH. "
+        "Якщо не можеш розпізнати суму — постав total: 0."
+    )
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+        ],
+    }]
+
+    try:
+        try:
+            resp = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            logger.warning("Модель %s без response_format для vision, повторюю без нього", AI_MODEL)
+            resp = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.2,
+            )
+        raw = _strip_safety_noise((resp.choices[0].message.content or "").strip())
+    except Exception:
+        logger.exception("AI extract_receipt request failed (model=%s)", AI_MODEL)
+        return None
+
+    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        logger.exception("AI повернув некоректний JSON для чека: %s", raw[:300])
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data

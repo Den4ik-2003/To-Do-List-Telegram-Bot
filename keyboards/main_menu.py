@@ -12,7 +12,10 @@ def kb_main() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="💬 AI Чат"), KeyboardButton(text="🗣 AI Команди")],
         [KeyboardButton(text="🎯 Мої цілі"), KeyboardButton(text="📁 Мої проєкти")],
         [KeyboardButton(text="💰 Фінанси"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="💡 Поради"), KeyboardButton(text="⚙️ Налаштування")],
+        [KeyboardButton(text="💱 Курс валют"), KeyboardButton(text="💰 Конвертер")],
+        [KeyboardButton(text="📅 Дні до дати"), KeyboardButton(text="🌤️ Погода")],
+        [KeyboardButton(text="🧾 Чек"), KeyboardButton(text="💡 Поради")],
+        [KeyboardButton(text="⚙️ Налаштування")],
     ], resize_keyboard=True)
 
 
