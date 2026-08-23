@@ -15,19 +15,27 @@ from database import finances as finances_db
 from database import ai_usage as ai_usage_db
 from services import ai_service
 from services import statistics_service
-from keyboards.main_menu import kb_main
+from keyboards.main_menu import kb_main, kb_category, MAIN_CATEGORIES, BACK_TO_MAIN
 from handlers.common import require_auth
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="menu")
 
 
-@router.message(F.text == "◀️ Головне меню")
+@router.message(F.text == BACK_TO_MAIN)
 async def back_to_main(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
     await state.clear()
     await msg.answer("🏠 *Головне меню*", reply_markup=kb_main())
+
+
+@router.message(F.text.in_(MAIN_CATEGORIES.keys()))
+async def open_category(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state):
+        return
+    category = msg.text
+    await msg.answer(f"{category}:", reply_markup=kb_category(category))
 
 
 @router.callback_query(F.data == "noop")

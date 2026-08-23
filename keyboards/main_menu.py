@@ -9,7 +9,7 @@ from aiogram.types import (
 # Використовується і для побудови клавіатур, і в handlers/menu.py для
 # розпізнавання натискання категорії та повернення потрібного підменю.
 CATEGORY_TASKS_AI = "📝 Задачі та AI"
-CATEGORY_FINANCE = "💰 Фінанси"
+CATEGORY_FINANCE = "💵 Гроші та ціни"
 CATEGORY_GOALS = "🎯 Цілі та проєкти"
 CATEGORY_LIFE = "🌍 Побут"
 
