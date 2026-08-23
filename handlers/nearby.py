@@ -17,7 +17,19 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
+
+# Overpass-сервери (особливо overpass-api.de) з 2026 року стали жорсткіше
+# фільтрувати запити, що виглядають "програмними" — без нормального
+# User-Agent і Accept-заголовків повертають 406, навіть якщо сам запит
+# коректний. Явно задаємо їх, щоб не потрапляти під цей фільтр.
+OVERPASS_HEADERS = {
+    "User-Agent": "todo-list-telegram-bot/1.0 (contact: telegram bot)",
+    "Accept": "application/json",
+    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+    "Content-Type": "application/x-www-form-urlencoded",
+}
 
 NEARBY_CATEGORIES = {
     "pharmacy": ("💊 Аптека", "amenity", "pharmacy"),
@@ -48,7 +60,7 @@ async def nearby_start(msg: Message, state: FSMContext):
         return
     await state.set_state(Nearby.waiting_address)
     await msg.answer(
-        "🗺 *Що поруч?*\n\nНапиши адресу або місце (напр. `Warszawa, Marszałkowska 10`), "
+        "🗺 *Що поруч?*\n\nНапиши адресу або місце (напр. `Київ, Хрещатик 10`), "
         "або надішли геолокацію.",
         reply_markup=kb_cancel(),
     )
@@ -107,7 +119,7 @@ async def nearby_address(msg: Message, state: FSMContext):
 async def _query_overpass(query: str) -> list[dict] | None:
     for url in OVERPASS_URLS:
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=OVERPASS_HEADERS) as session:
                 async with session.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -140,9 +152,6 @@ async def nearby_category(cb: CallbackQuery):
     lat, lon = coords
     await cb.answer("Шукаю...")
 
-    # ВАЖЛИВО: ключ і значення тега в Overpass QL мають бути в лапках,
-    # інакше запит падає з синтаксичною помилкою і завжди повертає None
-    # (що раніше маскувалось під "сервіс перевантажений").
     query = f"""
 [out:json][timeout:18];
 node["{tag_key}"="{tag_val}"](around:1500,{lat},{lon});
