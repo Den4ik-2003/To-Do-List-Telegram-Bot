@@ -3,7 +3,7 @@ import logging
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
 from config.constants import AI_ERROR_TEXT, AI_LIMIT_TEXT
 from config.settings import AI_DAILY_LIMIT
@@ -54,7 +54,12 @@ async def translate_text_received(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(text=msg.text)
-    await msg.answer("Обери мову перекладу:", reply_markup=_ikb_translate_lang())
+    # Стан тут вже виходить з-під контролю reply-хендлерів (вибір мови — inline),
+    # тож reply-клавіатуру "❌ Скасувати" треба прибрати зараз: інакше вона лишиться
+    # висіти на екрані під час вибору мови й далі, а натискання на неї провалиться
+    # в catch-all хендлер (finances.py) і бот мовчки нічого не відповість.
+    await msg.answer("Обери мову перекладу:", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("👇", reply_markup=_ikb_translate_lang())
 
 
 @router.callback_query(F.data.startswith("tr:"))
@@ -89,6 +94,7 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
 
     await ai_usage_db.increment_usage(uid)
     await cb.message.edit_text(result)
+    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
 
 
 @router.message(F.text == "✍️ Редактор")
@@ -119,7 +125,9 @@ async def rewrite_text_received(msg: Message, state: FSMContext):
     if remaining <= 0:
         return await msg.answer(AI_LIMIT_TEXT, reply_markup=kb_main())
 
-    wait_msg = await msg.answer("✍️ Складаю повідомлення...")
+    # Так само, як у decision.py: одразу міняємо reply-клавіатуру на kb_main(),
+    # бо подальший edit_text() її не прибере, і стара "❌ Скасувати" лишиться висіти.
+    wait_msg = await msg.answer("✍️ Складаю повідомлення...", reply_markup=kb_main())
 
     prompt = (
         f"Користувач написав неформально, можливо з помилками: \"{text}\". "

@@ -17,14 +17,35 @@ async def get_all_projects(uid: int) -> list:
     return await db_call(cursor.to_list(length=None), default=[], raise_on_fail=False) or []
 
 
-async def add_project(uid: int, title: str, description: str):
-    await db_call(m.projects_col.insert_one({
+async def get_project(pid: str) -> dict | None:
+    return await db_call(m.projects_col.find_one({"_id": ObjectId(pid)}), default=None, raise_on_fail=False)
+
+
+async def add_project(
+    uid: int,
+    title: str,
+    description: str = "",
+    deadline: str | None = None,
+    budget: float | None = None,
+    goal_id: str | None = None,
+) -> str:
+    doc = {
         "uid": uid,
         "title": title,
         "description": description,
         "status": PROJECT_ACTIVE,
         "created_at": datetime.now().isoformat(),
-    }))
+    }
+    if deadline:
+        doc["deadline"] = deadline
+    if budget:
+        doc["budget"] = budget
+        doc["spent"] = 0
+    if goal_id:
+        doc["goal_id"] = goal_id
+
+    result = await db_call(m.projects_col.insert_one(doc))
+    return str(result.inserted_id) if result else ""
 
 
 async def set_project_status(pid: str, status: str):

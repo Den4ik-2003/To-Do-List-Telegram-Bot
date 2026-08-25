@@ -65,7 +65,12 @@ async def decision_details_received(msg: Message, state: FSMContext):
     if remaining <= 0:
         return await msg.answer(AI_LIMIT_TEXT, reply_markup=kb_main())
 
-    wait_msg = await msg.answer("⚖️ Аналізую варіанти...")
+    # ВАЖЛИВО: одразу міняємо reply-клавіатуру на kb_main() тут, а не після AI-відповіді.
+    # edit_text() нижче редагує лише текст/inline-клавіатуру цього повідомлення і
+    # НЕ може прибрати чи замінити reply-клавіатуру "❌ Скасувати" внизу екрана —
+    # вона лишалась висіти навіть після завершення діалогу, і натискання на неї
+    # мовчки провалювалось у catch-all хендлер (звідси "кнопка не працює").
+    wait_msg = await msg.answer("⚖️ Аналізую варіанти...", reply_markup=kb_main())
 
     prompt = f"""Ти — раціональний помічник прийняття рішень. Відповідай українською.
 
