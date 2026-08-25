@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 import aiohttp
 
@@ -22,8 +22,9 @@ _weather_cache: dict[tuple, dict] = {}
 CACHE_TTL_SECONDS = 3 * 60 * 60  # 3 години
 
 # Якщо API повернув 429 (денний ліміт вичерпано) — ретраї марні, це не
-# тимчасовий збій. Тут просто фіксуємо факт до півночі UTC (коли ліміт
-# скидається), щоб не бити марно в API повторно і одразу йти у fallback.
+# тимчасовий збій. Тут фіксуємо точний момент наступної півночі UTC (коли
+# ліміт скидається), щоб не бити марно в API повторно до кінця доби і одразу
+# йти у fallback на кеш.
 _rate_limited_until: float = 0.0
 
 
@@ -31,12 +32,28 @@ def _is_rate_limited() -> bool:
     return time.time() < _rate_limited_until
 
 
+def is_daily_limit_exceeded() -> bool:
+    """Публічна перевірка для хендлерів бота — дозволяє показати користувачу
+    конкретне повідомлення про вичерпаний денний ліміт Open-Meteo, а не
+    загальну помилку "не вдалося отримати погоду"."""
+    return _is_rate_limited()
+
+
 def _mark_rate_limited():
     global _rate_limited_until
-    # Ліміт Open-Meteo скидається опівночі UTC. Ставимо паузу на годину
-    # наперед і потім перевіряємо знову — простіше і надійніше, ніж рахувати
-    # точний момент півночі UTC.
-    _rate_limited_until = time.time() + 60 * 60
+    # Ліміт Open-Meteo скидається опівночі UTC. Рахуємо точний момент
+    # наступної півночі UTC замість довільної години наперед — інакше бот
+    # раз на годину марно повторює запит і знову ловить 429 до кінця доби.
+    now = datetime.now(timezone.utc)
+    next_midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    _rate_limited_until = next_midnight.timestamp()
+    logger.warning(
+        "Open-Meteo: денний ліміт вичерпано, наступна спроба після %s UTC",
+        next_midnight.strftime("%Y-%m-%d %H:%M"),
+    )
+
 
 WEATHER_CODE_DESCRIPTIONS = {
     0: "☀️ Ясно", 1: "🌤️ Переважно ясно", 2: "⛅ Мінлива хмарність", 3: "☁️ Хмарно",
