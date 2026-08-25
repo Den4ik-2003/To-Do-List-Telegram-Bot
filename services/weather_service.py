@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, date
 
 import aiohttp
@@ -8,6 +9,17 @@ logger = logging.getLogger("tasks_bot")
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+FETCH_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.5  # секунди, зростає з кожною спробою
+
+# Кеш останньої вдалої "сирої" відповіді Open-Meteo по (lat, lon, forecast_days),
+# щоб при тимчасовому збої API не показувати користувачу помилку, а віддати
+# трохи застарілі, але робочі дані. TTL — скільки хвилин кеш вважається
+# придатним для показу як fallback при новому провалі запиту.
+_weather_cache: dict[tuple, dict] = {}
+CACHE_TTL_SECONDS = 30 * 60  # 30 хв
 
 WEATHER_CODE_DESCRIPTIONS = {
     0: "☀️ Ясно", 1: "🌤️ Переважно ясно", 2: "⛅ Мінлива хмарність", 3: "☁️ Хмарно",
@@ -40,12 +52,20 @@ async def search_city_options(query: str, count: int = 6) -> list[dict]:
 
     params = {"name": city_part, "count": max(count, 10), "language": "uk", "format": "json"}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(GEOCODE_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.get(GEOCODE_URL, params=params) as resp:
                 if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Geocoding status=%s body=%s", resp.status, body[:200])
                     return []
                 data = await resp.json()
                 results = data.get("results") or []
+    except asyncio.TimeoutError:
+        logger.warning("Geocoding timeout для запиту '%s'", query)
+        return []
+    except aiohttp.ClientError as e:
+        logger.warning("Geocoding мережева помилка для '%s': %s", query, e)
+        return []
     except Exception:
         logger.exception("Не вдалося геокодувати місто %s", query)
         return []
@@ -76,7 +96,13 @@ def format_option_label(opt: dict) -> str:
     return ", ".join(parts)
 
 
-async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: int = 2) -> dict | None:
+def _cache_key(lat: float, lon: float, forecast_days: int) -> tuple:
+    # округлюємо координати, щоб дрібні відмінності (0.0001) не плодили окремі
+    # записи кешу для фактично того самого міста
+    return (round(lat, 3), round(lon, 3), forecast_days)
+
+
+async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: int = FETCH_ATTEMPTS) -> dict | None:
     # ВАЖЛИВО: сучасне Open-Meteo API очікує "weather_code" (з підкресленням).
     # Стара назва "weathercode" в актуальній документації/SDK більше не
     # використовується і могла призводити до некоректної/порожньої відповіді.
@@ -88,24 +114,46 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
         "forecast_days": max(1, min(forecast_days, 16)),
         "timezone": "auto",
     }
+    key = _cache_key(lat, lon, forecast_days)
     last_error = None
+
     for attempt in range(1, attempts + 1):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(FORECAST_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+                async with session.get(FORECAST_URL, params=params) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning("Open-Meteo status=%s body=%s (attempt %s)", resp.status, body[:300], attempt)
+                        logger.warning(
+                            "Open-Meteo forecast status=%s body=%s (спроба %s/%s, lat=%s lon=%s)",
+                            resp.status, body[:300], attempt, attempts, lat, lon,
+                        )
                         last_error = f"status {resp.status}"
-                        continue
-                    return await resp.json()
+                    else:
+                        data = await resp.json()
+                        _weather_cache[key] = {"data": data, "ts": time.time()}
+                        return data
         except asyncio.TimeoutError:
-            logger.warning("Open-Meteo timeout (attempt %s) для (%s, %s)", attempt, lat, lon)
+            logger.warning("Open-Meteo forecast timeout (спроба %s/%s) для (%s, %s)", attempt, attempts, lat, lon)
             last_error = "timeout"
+        except aiohttp.ClientError as e:
+            logger.warning("Open-Meteo forecast мережева помилка (спроба %s/%s): %s", attempt, attempts, e)
+            last_error = str(e)
         except Exception:
-            logger.exception("Не вдалося отримати погоду для (%s, %s), спроба %s", lat, lon, attempt)
+            logger.exception("Open-Meteo forecast неочікувана помилка (спроба %s/%s) для (%s, %s)", attempt, attempts, lat, lon)
             last_error = "exception"
-    logger.warning("get_weather failed after %s attempts: %s", attempts, last_error)
+
+        if attempt < attempts:
+            await asyncio.sleep(RETRY_BASE_DELAY * attempt)
+
+    logger.error("get_weather остаточно провалився після %s спроб (lat=%s lon=%s): %s", attempts, lat, lon, last_error)
+
+    # Fallback: якщо свіжий запит не вдався, але є ще не застарілий кеш — віддаємо його,
+    # щоб користувач не бачив "не вдалося отримати погоду" через одноразовий збій мережі.
+    cached = _weather_cache.get(key)
+    if cached and (time.time() - cached["ts"]) <= CACHE_TTL_SECONDS:
+        logger.info("get_weather: віддаю кешовані дані (вік %.0f сек) для (%s, %s)", time.time() - cached["ts"], lat, lon)
+        return cached["data"]
+
     return None
 
 
@@ -138,15 +186,15 @@ def _extract_hourly_window(hourly: dict, local_now: datetime, hours_ahead: int =
     precs = hourly.get("precipitation_probability", [])
     codes = hourly.get("weather_code", [])
 
-    now = local_now
-    limit = now + timedelta(hours=hours_ahead)
+    now_floor = local_now.replace(minute=0, second=0, microsecond=0)
+    limit = local_now + timedelta(hours=hours_ahead)
     window = []
     for i, t in enumerate(times):
         try:
             dt = datetime.strptime(t, "%Y-%m-%dT%H:%M")
         except ValueError:
             continue
-        if dt < now.replace(minute=0, second=0, microsecond=0) or dt > limit:
+        if dt < now_floor or dt > limit:
             continue
         window.append({
             "dt": dt,
@@ -204,9 +252,14 @@ async def build_weather_report(lat: float, lon: float, display_name: str) -> str
 
     current = data.get("current")
     if not current:
+        logger.error("Open-Meteo відповів без блоку 'current' для (%s, %s): %s", lat, lon, str(data)[:300])
         return None
 
     temp = current.get("temperature_2m")
+    if temp is None:
+        logger.error("Open-Meteo відповів без temperature_2m для (%s, %s): %s", lat, lon, current)
+        return None
+
     precipitation = current.get("precipitation", 0)
     code = current.get("weather_code", 0)
     wind = current.get("wind_speed_10m")
