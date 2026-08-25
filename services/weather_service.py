@@ -9,22 +9,19 @@ logger = logging.getLogger("tasks_bot")
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+# Резервне джерело погоди — безкоштовне, без реєстрації й без API-ключа.
+# Використовується, якщо Open-Meteo недоступний (мережевий збій АБО
+# вичерпаний денний ліміт 429).
+WTTR_URL_TEMPLATE = "https://wttr.in/{lat},{lon}"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 FETCH_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1.5  # секунди, зростає з кожною спробою
 
 # Кеш останньої вдалої "сирої" відповіді Open-Meteo по (lat, lon, forecast_days).
-# TTL підняли до 3 годин — погода не змінюється щохвилини, а безкоштовний
-# ліміт Open-Meteo (10 000 запитів/добу на IP) вичерпується дуже швидко,
-# якщо кожне натискання кнопки й кожна ранкова розсилка б'ють в API напряму.
 _weather_cache: dict[tuple, dict] = {}
 CACHE_TTL_SECONDS = 3 * 60 * 60  # 3 години
 
-# Якщо API повернув 429 (денний ліміт вичерпано) — ретраї марні, це не
-# тимчасовий збій. Тут фіксуємо точний момент наступної півночі UTC (коли
-# ліміт скидається), щоб не бити марно в API повторно до кінця доби і одразу
-# йти у fallback на кеш.
 _rate_limited_until: float = 0.0
 
 
@@ -35,15 +32,14 @@ def _is_rate_limited() -> bool:
 def is_daily_limit_exceeded() -> bool:
     """Публічна перевірка для хендлерів бота — дозволяє показати користувачу
     конкретне повідомлення про вичерпаний денний ліміт Open-Meteo, а не
-    загальну помилку "не вдалося отримати погоду"."""
+    загальну помилку "не вдалося отримати погоду". Лишається корисною навіть
+    з резервним джерелом — про сам факт ліміту користувач знати може, хоча
+    тепер це вже не завадить отримати погоду через fallback."""
     return _is_rate_limited()
 
 
 def _mark_rate_limited():
     global _rate_limited_until
-    # Ліміт Open-Meteo скидається опівночі UTC. Рахуємо точний момент
-    # наступної півночі UTC замість довільної години наперед — інакше бот
-    # раз на годину марно повторює запит і знову ловить 429 до кінця доби.
     now = datetime.now(timezone.utc)
     next_midnight = (now + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -131,8 +127,6 @@ def format_option_label(opt: dict) -> str:
 
 
 def _cache_key(lat: float, lon: float, forecast_days: int) -> tuple:
-    # округлюємо координати, щоб дрібні відмінності (0.0001) не плодили окремі
-    # записи кешу для фактично того самого міста
     return (round(lat, 3), round(lon, 3), forecast_days)
 
 
@@ -144,7 +138,6 @@ def _get_cached(key: tuple) -> dict | None:
 
 
 async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: int = FETCH_ATTEMPTS) -> dict | None:
-    # ВАЖЛИВО: сучасне Open-Meteo API очікує "weather_code" (з підкресленням).
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -155,15 +148,13 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
     }
     key = _cache_key(lat, lon, forecast_days)
 
-    # Денний ліміт API вже вичерпано (зафіксовано нещодавнім 429) — не б'ємо
-    # знову марно, одразу віддаємо кеш, якщо він ще не застарів.
     if _is_rate_limited():
         cached = _get_cached(key)
         if cached:
             logger.info("get_weather: денний ліміт Open-Meteo вичерпано, віддаю кеш для (%s, %s)", lat, lon)
-        else:
-            logger.warning("get_weather: денний ліміт Open-Meteo вичерпано і кешу немає для (%s, %s)", lat, lon)
-        return cached
+            return cached
+        logger.warning("get_weather: денний ліміт Open-Meteo вичерпано і кешу немає для (%s, %s)", lat, lon)
+        return None
 
     last_error = None
 
@@ -178,7 +169,6 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
                             body[:300], lat, lon,
                         )
                         _mark_rate_limited()
-                        # Ретраї при 429 марні — ліміт не скинеться за секунди
                         break
                     if resp.status != 200:
                         body = await resp.text()
@@ -206,14 +196,51 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
 
     logger.error("get_weather остаточно провалився (lat=%s lon=%s): %s", lat, lon, last_error)
 
-    # Fallback: якщо свіжий запит не вдався (з будь-якої причини, включно з 429) —
-    # віддаємо кеш, якщо він ще не застарів, замість помилки користувачу.
     cached = _get_cached(key)
     if cached:
         logger.info("get_weather: віддаю кешовані дані для (%s, %s)", lat, lon)
         return cached
 
     return None
+
+
+async def _fetch_wttr_fallback(lat: float, lon: float) -> dict | None:
+    """Резервне джерело поточної погоди через wttr.in — коли Open-Meteo
+    недоступний (мережа) або вичерпав денний ліміт. Дає лише поточну
+    погоду (без погодинного прогнозу), але цього достатньо для базового
+    сценарію "яка зараз погода / що вдягнути"."""
+    url = WTTR_URL_TEMPLATE.format(lat=lat, lon=lon)
+    params = {"format": "j1", "lang": "uk"}
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning("wttr.in fallback status=%s для (%s, %s)", resp.status, lat, lon)
+                    return None
+                data = await resp.json()
+    except asyncio.TimeoutError:
+        logger.warning("wttr.in fallback timeout для (%s, %s)", lat, lon)
+        return None
+    except Exception:
+        logger.exception("wttr.in fallback помилка для (%s, %s)", lat, lon)
+        return None
+
+    try:
+        current = data["current_condition"][0]
+        temp = float(current["temp_C"])
+        wind = float(current["windspeedKmph"])
+        precip = float(current.get("precipMM", 0))
+        desc_list = current.get("lang_uk") or current.get("weatherDesc", [])
+        desc = desc_list[0]["value"] if desc_list else "Погода"
+        return {
+            "temp": temp,
+            "wind": wind,
+            "precipitation": precip,
+            "description": desc,
+        }
+    except (KeyError, IndexError, ValueError, TypeError):
+        logger.exception("wttr.in fallback: не вдалося розпарсити відповідь для (%s, %s)", lat, lon)
+        return None
 
 
 def clothing_advice(temp: float, precipitation: float) -> str:
@@ -306,44 +333,58 @@ def _build_day_plan_lines(window: list[dict]) -> list[str]:
 
 async def build_weather_report(lat: float, lon: float, display_name: str) -> str | None:
     data = await get_weather(lat, lon, forecast_days=2)
-    if not data:
-        return None
 
-    current = data.get("current")
-    if not current:
-        logger.error("Open-Meteo відповів без блоку 'current' для (%s, %s): %s", lat, lon, str(data)[:300])
-        return None
+    if data:
+        current = data.get("current")
+        if current and current.get("temperature_2m") is not None:
+            temp = current.get("temperature_2m")
+            precipitation = current.get("precipitation", 0)
+            code = current.get("weather_code", 0)
+            wind = current.get("wind_speed_10m")
 
-    temp = current.get("temperature_2m")
-    if temp is None:
-        logger.error("Open-Meteo відповів без temperature_2m для (%s, %s): %s", lat, lon, current)
-        return None
+            lines = [
+                f"🌤️ *Погода — {display_name}*",
+                "",
+                weather_code_description(code),
+                f"🌡 Температура: *{temp:.0f}°C*",
+            ]
+            if wind is not None:
+                lines.append(f"💨 Вітер: {wind:.0f} км/год")
+            lines.append("")
+            lines.append(f"👕 *Що вдягнути:*\n{clothing_advice(temp, precipitation)}")
 
-    precipitation = current.get("precipitation", 0)
-    code = current.get("weather_code", 0)
-    wind = current.get("wind_speed_10m")
+            hourly = data.get("hourly")
+            if hourly:
+                current_time_str = current.get("time")
+                try:
+                    local_now = datetime.strptime(current_time_str, "%Y-%m-%dT%H:%M") if current_time_str else datetime.now()
+                except ValueError:
+                    local_now = datetime.now()
+                window = _extract_hourly_window(hourly, local_now)
+                lines.extend(_build_day_plan_lines(window))
+
+            return "\n".join(lines)
+
+        logger.error("Open-Meteo відповів без коректного 'current' для (%s, %s): %s", lat, lon, str(data)[:300])
+
+    # Open-Meteo недоступний або дав неповну відповідь — пробуємо резервне джерело.
+    logger.info("build_weather_report: пробую резервне джерело (wttr.in) для (%s, %s)", lat, lon)
+    fallback = await _fetch_wttr_fallback(lat, lon)
+    if not fallback:
+        return None
 
     lines = [
         f"🌤️ *Погода — {display_name}*",
         "",
-        weather_code_description(code),
-        f"🌡 Температура: *{temp:.0f}°C*",
+        f"{fallback['description']}",
+        f"🌡 Температура: *{fallback['temp']:.0f}°C*",
+        f"💨 Вітер: {fallback['wind']:.0f} км/год",
+        "",
+        f"👕 *Що вдягнути:*\n{clothing_advice(fallback['temp'], fallback['precipitation'])}",
+        "",
+        "_ℹ️ Основне джерело погоди тимчасово недоступне, дані з резервного сервісу "
+        "(без погодинного прогнозу)._",
     ]
-    if wind is not None:
-        lines.append(f"💨 Вітер: {wind:.0f} км/год")
-    lines.append("")
-    lines.append(f"👕 *Що вдягнути:*\n{clothing_advice(temp, precipitation)}")
-
-    hourly = data.get("hourly")
-    if hourly:
-        current_time_str = current.get("time")
-        try:
-            local_now = datetime.strptime(current_time_str, "%Y-%m-%dT%H:%M") if current_time_str else datetime.now()
-        except ValueError:
-            local_now = datetime.now()
-        window = _extract_hourly_window(hourly, local_now)
-        lines.extend(_build_day_plan_lines(window))
-
     return "\n".join(lines)
 
 
@@ -352,11 +393,14 @@ async def build_hourly_day_report(lat: float, lon: float, display_name: str, tar
     today = date.today()
     days_ahead = (target_date - today).days
     if days_ahead < 0:
-        return None  # погода на минулу дату недоступна через forecast API
+        return None
+
     forecast_days = max(1, min(days_ahead + 1, 16))
 
     data = await get_weather(lat, lon, forecast_days=forecast_days)
     if not data:
+        # Резервне джерело не має погодинного прогнозу на майбутні дати
+        # в безкоштовному режимі — чесно повідомляємо про недоступність.
         return None
 
     hourly = data.get("hourly")
@@ -368,7 +412,7 @@ async def build_hourly_day_report(lat: float, lon: float, display_name: str, tar
     precs = hourly.get("precipitation_probability", [])
     codes = hourly.get("weather_code", [])
 
-    date_prefix = target_date.isoformat()  # "YYYY-MM-DD"
+    date_prefix = target_date.isoformat()
     lines = [f"📅 *Погодинно на {target_date.strftime('%d.%m.%Y')} — {display_name}*", ""]
     found = False
 
