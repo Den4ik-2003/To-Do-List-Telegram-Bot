@@ -208,7 +208,12 @@ async def _fetch_wttr_fallback(lat: float, lon: float) -> dict | None:
     """Резервне джерело поточної погоди через wttr.in — коли Open-Meteo
     недоступний (мережа) або вичерпав денний ліміт. Дає лише поточну
     погоду (без погодинного прогнозу), але цього достатньо для базового
-    сценарію "яка зараз погода / що вдягнути"."""
+    сценарію "яка зараз погода / що вдягнути".
+
+    ПРИМІТКА: wttr.in часто повертає тіло-JSON, але з заголовком
+    Content-Type: text/plain замість application/json. Тому явно передаємо
+    content_type=None у resp.json(), щоб aiohttp не кидав ContentTypeError
+    через "неправильний" mimetype і парсив тіло як JSON у будь-якому разі."""
     url = WTTR_URL_TEMPLATE.format(lat=lat, lon=lon)
     params = {"format": "j1", "lang": "uk"}
     try:
@@ -217,7 +222,7 @@ async def _fetch_wttr_fallback(lat: float, lon: float) -> dict | None:
                 if resp.status != 200:
                     logger.warning("wttr.in fallback status=%s для (%s, %s)", resp.status, lat, lon)
                     return None
-                data = await resp.json()
+                data = await resp.json(content_type=None)
     except asyncio.TimeoutError:
         logger.warning("wttr.in fallback timeout для (%s, %s)", lat, lon)
         return None
