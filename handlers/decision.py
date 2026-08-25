@@ -58,19 +58,14 @@ async def decision_details_received(msg: Message, state: FSMContext):
     fd = await state.get_data()
     question = fd.get("question", "")
     details = msg.text.strip()
-    await state.clear()
 
     uid = msg.from_user.id
     remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
     if remaining <= 0:
+        await state.clear()
         return await msg.answer(AI_LIMIT_TEXT, reply_markup=kb_main())
 
-    # ВАЖЛИВО: одразу міняємо reply-клавіатуру на kb_main() тут, а не після AI-відповіді.
-    # edit_text() нижче редагує лише текст/inline-клавіатуру цього повідомлення і
-    # НЕ може прибрати чи замінити reply-клавіатуру "❌ Скасувати" внизу екрана —
-    # вона лишалась висіти навіть після завершення діалогу, і натискання на неї
-    # мовчки провалювалось у catch-all хендлер (звідси "кнопка не працює").
-    wait_msg = await msg.answer("⚖️ Аналізую варіанти...", reply_markup=kb_main())
+    wait_msg = await msg.answer("⚖️ Аналізую варіанти...")
 
     prompt = f"""Ти — раціональний помічник прийняття рішень. Відповідай українською.
 
@@ -103,9 +98,28 @@ async def decision_details_received(msg: Message, state: FSMContext):
 
 Будь конкретним і чесним, не уникай прямої рекомендації."""
 
-    result = await ai_service.generate_text(prompt, temperature=0.3)
+    try:
+        result = await ai_service.generate_text(prompt, temperature=0.3)
+    except Exception:
+        logger.exception("decision AI call failed for uid=%s", uid)
+        result = None
+
     if not result:
-        return await wait_msg.edit_text(AI_ERROR_TEXT)
+        # Стан НЕ скидаємо при помилці AI — питання й контекст вже введені,
+        # немає сенсу змушувати вводити їх заново. Просто повертаємось на
+        # крок деталей, щоб можна було спробувати ще раз або скасувати.
+        await wait_msg.edit_text(AI_ERROR_TEXT)
+        await state.set_state(Decision.waiting_details)
+        await msg.answer("Спробуй ще раз, або натисни «❌ Скасувати»:", reply_markup=kb_cancel())
+        return
 
     await ai_usage_db.increment_usage(uid)
     await wait_msg.edit_text(result)
+
+    # Не викидаємо в головне меню — лишаємось у режимі помічника, щоб можна було
+    # одразу поставити наступне питання. У меню виходимо лише по «❌ Скасувати».
+    await state.set_state(Decision.waiting_question)
+    await msg.answer(
+        "Постав ще одне питання для аналізу, або натисни «❌ Скасувати»:",
+        reply_markup=kb_cancel(),
+    )
