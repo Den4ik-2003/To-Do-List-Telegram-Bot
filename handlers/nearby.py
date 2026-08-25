@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 import aiohttp
 from aiogram import Router, F
@@ -18,6 +19,8 @@ OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
 # Overpass-сервери (особливо overpass-api.de) з 2026 року стали жорсткіше
@@ -42,6 +45,35 @@ NEARBY_CATEGORIES = {
 # вибору першої категорії стан чиститься і повторний пошук іншої
 # категорії для того ж місця стає неможливим.
 _pending_location: dict[int, tuple[float, float]] = {}
+
+# Короткочасний кеш результатів Overpass: (округлені lat/lon, категорія) -> (timestamp, elements).
+# Overpass-дзеркала часто лежать одночасно всі разом — якщо хтось щойно
+# успішно шукав ту саму категорію в тій самій точці, віддаємо готовий
+# результат миттєво замість нового звернення, яке може знову впасти.
+_RESULT_CACHE_TTL = 15 * 60  # 15 хвилин
+_result_cache: dict[tuple, tuple[float, list]] = {}
+
+
+def _cache_key(lat: float, lon: float, category: str) -> tuple:
+    # Округлюємо координати до ~100м, щоб невеликий дрейф GPS/геокодера
+    # не створював окремий кеш-запис на кожен мікроскопічний зсув.
+    return (round(lat, 3), round(lon, 3), category)
+
+
+def _cache_get(lat: float, lon: float, category: str) -> list | None:
+    key = _cache_key(lat, lon, category)
+    entry = _result_cache.get(key)
+    if not entry:
+        return None
+    ts, elements = entry
+    if time.monotonic() - ts > _RESULT_CACHE_TTL:
+        _result_cache.pop(key, None)
+        return None
+    return elements
+
+
+def _cache_set(lat: float, lon: float, category: str, elements: list) -> None:
+    _result_cache[_cache_key(lat, lon, category)] = (time.monotonic(), elements)
 
 
 class Nearby(StatesGroup):
@@ -150,6 +182,14 @@ async def nearby_category(cb: CallbackQuery):
         return await cb.message.edit_text("⚠️ Локація втрачена, почни спочатку через «🗺 Що поруч».")
 
     lat, lon = coords
+
+    cached = _cache_get(lat, lon, key)
+    if cached is not None:
+        await cb.answer()
+        await cb.message.edit_text(_fmt_results(label, cached))
+        await cb.message.answer("Шукати ще щось поруч?", reply_markup=_ikb_categories())
+        return
+
     await cb.answer("Шукаю...")
 
     query = f"""
@@ -165,17 +205,19 @@ out body 15;
             reply_markup=_ikb_categories(),
         )
 
-    if not elements:
-        text = f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км)."
-    else:
-        lines = [f"{label} поруч:\n"]
-        for el in elements[:10]:
-            name = el.get("tags", {}).get("name", "Без назви")
-            lines.append(f"• {name}")
-        text = "\n".join(lines)
-
-    await cb.message.edit_text(text)
+    _cache_set(lat, lon, key, elements)
+    await cb.message.edit_text(_fmt_results(label, elements))
     await cb.message.answer("Шукати ще щось поруч?", reply_markup=_ikb_categories())
+
+
+def _fmt_results(label: str, elements: list) -> str:
+    if not elements:
+        return f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км)."
+    lines = [f"{label} поруч:\n"]
+    for el in elements[:10]:
+        name = el.get("tags", {}).get("name", "Без назви")
+        lines.append(f"• {name}")
+    return "\n".join(lines)
 
 
 @router.callback_query(F.data == "nb_exit")

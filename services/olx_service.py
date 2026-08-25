@@ -1,29 +1,29 @@
 import logging
 import re
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("tasks_bot")
 
+# ВАЖЛИВО: раніше тут використовувався aiohttp з "браузерними" заголовками
+# (User-Agent, Accept, Referer тощо), але OLX все одно повертав 403.
+# Причина — не заголовки, а TLS-відбиток з'єднання: Cloudflare/Akamai-подібний
+# захист розпізнає non-браузерні HTTP-клієнти за тим, ЯК вони встановлюють
+# TLS (порядок cipher suites, ALPN, HTTP/2-параметри), а не лише за
+# заголовками. aiohttp завжди має "не-браузерний" відбиток, скільки
+# заголовків не додавай.
+#
+# curl_cffi вміє відтворювати РЕАЛЬНИЙ TLS-відбиток конкретної версії Chrome
+# (impersonate="chrome124") — це і обходить саме цей тип 403.
+IMPERSONATE = "chrome124"
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
     "Referer": "https://www.olx.ua/",
 }
 
@@ -47,13 +47,13 @@ def _parse_price(text: str) -> tuple[float, str] | None:
 
 async def fetch_listing_price(url: str) -> tuple[float, str] | None:
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
-                final_url = str(resp.url)
-                if resp.status != 200:
-                    logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status, url, final_url)
-                    return None
-                html = await resp.text()
+        async with AsyncSession(impersonate=IMPERSONATE, headers=HEADERS) as session:
+            resp = await session.get(url, timeout=20, allow_redirects=True)
+            final_url = str(resp.url)
+            if resp.status_code != 200:
+                logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status_code, url, final_url)
+                return None
+            html = resp.text
     except Exception:
         logger.exception("OLX listing fetch failed for %s", url)
         return None
@@ -104,12 +104,12 @@ def _build_search_url(title_query: str, max_price: float | None, location: str, 
 async def search_listings(title_query: str, max_price: float | None, location: str, radius_km: int) -> list[dict]:
     url = _build_search_url(title_query, max_price, location, radius_km)
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
-                if resp.status != 200:
-                    logger.warning("OLX search fetch status=%s for %s", resp.status, url)
-                    return []
-                html = await resp.text()
+        async with AsyncSession(impersonate=IMPERSONATE, headers=HEADERS) as session:
+            resp = await session.get(url, timeout=20, allow_redirects=True)
+            if resp.status_code != 200:
+                logger.warning("OLX search fetch status=%s for %s", resp.status_code, url)
+                return []
+            html = resp.text
     except Exception:
         logger.exception("OLX search fetch failed for %s", url)
         return []

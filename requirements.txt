@@ -9,3 +9,4 @@ reportlab
 pandas
 python-dotenv
 beautifulsoup4==4.12.3
+curl_cffi
