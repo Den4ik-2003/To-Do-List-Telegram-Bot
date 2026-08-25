@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 
@@ -16,15 +17,27 @@ from database import ai_usage as ai_usage_db
 from services import ai_service
 from services import planner_service
 from keyboards.main_menu import kb_main, kb_cancel
-from keyboards.ai import ikb_ai_menu, ikb_ai_plan_preview, ikb_ai_settings, ikb_ai_usage
+from keyboards.ai import ikb_ai_menu, ikb_ai_plan_preview, ikb_ai_settings, ikb_ai_usage, ikb_ai_generating
 from handlers.common import require_auth, ai_suggestions_cache, compute_daily_stats
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="ai_planner")
 
+# Скільки секунд чекаємо на відповідь AI, перш ніж вважати запит завислим.
+AI_PLAN_TIMEOUT_SECONDS = 45
+
+# Активні задачі генерації плану, per uid — щоб кнопка "❌ Скасувати"
+# могла реально перервати запит, а не просто показати відмову користувачу,
+# лишивши AI-запит висіти у фоні.
+_generation_tasks: dict[int, asyncio.Task] = {}
+
 
 class AiSettings(StatesGroup):
     setting_time = State()
+
+
+class AiEditTask(StatesGroup):
+    text = State()
 
 
 def _fmt_plan_preview(plan: dict, selected: set) -> str:
@@ -52,7 +65,7 @@ def _fmt_plan_preview(plan: dict, selected: set) -> str:
     lines.append("")
     lines.append(f"📊 Заплановане навантаження: ~{' '.join(load_parts) or '0 хв'}")
     lines.append("")
-    lines.append("Натисни на задачу, щоб зняти/додати позначку, потім підтверди.")
+    lines.append("Тисни на задачу, щоб зняти/додати позначку, ✏️ — щоб відредагувати текст, потім підтверди.")
     return "\n".join(lines)
 
 
@@ -87,18 +100,53 @@ async def _generate_and_show_plan(cb: CallbackQuery):
     uid = cb.from_user.id
     allowed, remaining = await planner_service.check_ai_limit(uid)
     if not allowed:
-        return await cb.message.edit_text(AI_LIMIT_TEXT)
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_ai_menu())
 
-    await cb.message.edit_text("☀️ Аналізую твої задачі, цілі, проєкти та фінанси, зачекай кілька секунд...")
-    plan = await planner_service.generate_daily_plan(uid)
+    # Кнопка "❌ Скасувати" з'являється ОДРАЗУ, поки чекаємо відповідь AI —
+    # раніше тут не було жодної клавіатури, і якщо запит зависав, зробити
+    # було нічого не можна.
+    await cb.message.edit_text(
+        "☀️ Аналізую твої задачі, цілі, проєкти та фінанси, зачекай кілька секунд...",
+        reply_markup=ikb_ai_generating(),
+    )
+
+    task = asyncio.create_task(planner_service.generate_daily_plan(uid))
+    _generation_tasks[uid] = task
+    try:
+        plan = await asyncio.wait_for(task, timeout=AI_PLAN_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        # Користувач натиснув "❌ Скасувати" — той хендлер вже оновив повідомлення.
+        return
+    except asyncio.TimeoutError:
+        task.cancel()
+        return await cb.message.edit_text(
+            "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
+            reply_markup=ikb_ai_menu(),
+        )
+    finally:
+        _generation_tasks.pop(uid, None)
+
     if not plan or not plan.get("tasks"):
-        return await cb.message.edit_text(AI_ERROR_TEXT)
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
     selected = set(range(len(plan["tasks"])))
     ai_suggestions_cache[uid] = {"plan": plan, "selected": selected}
     await cb.message.edit_text(
         _fmt_plan_preview(plan, selected),
         reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
     )
+
+
+@router.callback_query(F.data == "ai_gen_cancel")
+async def ai_gen_cancel_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    task = _generation_tasks.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+    try:
+        await cb.message.edit_text("❌ Генерацію скасовано.", reply_markup=ikb_ai_menu())
+    except TelegramAPIError:
+        pass
+    await cb.answer()
 
 
 @router.callback_query(F.data == "ai_plan")
@@ -163,6 +211,66 @@ async def aip_select_all_cb(cb: CallbackQuery):
     await cb.answer()
 
 
+# =========================================================
+# РЕДАГУВАННЯ ЗАДАЧІ В ПЛАНІ (перед додаванням)
+# =========================================================
+
+@router.callback_query(F.data.startswith("aipedit:"))
+async def aipedit_cb(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    data = ai_suggestions_cache.get(uid)
+    if not data:
+        return await cb.answer("Сесія застаріла, згенеруй план заново.", show_alert=True)
+    idx = int(cb.data.split(":")[1])
+    tasks = data["plan"]["tasks"]
+    if idx >= len(tasks):
+        return await cb.answer("Задачу не знайдено.", show_alert=True)
+
+    await state.set_state(AiEditTask.text)
+    await state.update_data(edit_idx=idx)
+    current_text = tasks[idx]["text"]
+    await cb.message.answer(
+        f"✏️ Поточний текст:\n«{current_text}»\n\nНадішли новий текст задачі:",
+        reply_markup=kb_cancel(),
+    )
+    await cb.answer()
+
+
+@router.message(AiEditTask.text)
+async def aipedit_save(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    if msg.text == "❌ Скасувати":
+        # Скасовуємо лише редагування конкретної задачі — план і сесія лишаються,
+        # повертаємось до прев'ю без змін.
+        await state.clear()
+        data = ai_suggestions_cache.get(uid)
+        if not data:
+            return await msg.answer("Скасовано.", reply_markup=kb_main())
+        await msg.answer(
+            _fmt_plan_preview(data["plan"], data["selected"]),
+            reply_markup=ikb_ai_plan_preview(data["plan"]["tasks"], data["selected"]),
+        )
+        return
+
+    new_text = msg.text.strip()[:200]
+    if not new_text:
+        return await msg.answer("⚠️ Текст не може бути порожнім. Спробуй ще раз:", reply_markup=kb_cancel())
+
+    fd = await state.get_data()
+    idx = fd["edit_idx"]
+    await state.clear()
+
+    data = ai_suggestions_cache.get(uid)
+    if not data or idx >= len(data["plan"]["tasks"]):
+        return await msg.answer("Сесія застаріла, згенеруй план заново.", reply_markup=kb_main())
+
+    data["plan"]["tasks"][idx]["text"] = new_text
+    await msg.answer(
+        _fmt_plan_preview(data["plan"], data["selected"]),
+        reply_markup=ikb_ai_plan_preview(data["plan"]["tasks"], data["selected"]),
+    )
+
+
 @router.callback_query(F.data == "aip_add")
 async def aip_add_cb(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -222,13 +330,29 @@ async def ai_analysis_cb(cb: CallbackQuery):
         await cb.answer("Аналізую...")
         allowed, _ = await planner_service.check_ai_limit(uid)
         if not allowed:
-            return await cb.message.edit_text(AI_LIMIT_TEXT)
-        await cb.message.edit_text("📊 Аналізую твою продуктивність...")
-        stats = await compute_daily_stats(uid, tasks_db)
-        text = await planner_service.generate_daily_analysis(uid, stats)
+            return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_ai_menu())
+        await cb.message.edit_text("📊 Аналізую твою продуктивність...", reply_markup=ikb_ai_generating())
+
+        task = asyncio.create_task(compute_daily_stats(uid, tasks_db))
+        stats = await task
+        analysis_task = asyncio.create_task(planner_service.generate_daily_analysis(uid, stats))
+        _generation_tasks[uid] = analysis_task
+        try:
+            text = await asyncio.wait_for(analysis_task, timeout=AI_PLAN_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        except asyncio.TimeoutError:
+            analysis_task.cancel()
+            return await cb.message.edit_text(
+                "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
+                reply_markup=ikb_ai_menu(),
+            )
+        finally:
+            _generation_tasks.pop(uid, None)
+
         if not text:
-            return await cb.message.edit_text(AI_ERROR_TEXT)
-        await cb.message.edit_text(f"📊 *Аналіз продуктивності*\n\n{text}")
+            return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
+        await cb.message.edit_text(f"📊 *Аналіз продуктивності*\n\n{text}", reply_markup=ikb_ai_menu())
     except Exception:
         logger.exception("ai_analysis_cb failed")
         await _safe_edit(cb, AI_ERROR_TEXT)
@@ -297,6 +421,6 @@ async def ai_usage_info_cb(cb: CallbackQuery):
 
 async def _safe_edit(cb: CallbackQuery, text: str):
     try:
-        await cb.message.edit_text(text)
+        await cb.message.edit_text(text, reply_markup=ikb_ai_menu())
     except TelegramAPIError:
         pass

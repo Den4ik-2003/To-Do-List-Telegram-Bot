@@ -14,12 +14,25 @@ def ikb_ai_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def ikb_ai_generating() -> InlineKeyboardMarkup:
+    """
+    Клавіатура, яка показується ОДРАЗУ, поки AI генерує план — щоб було
+    куди тиснути, якщо запит зависне чи просто набридло чекати.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ai_gen_cancel")],
+    ])
+
+
 def ikb_ai_plan_preview(tasks: list, selected: set) -> InlineKeyboardMarkup:
     rows = []
     for i, t in enumerate(tasks):
         mark = "☑️" if i in selected else "⬜️"
         label = LABELS.get(t.get("label", ""), {})
-        rows.append([InlineKeyboardButton(text=f"{mark} {label.get('emoji','')} {t['text'][:35]}", callback_data=f"aiptoggle:{i}")])
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} {label.get('emoji','')} {t['text'][:28]}", callback_data=f"aiptoggle:{i}"),
+            InlineKeyboardButton(text="✏️", callback_data=f"aipedit:{i}"),
+        ])
     rows.append([
         InlineKeyboardButton(text="✅ Додати всі", callback_data="aip_select_all"),
         InlineKeyboardButton(text="🔄 Перегенерувати", callback_data="ai_regenerate"),
