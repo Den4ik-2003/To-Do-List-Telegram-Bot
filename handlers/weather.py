@@ -18,6 +18,22 @@ router = Router(name="weather")
 # великий JSON у callback_data (там ліміт 64 байти)
 _pending_options: dict[int, list[dict]] = {}
 
+# Текст, який показуємо, коли погоду не вдалося отримати саме через те, що
+# вичерпано денний ліміт запитів до Open-Meteo (а не через тимчасовий збій).
+LIMIT_EXCEEDED_TEXT = (
+    "⚠️ Денний ліміт запитів до сервісу погоди вичерпано.\n"
+    "Спробуй, будь ласка, пізніше — ліміт скидається щодня опівночі UTC."
+)
+
+
+def _weather_failure_text(fallback: str) -> str:
+    """Повертає текст помилки погоди: конкретний, якщо причина — вичерпаний
+    денний ліміт Open-Meteo, або переданий fallback для інших випадків
+    (мережеві збої, таймаути тощо)."""
+    if weather_service.is_daily_limit_exceeded():
+        return LIMIT_EXCEEDED_TEXT
+    return fallback
+
 
 class WeatherCity(StatesGroup):
     waiting_city = State()
@@ -81,7 +97,8 @@ async def weather_show(msg: Message, state: FSMContext):
     wait_msg = await msg.answer("🌤️ Дивлюсь погоду...")
     report = await weather_service.build_weather_report(lat, lon, display_name)
     if not report:
-        return await wait_msg.edit_text("⚠️ Не вдалося отримати погоду. Спробуй пізніше.")
+        text = _weather_failure_text("⚠️ Не вдалося отримати погоду. Спробуй пізніше.")
+        return await wait_msg.edit_text(text)
     await wait_msg.edit_text(report, reply_markup=_ikb_change_city())
 
 
@@ -163,10 +180,11 @@ async def _send_hourly_day(target: Message, uid: int, target_date: date):
     wait_msg = await target.answer("📅 Формую погодинний прогноз...")
     report = await weather_service.build_hourly_day_report(lat, lon, display_name, target_date)
     if not report:
-        return await wait_msg.edit_text(
+        text = _weather_failure_text(
             "⚠️ Не вдалося отримати погодинний прогноз на цю дату. "
             "Можливо, вона задалеко в майбутньому (доступно до 16 днів)."
         )
+        return await wait_msg.edit_text(text)
     await wait_msg.edit_text(report, reply_markup=_ikb_change_city())
 
 
@@ -246,7 +264,7 @@ async def _apply_city(uid: int, opt: dict, target: Message, state: FSMContext, e
 
     report = await weather_service.build_weather_report(opt["lat"], opt["lon"], display_name)
     if report:
-        if edit:
-            await target.answer(report, reply_markup=_ikb_change_city())
-        else:
-            await target.answer(report, reply_markup=_ikb_change_city())
+        await target.answer(report, reply_markup=_ikb_change_city())
+    else:
+        text = _weather_failure_text("⚠️ Не вдалося отримати погоду. Спробуй пізніше.")
+        await target.answer(text)
