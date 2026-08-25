@@ -14,12 +14,29 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 FETCH_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1.5  # секунди, зростає з кожною спробою
 
-# Кеш останньої вдалої "сирої" відповіді Open-Meteo по (lat, lon, forecast_days),
-# щоб при тимчасовому збої API не показувати користувачу помилку, а віддати
-# трохи застарілі, але робочі дані. TTL — скільки хвилин кеш вважається
-# придатним для показу як fallback при новому провалі запиту.
+# Кеш останньої вдалої "сирої" відповіді Open-Meteo по (lat, lon, forecast_days).
+# TTL підняли до 3 годин — погода не змінюється щохвилини, а безкоштовний
+# ліміт Open-Meteo (10 000 запитів/добу на IP) вичерпується дуже швидко,
+# якщо кожне натискання кнопки й кожна ранкова розсилка б'ють в API напряму.
 _weather_cache: dict[tuple, dict] = {}
-CACHE_TTL_SECONDS = 30 * 60  # 30 хв
+CACHE_TTL_SECONDS = 3 * 60 * 60  # 3 години
+
+# Якщо API повернув 429 (денний ліміт вичерпано) — ретраї марні, це не
+# тимчасовий збій. Тут просто фіксуємо факт до півночі UTC (коли ліміт
+# скидається), щоб не бити марно в API повторно і одразу йти у fallback.
+_rate_limited_until: float = 0.0
+
+
+def _is_rate_limited() -> bool:
+    return time.time() < _rate_limited_until
+
+
+def _mark_rate_limited():
+    global _rate_limited_until
+    # Ліміт Open-Meteo скидається опівночі UTC. Ставимо паузу на годину
+    # наперед і потім перевіряємо знову — простіше і надійніше, ніж рахувати
+    # точний момент півночі UTC.
+    _rate_limited_until = time.time() + 60 * 60
 
 WEATHER_CODE_DESCRIPTIONS = {
     0: "☀️ Ясно", 1: "🌤️ Переважно ясно", 2: "⛅ Мінлива хмарність", 3: "☁️ Хмарно",
@@ -102,10 +119,15 @@ def _cache_key(lat: float, lon: float, forecast_days: int) -> tuple:
     return (round(lat, 3), round(lon, 3), forecast_days)
 
 
+def _get_cached(key: tuple) -> dict | None:
+    cached = _weather_cache.get(key)
+    if cached and (time.time() - cached["ts"]) <= CACHE_TTL_SECONDS:
+        return cached["data"]
+    return None
+
+
 async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: int = FETCH_ATTEMPTS) -> dict | None:
     # ВАЖЛИВО: сучасне Open-Meteo API очікує "weather_code" (з підкресленням).
-    # Стара назва "weathercode" в актуальній документації/SDK більше не
-    # використовується і могла призводити до некоректної/порожньої відповіді.
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -115,12 +137,32 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
         "timezone": "auto",
     }
     key = _cache_key(lat, lon, forecast_days)
+
+    # Денний ліміт API вже вичерпано (зафіксовано нещодавнім 429) — не б'ємо
+    # знову марно, одразу віддаємо кеш, якщо він ще не застарів.
+    if _is_rate_limited():
+        cached = _get_cached(key)
+        if cached:
+            logger.info("get_weather: денний ліміт Open-Meteo вичерпано, віддаю кеш для (%s, %s)", lat, lon)
+        else:
+            logger.warning("get_weather: денний ліміт Open-Meteo вичерпано і кешу немає для (%s, %s)", lat, lon)
+        return cached
+
     last_error = None
 
     for attempt in range(1, attempts + 1):
         try:
             async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
                 async with session.get(FORECAST_URL, params=params) as resp:
+                    if resp.status == 429:
+                        body = await resp.text()
+                        logger.warning(
+                            "Open-Meteo денний ліміт вичерпано (429): %s (lat=%s lon=%s)",
+                            body[:300], lat, lon,
+                        )
+                        _mark_rate_limited()
+                        # Ретраї при 429 марні — ліміт не скинеться за секунди
+                        break
                     if resp.status != 200:
                         body = await resp.text()
                         logger.warning(
@@ -145,14 +187,14 @@ async def get_weather(lat: float, lon: float, forecast_days: int = 2, attempts: 
         if attempt < attempts:
             await asyncio.sleep(RETRY_BASE_DELAY * attempt)
 
-    logger.error("get_weather остаточно провалився після %s спроб (lat=%s lon=%s): %s", attempts, lat, lon, last_error)
+    logger.error("get_weather остаточно провалився (lat=%s lon=%s): %s", lat, lon, last_error)
 
-    # Fallback: якщо свіжий запит не вдався, але є ще не застарілий кеш — віддаємо його,
-    # щоб користувач не бачив "не вдалося отримати погоду" через одноразовий збій мережі.
-    cached = _weather_cache.get(key)
-    if cached and (time.time() - cached["ts"]) <= CACHE_TTL_SECONDS:
-        logger.info("get_weather: віддаю кешовані дані (вік %.0f сек) для (%s, %s)", time.time() - cached["ts"], lat, lon)
-        return cached["data"]
+    # Fallback: якщо свіжий запит не вдався (з будь-якої причини, включно з 429) —
+    # віддаємо кеш, якщо він ще не застарів, замість помилки користувачу.
+    cached = _get_cached(key)
+    if cached:
+        logger.info("get_weather: віддаю кешовані дані для (%s, %s)", lat, lon)
+        return cached
 
     return None
 
@@ -277,9 +319,6 @@ async def build_weather_report(lat: float, lon: float, display_name: str) -> str
 
     hourly = data.get("hourly")
     if hourly:
-        # Використовуємо ЛОКАЛЬНИЙ час міста, який повертає сам API
-        # (data["current"]["time"]), а не час сервера — інакше вікно
-        # "найближчих годин" рахується з рознобою в часових поясах.
         current_time_str = current.get("time")
         try:
             local_now = datetime.strptime(current_time_str, "%Y-%m-%dT%H:%M") if current_time_str else datetime.now()
