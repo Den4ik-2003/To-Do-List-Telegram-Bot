@@ -35,6 +35,10 @@ def _ikb_translate_lang() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# =========================================================
+# ПЕРЕКЛАД
+# =========================================================
+
 @router.message(F.text == "🌐 Переклад")
 async def translate_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
@@ -54,10 +58,9 @@ async def translate_text_received(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(text=msg.text)
-    # Стан тут вже виходить з-під контролю reply-хендлерів (вибір мови — inline),
-    # тож reply-клавіатуру "❌ Скасувати" треба прибрати зараз: інакше вона лишиться
-    # висіти на екрані під час вибору мови й далі, а натискання на неї провалиться
-    # в catch-all хендлер (finances.py) і бот мовчки нічого не відповість.
+    # Поки обирається мова — це inline-крок, reply-клавіатура тут не потрібна.
+    # Стан НЕ скидаємо: після перекладу користувач повертається саме в цей стан,
+    # щоб міг одразу надіслати наступний текст без повторного натискання меню.
     await msg.answer("Обери мову перекладу:", reply_markup=ReplyKeyboardRemove())
     await msg.answer("👇", reply_markup=_ikb_translate_lang())
 
@@ -72,7 +75,6 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
 
     fd = await state.get_data()
     text = fd.get("text", "")
-    await state.clear()
     if not text:
         await cb.answer()
         return await cb.message.edit_text("⚠️ Текст втрачено, спробуй ще раз.")
@@ -82,6 +84,7 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
     if remaining <= 0:
+        await state.clear()
         return await cb.message.edit_text(AI_LIMIT_TEXT)
 
     prompt = (
@@ -90,12 +93,25 @@ async def translate_pick_lang(cb: CallbackQuery, state: FSMContext):
     )
     result = await ai_service.generate_text(prompt, temperature=0.3)
     if not result:
+        await state.clear()
         return await cb.message.edit_text(AI_ERROR_TEXT)
 
     await ai_usage_db.increment_usage(uid)
     await cb.message.edit_text(result)
-    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
 
+    # Не викидаємо в головне меню — повертаємось у той самий стан очікування тексту,
+    # щоб можна було одразу перекладати далі. У меню виходимо лише по «❌ Скасувати».
+    await state.set_state(Translate.waiting_text)
+    await state.update_data(text=None)
+    await cb.message.answer(
+        "Надішли ще текст для перекладу, або натисни «❌ Скасувати»:",
+        reply_markup=kb_cancel(),
+    )
+
+
+# =========================================================
+# РЕДАГУВАННЯ ПОВІДОМЛЕНЬ
+# =========================================================
 
 @router.message(F.text == "✍️ Редактор")
 async def rewrite_start(msg: Message, state: FSMContext):
@@ -118,16 +134,14 @@ async def rewrite_text_received(msg: Message, state: FSMContext):
         return await msg.answer("Скасовано.", reply_markup=kb_main())
 
     text = msg.text.strip()
-    await state.clear()
 
     uid = msg.from_user.id
     remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
     if remaining <= 0:
+        await state.clear()
         return await msg.answer(AI_LIMIT_TEXT, reply_markup=kb_main())
 
-    # Так само, як у decision.py: одразу міняємо reply-клавіатуру на kb_main(),
-    # бо подальший edit_text() її не прибере, і стара "❌ Скасувати" лишиться висіти.
-    wait_msg = await msg.answer("✍️ Складаю повідомлення...", reply_markup=kb_main())
+    wait_msg = await msg.answer("✍️ Складаю повідомлення...")
 
     prompt = (
         f"Користувач написав неформально, можливо з помилками: \"{text}\". "
@@ -137,7 +151,16 @@ async def rewrite_text_received(msg: Message, state: FSMContext):
     )
     result = await ai_service.generate_text(prompt, temperature=0.4)
     if not result:
+        await state.clear()
         return await wait_msg.edit_text(AI_ERROR_TEXT)
 
     await ai_usage_db.increment_usage(uid)
     await wait_msg.edit_text(result)
+
+    # Так само, як з перекладом: залишаємось у стані редактора, щоб можна було
+    # одразу редагувати наступне повідомлення. Кнопка "❌ Скасувати" лишається
+    # видимою постійно і саме вона одна веде в головне меню.
+    await msg.answer(
+        "Надішли ще текст для редагування, або натисни «❌ Скасувати»:",
+        reply_markup=kb_cancel(),
+    )
