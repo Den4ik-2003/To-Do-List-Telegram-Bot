@@ -6,6 +6,7 @@ from aiogram import Router, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import StateFilter
 from aiogram.types import Message, CallbackQuery
 
 from config.constants import (
@@ -28,6 +29,8 @@ from handlers.common import (
 logger = logging.getLogger("tasks_bot")
 router = Router(name="tasks")
 
+CANCEL_TEXT = "❌ Скасувати"
+
 
 class AddTask(StatesGroup):
     text = State()
@@ -40,6 +43,15 @@ class AddTask(StatesGroup):
 
 class EditField(StatesGroup):
     typing = State()
+
+
+def is_cancel(text: str | None) -> bool:
+    return bool(text) and text.strip() == CANCEL_TEXT
+
+
+async def _cancel(msg: Message, state: FSMContext, kb=None) -> None:
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb or kb_tasks_menu())
 
 
 # =========================================================
@@ -75,21 +87,21 @@ async def new_task_start(msg: Message, state: FSMContext):
     await msg.answer("📝 Введіть *текст завдання*:", reply_markup=kb_cancel())
 
 
-@router.message(AddTask.text)
+@router.message(StateFilter(AddTask.text))
 async def at_text(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    if not msg.text:
+        return await msg.answer("⚠️ Введіть текст завдання:", reply_markup=kb_cancel())
     await state.update_data(text=msg.text.strip())
     await state.set_state(AddTask.label)
     await msg.answer("🎨 Оберіть *мітку*:", reply_markup=kb_label())
 
 
-@router.message(AddTask.label)
+@router.message(StateFilter(AddTask.label))
 async def at_label(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
     label = label_from_text(msg.text)
     if not label:
         return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_label())
@@ -98,11 +110,10 @@ async def at_label(msg: Message, state: FSMContext):
     await msg.answer("🏷 Оберіть *категорію*:", reply_markup=kb_category())
 
 
-@router.message(AddTask.category)
+@router.message(StateFilter(AddTask.category))
 async def at_category(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
     category = category_from_text(msg.text)
     if not category:
         return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
@@ -111,11 +122,10 @@ async def at_category(msg: Message, state: FSMContext):
     await msg.answer("📅 Коли треба це зробити? Оберіть дату:", reply_markup=kb_date())
 
 
-@router.message(AddTask.date)
+@router.message(StateFilter(AddTask.date))
 async def at_date(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
     if msg.text == "✏️ Своя дата (дд.мм.рррр)":
         await state.set_state(AddTask.date_manual)
         return await msg.answer("📅 Введіть дату як *дд.мм.рррр*:", reply_markup=kb_cancel())
@@ -129,12 +139,11 @@ async def at_date(msg: Message, state: FSMContext):
     await _at_date_save(msg, state, date_str)
 
 
-@router.message(AddTask.date_manual)
+@router.message(StateFilter(AddTask.date_manual))
 async def at_date_manual(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
-    raw = msg.text.strip()
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    raw = (msg.text or "").strip()
     try:
         datetime.strptime(raw, "%d.%m.%Y")
     except ValueError:
@@ -154,12 +163,11 @@ async def _at_date_save(msg: Message, state: FSMContext, date_str: str):
     )
 
 
-@router.message(AddTask.time)
+@router.message(StateFilter(AddTask.time))
 async def at_time(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
-    raw = msg.text.strip()
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    raw = (msg.text or "").strip()
     try:
         datetime.strptime(raw, "%H:%M")
     except ValueError:
@@ -590,11 +598,10 @@ async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
         await _safe_alert(cb)
 
 
-@router.message(EditField.typing)
+@router.message(StateFilter(EditField.typing))
 async def edit_field_save(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_tasks_menu())
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
     fd = await state.get_data()
     tid, field = fd["edit_tid"], fd["edit_field"]
     t = await tasks_db.get_task(tid)
