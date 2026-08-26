@@ -123,6 +123,17 @@ async def _generate_and_show_plan(cb: CallbackQuery):
             "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
             reply_markup=ikb_ai_menu(),
         )
+    except Exception:
+        # ВАЖЛИВО: раніше тут ловились ЛИШЕ CancelledError і TimeoutError.
+        # Будь-яка інша помилка (проблема з БД, некоректна JSON-відповідь AI,
+        # мережевий збій тощо) летіла далі й гасилась загальним except у
+        # ai_plan_cb/ai_regenerate_cb — але екран з кнопкою "❌ Скасувати"
+        # на цей момент уже показував застарілий стан, тому натискання на
+        # неї не давало ефекту (задача з _generation_tasks вже видалена
+        # нижче у finally, і хендлер ai_gen_cancel_cb не знаходив що скасовувати).
+        # Тепер помилка одразу перемальовує екран у робочий стан з меню.
+        logger.exception("Помилка генерації AI-плану для uid=%s", uid)
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
     finally:
         _generation_tasks.pop(uid, None)
 
@@ -138,6 +149,13 @@ async def _generate_and_show_plan(cb: CallbackQuery):
 
 @router.callback_query(F.data == "ai_gen_cancel")
 async def ai_gen_cancel_cb(cb: CallbackQuery):
+    # ВАЖЛИВО: відповідаємо на callback ОДРАЗУ, ще до edit_text. Раніше
+    # cb.answer() викликався лише в кінці, тому якщо edit_text падав з
+    # помилкою (напр. "message is not modified" — коли повідомлення вже
+    # було в такому ж стані через race condition) або просто затримувався,
+    # кнопка в Telegram лишалась у стані "завантаження" й виглядала так,
+    # ніби натискання взагалі не спрацювало.
+    await cb.answer("Скасовую...")
     uid = cb.from_user.id
     task = _generation_tasks.pop(uid, None)
     if task and not task.done():
@@ -146,7 +164,6 @@ async def ai_gen_cancel_cb(cb: CallbackQuery):
         await cb.message.edit_text("❌ Генерацію скасовано.", reply_markup=ikb_ai_menu())
     except TelegramAPIError:
         pass
-    await cb.answer()
 
 
 @router.callback_query(F.data == "ai_plan")
@@ -347,6 +364,11 @@ async def ai_analysis_cb(cb: CallbackQuery):
                 "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
                 reply_markup=ikb_ai_menu(),
             )
+        except Exception:
+            # Той самий фікс, що й у _generate_and_show_plan: будь-яка інша
+            # помилка тепер теж коректно перемальовує екран замість "зависання".
+            logger.exception("Помилка AI-аналізу для uid=%s", uid)
+            return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
         finally:
             _generation_tasks.pop(uid, None)
 
