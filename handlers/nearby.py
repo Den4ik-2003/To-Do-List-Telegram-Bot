@@ -15,7 +15,8 @@ from handlers.common import require_auth
 logger = logging.getLogger("tasks_bot")
 router = Router(name="nearby")
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -24,16 +25,13 @@ OVERPASS_URLS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
-# Overpass-сервери (особливо overpass-api.de) з 2026 року стали жорсткіше
-# фільтрувати запити, що виглядають "програмними" — без нормального
-# User-Agent і Accept-заголовків повертають 406, навіть якщо сам запит
-# коректний. Явно задаємо їх, щоб не потрапляти під цей фільтр.
 OVERPASS_HEADERS = {
     "User-Agent": "todo-list-telegram-bot/1.0 (contact: telegram bot)",
     "Accept": "application/json",
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
     "Content-Type": "application/x-www-form-urlencoded",
 }
+NOMINATIM_HEADERS = {"User-Agent": "todo-list-telegram-bot/1.0 (contact: telegram bot)"}
 
 NEARBY_CATEGORIES = {
     "pharmacy": ("💊 Аптека", "amenity", "pharmacy"),
@@ -42,18 +40,23 @@ NEARBY_CATEGORIES = {
     "atm": ("🏧 Банкомат", "amenity", "atm"),
 }
 
-# lat/lon зберігаємо ОКРЕМО від FSM-стану, а не в ньому — інакше після
-# вибору першої категорії стан чиститься і повторний пошук іншої
-# категорії для того ж місця стає неможливим.
 _pending_location: dict[int, tuple[float, float]] = {}
-
-# Кандидати адреси (коли пошук неоднозначний, напр. просто назва вулиці
-# без міста), поки користувач не обере потрібний варіант.
 _pending_geocode_options: dict[int, list[dict]] = {}
 
-# Короткочасний кеш результатів Overpass: (округлені lat/lon, категорія) -> (timestamp, elements).
 _RESULT_CACHE_TTL = 15 * 60  # 15 хвилин
 _result_cache: dict[tuple, tuple[float, list]] = {}
+
+# Кеш reverse-геокодування (координати -> назва вулиці) — тримаємо довго,
+# бо вулиця біля точки практично ніколи не змінюється, а Nominatim дозволяє
+# лише 1 запит/сек, тому повторні виклики для тих самих точок дорогі.
+_REVERSE_CACHE_TTL = 7 * 24 * 60 * 60  # 7 днів
+_reverse_cache: dict[tuple, tuple[float, str | None]] = {}
+
+# Nominatim Usage Policy дозволяє максимум 1 запит/сек — тримаємо один
+# спільний лок і час останнього виклику, щоб усі reverse-запити (навіть
+# для різних користувачів одночасно) не перевищували цей ліміт.
+_nominatim_lock = asyncio.Lock()
+_last_nominatim_call = 0.0
 
 
 def _cache_key(lat: float, lon: float, category: str) -> tuple:
@@ -113,12 +116,11 @@ async def nearby_start(msg: Message, state: FSMContext):
 
 async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
     params = {"q": query, "format": "json", "limit": limit, "addressdetails": 1}
-    headers = {"User-Agent": "todo-list-telegram-bot"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(NOMINATIM_URL, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            async with session.get(NOMINATIM_SEARCH_URL, params=params, headers=NOMINATIM_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status != 200:
-                    logger.warning("Nominatim status=%s for query=%s", resp.status, query)
+                    logger.warning("Nominatim search status=%s for query=%s", resp.status, query)
                     return []
                 data = await resp.json()
     except Exception:
@@ -144,6 +146,51 @@ async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
             "short": _shorten_display_name(display_name),
         })
     return options
+
+
+async def _reverse_geocode_street(lat: float, lon: float) -> str | None:
+    """
+    Визначає назву вулиці за координатами через Nominatim reverse-геокодування —
+    використовується як fallback для об'єктів з Overpass, у яких немає прямих
+    тегів addr:street/addr:housenumber (це поширено для дрібних магазинів в OSM).
+    Дотримується ліміту Nominatim в 1 запит/сек через спільний лок.
+    """
+    global _last_nominatim_call
+
+    key = (round(lat, 4), round(lon, 4))
+    cached = _reverse_cache.get(key)
+    if cached and (time.monotonic() - cached[0]) <= _REVERSE_CACHE_TTL:
+        return cached[1]
+
+    async with _nominatim_lock:
+        elapsed = time.monotonic() - _last_nominatim_call
+        if elapsed < 1.0:
+            await asyncio.sleep(1.0 - elapsed)
+
+        params = {"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1}
+        street = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    NOMINATIM_REVERSE_URL, params=params, headers=NOMINATIM_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    _last_nominatim_call = time.monotonic()
+                    if resp.status == 200:
+                        data = await resp.json()
+                        addr = data.get("address", {})
+                        road = addr.get("road") or addr.get("pedestrian") or addr.get("footway")
+                        house = addr.get("house_number", "")
+                        if road:
+                            street = f"{road} {house}".strip()
+                    else:
+                        logger.warning("Nominatim reverse status=%s for (%s, %s)", resp.status, lat, lon)
+        except Exception:
+            logger.exception("Reverse geocoding failed for (%s, %s)", lat, lon)
+            _last_nominatim_call = time.monotonic()
+
+    _reverse_cache[key] = (time.monotonic(), street)
+    return street
 
 
 @router.message(Nearby.waiting_address, F.location)
@@ -209,16 +256,6 @@ async def nearby_address_cancel(cb: CallbackQuery, state: FSMContext):
 
 
 async def _send_categories_prompt(uid: int, target: Message):
-    """
-    Надсилає повідомлення з кнопками категорій ("Що шукаємо поруч?") ОКРЕМИМ
-    надійним кроком з власним try/except — раніше, якщо попередній edit_text/answer
-    падав з помилкою (напр. "message can't be edited" через застаріле повідомлення),
-    виконання _apply_location зупинялось ДО цього кроку, і кнопки взагалі не
-    з'являлись — користувач бачив підтвердження локації, але без жодної кнопки,
-    і будь-яке подальше натискання на СТАРУ кнопку з попередньої сесії
-    видавало "Локація втрачена" (бо контекст насправді був втрачений раніше,
-    ще на етапі показу кнопок).
-    """
     try:
         await target.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
     except TelegramAPIError:
@@ -233,8 +270,6 @@ async def _send_categories_prompt(uid: int, target: Message):
 
 
 async def _apply_location(uid: int, opt: dict, target: Message, state: FSMContext, edit: bool = False):
-    # Спочатку зберігаємо локацію — це найважливіший крок, і він не залежить
-    # від того, чи вдасться відредагувати/надіслати текстове підтвердження.
     _pending_location[uid] = (opt["lat"], opt["lon"])
     await state.clear()
 
@@ -244,9 +279,6 @@ async def _apply_location(uid: int, opt: dict, target: Message, state: FSMContex
         try:
             await target.edit_text(text)
         except TelegramAPIError:
-            # Якщо редагування не вдалось (напр. повідомлення застаріле) —
-            # надсилаємо підтвердження новим повідомленням, щоб користувач
-            # точно побачив, що локація прийнята, і далі отримав кнопки.
             logger.warning("Не вдалося відредагувати повідомлення локації для uid=%s, надсилаю нове", uid)
             try:
                 await target.answer(text)
@@ -258,9 +290,6 @@ async def _apply_location(uid: int, opt: dict, target: Message, state: FSMContex
         except TelegramAPIError:
             logger.exception("Не вдалося надіслати підтвердження локації для uid=%s", uid)
 
-    # Кнопки категорій надсилаємо ЗАВЖДИ, незалежно від того, чи вдалось
-    # попереднє підтвердження — це і є головний фікс: раніше якщо щось
-    # падало вище, до цього рядка виконання просто не доходило.
     await _send_categories_prompt(uid, target)
 
 
@@ -295,10 +324,6 @@ async def nearby_category(cb: CallbackQuery):
     coords = _pending_location.get(cb.from_user.id)
     if not coords:
         await cb.answer()
-        # ВАЖЛИВО: якщо це трапляється одразу після успішного пошуку
-        # (не через довгий час) — це майже завжди означає, що процес бота
-        # перезапустився (наприклад, деплой на Render), бо _pending_location
-        # зберігається лише в пам'яті процесу і обнуляється при рестарті.
         return await cb.message.edit_text(
             "⚠️ Локація втрачена (можливо, бот щойно перезапустився). "
             "Почни спочатку через «🗺 Що поруч»."
@@ -309,7 +334,9 @@ async def nearby_category(cb: CallbackQuery):
     cached = _cache_get(lat, lon, key)
     if cached is not None:
         await cb.answer()
-        await cb.message.edit_text(_fmt_results(label, cached))
+        await cb.message.edit_text("🔎 Уточнюю адреси...")
+        text = await _build_results_text(label, cached)
+        await cb.message.edit_text(text)
         await cb.message.answer("Шукати ще щось поруч?", reply_markup=_ikb_categories())
         return
 
@@ -329,20 +356,36 @@ out body 15;
         )
 
     _cache_set(lat, lon, key, elements)
-    await cb.message.edit_text(_fmt_results(label, elements))
+
+    # Уточнення адрес через reverse-геокодування може зайняти кілька секунд
+    # (Nominatim обмежує 1 запит/сек) — показуємо проміжний статус.
+    await cb.message.edit_text("🔎 Уточнюю адреси...")
+    text = await _build_results_text(label, elements)
+    await cb.message.edit_text(text)
     await cb.message.answer("Шукати ще щось поруч?", reply_markup=_ikb_categories())
 
 
-def _fmt_results(label: str, elements: list) -> str:
+async def _build_results_text(label: str, elements: list) -> str:
     if not elements:
         return f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км)."
+
     lines = [f"{label} поруч:\n"]
     for el in elements[:10]:
         tags = el.get("tags", {})
         name = tags.get("name", "Без назви")
+
         street = tags.get("addr:street", "")
         house = tags.get("addr:housenumber", "")
         address = f"{street} {house}".strip()
+
+        if not address:
+            # Fallback: у об'єкта немає прямих тегів адреси — визначаємо
+            # найближчу вулицю за координатами через reverse-геокодування.
+            lat = el.get("lat")
+            lon = el.get("lon")
+            if lat is not None and lon is not None:
+                address = await _reverse_geocode_street(lat, lon) or ""
+
         if address:
             lines.append(f"• {name} — {address}")
         else:
