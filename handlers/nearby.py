@@ -46,6 +46,10 @@ NEARBY_CATEGORIES = {
 # категорії для того ж місця стає неможливим.
 _pending_location: dict[int, tuple[float, float]] = {}
 
+# Кандидати адреси (коли пошук неоднозначний, напр. просто назва вулиці
+# без міста), поки користувач не обере потрібний варіант.
+_pending_geocode_options: dict[int, list[dict]] = {}
+
 # Короткочасний кеш результатів Overpass: (округлені lat/lon, категорія) -> (timestamp, elements).
 # Overpass-дзеркала часто лежать одночасно всі разом — якщо хтось щойно
 # успішно шукав ту саму категорію в тій самій точці, віддаємо готовий
@@ -86,34 +90,70 @@ def _ikb_categories() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _ikb_address_options(options: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, opt in enumerate(options):
+        rows.append([InlineKeyboardButton(text=opt["short"], callback_data=f"nb_addr:{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="nb_addr_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _shorten_display_name(display_name: str, limit: int = 60) -> str:
+    return display_name if len(display_name) <= limit else display_name[: limit - 1] + "…"
+
+
 @router.message(F.text == "🗺 Що поруч")
 async def nearby_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
     await state.set_state(Nearby.waiting_address)
     await msg.answer(
-        "🗺 *Що поруч?*\n\nНапиши адресу або місце (напр. `Київ, Хрещатик 10`), "
-        "або надішли геолокацію.",
+        "🗺 *Що поруч?*\n\nНапиши адресу, назву вулиці (напр. `Хрещатик` або "
+        "`Київ, Хрещатик 10`), або надішли геолокацію.\n\n"
+        "Якщо вулиця зустрічається в кількох містах — покажу варіанти на вибір.",
         reply_markup=kb_cancel(),
     )
 
 
-async def _geocode(query: str) -> tuple[float, float] | None:
-    params = {"q": query, "format": "json", "limit": 1}
+async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
+    """
+    Повертає до `limit` кандидатів для неоднозначних запитів (напр. просто
+    назва вулиці без міста). Кожен елемент: {"lat", "lon", "display_name", "short"}.
+    """
+    params = {"q": query, "format": "json", "limit": limit, "addressdetails": 1}
     headers = {"User-Agent": "todo-list-telegram-bot"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(NOMINATIM_URL, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status != 200:
                     logger.warning("Nominatim status=%s for query=%s", resp.status, query)
-                    return None
+                    return []
                 data = await resp.json()
-                if not data:
-                    return None
-                return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
         logger.exception("Geocoding failed for query=%s", query)
-        return None
+        return []
+
+    options = []
+    seen = set()
+    for item in data:
+        try:
+            lat, lon = float(item["lat"]), float(item["lon"])
+        except (KeyError, ValueError):
+            continue
+        display_name = item.get("display_name", query)
+        # Прибираємо дублікати, коли Nominatim повертає однакове місце
+        # кілька разів під різними тегами (напр. вулиця і зупинка на ній).
+        dedup_key = (round(lat, 3), round(lon, 3))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        options.append({
+            "lat": lat,
+            "lon": lon,
+            "display_name": display_name,
+            "short": _shorten_display_name(display_name),
+        })
+    return options
 
 
 @router.message(Nearby.waiting_address, F.location)
@@ -133,19 +173,69 @@ async def nearby_address(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Скасовано.", reply_markup=kb_main())
 
-    coords = await _geocode(msg.text.strip())
-    if not coords:
+    query = msg.text.strip()
+    options = await _geocode_options(query)
+
+    if not options:
         return await msg.answer(
-            "🤔 Не знайшов таку адресу. Спробуй точніше (напр. з містом і країною) "
+            "🤔 Не знайшов таку адресу чи вулицю. Спробуй точніше (напр. з містом і країною) "
             "або надішли геолокацію."
         )
 
-    _pending_location[msg.from_user.id] = coords
+    if len(options) == 1:
+        await _apply_location(msg.from_user.id, options[0], msg, state)
+        return
+
+    # Кілька варіантів (напр. однойменна вулиця в різних містах) —
+    # показуємо на вибір, щоб не брати навмання перший результат.
+    _pending_geocode_options[msg.from_user.id] = options
     await state.clear()
-    # Те саме — прибираємо стару reply-клавіатуру "❌ Скасувати", вона
-    # вже нерелевантна на цьому кроці.
-    await msg.answer("✅ Місце знайдено.", reply_markup=ReplyKeyboardRemove())
-    await msg.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
+    await msg.answer(
+        f"🔎 Знайшов кілька варіантів для «{query}»:",
+        reply_markup=_ikb_address_options(options),
+    )
+
+
+@router.callback_query(F.data.startswith("nb_addr:"))
+async def nearby_address_pick(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    options = _pending_geocode_options.get(uid)
+    if not options:
+        await cb.answer()
+        return await cb.message.edit_text("⚠️ Варіанти застаріли, спробуй пошук ще раз.")
+
+    idx = int(cb.data.split(":", 1)[1])
+    if idx < 0 or idx >= len(options):
+        return await cb.answer()
+
+    chosen = options[idx]
+    _pending_geocode_options.pop(uid, None)
+    await cb.answer()
+    await _apply_location(uid, chosen, cb.message, state, edit=True)
+
+
+@router.callback_query(F.data == "nb_addr_cancel")
+async def nearby_address_cancel(cb: CallbackQuery, state: FSMContext):
+    _pending_geocode_options.pop(cb.from_user.id, None)
+    await state.clear()
+    await cb.answer()
+    await cb.message.edit_text("Скасовано.")
+    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
+
+
+async def _apply_location(uid: int, opt: dict, target: Message, state: FSMContext, edit: bool = False):
+    _pending_location[uid] = (opt["lat"], opt["lon"])
+    await state.clear()
+
+    text = f"✅ Місце знайдено: {opt['short']}"
+    if edit:
+        await target.edit_text(text)
+    else:
+        # Прибираємо стару reply-клавіатуру "❌ Скасувати" — вона вже
+        # нерелевантна на цьому кроці.
+        await target.answer(text, reply_markup=ReplyKeyboardRemove())
+
+    await target.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
 
 
 async def _query_overpass(query: str) -> list[dict] | None:
@@ -223,6 +313,7 @@ def _fmt_results(label: str, elements: list) -> str:
 @router.callback_query(F.data == "nb_exit")
 async def nearby_exit(cb: CallbackQuery):
     _pending_location.pop(cb.from_user.id, None)
+    _pending_geocode_options.pop(cb.from_user.id, None)
     await cb.answer()
     try:
         await cb.message.edit_text("🗺 Пошук завершено.")
