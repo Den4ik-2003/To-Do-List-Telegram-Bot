@@ -7,6 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config.settings import BOT_TOKEN, MONGO_URI, PORT
 from database.mongo import init_mongo, close_mongo
@@ -40,6 +41,8 @@ def setup_logging() -> None:
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("pymongo").setLevel(logging.WARNING)
+    # apscheduler логує кожен запуск джоби на INFO — це шумно, приглушуємо до WARNING
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
 def register_routers(dp: Dispatcher) -> None:
@@ -109,11 +112,24 @@ async def main() -> None:
     register_scheduler_jobs(bot)
     logger.info("Scheduler jobs registered")
 
+    # ВАЖЛИВО: register_olx_jobs() очікує APScheduler-інстанс, а не просто
+    # реєструє asyncio-таску сам по собі (на відміну від daily_jobs.py).
+    # Без створення й запуску AsyncIOScheduler джоба перевірки цін OLX
+    # ніколи не виконувалась — тому сповіщення про падіння ціни не приходили,
+    # скільки б часу не пройшло.
+    from scheduler.olx_jobs import register_olx_jobs
+
+    olx_scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
+    register_olx_jobs(olx_scheduler, bot)
+    olx_scheduler.start()
+    logger.info("OLX scheduler started")
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Starting polling...")
         await dp.start_polling(bot)
     finally:
+        olx_scheduler.shutdown(wait=False)
         await health_runner.cleanup()
         await close_mongo()
         await bot.session.close()
