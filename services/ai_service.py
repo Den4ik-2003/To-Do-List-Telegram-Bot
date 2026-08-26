@@ -253,3 +253,63 @@ async def transcribe_voice(audio_bytes: bytes) -> str | None:
     except Exception:
         logger.exception("Voice transcription failed")
         return None
+
+
+async def analyze_product_photo(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict | None:
+    """
+    Аналізує фото товару і повертає:
+    {"title": str, "description": str, "category": str, "price_pln": float, "price_reasoning": str}
+    """
+    if not client:
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode()
+    prompt_text = (
+        "Це фото товару, який людина хоче продати на OLX (Польща). "
+        "Визнач, що це за товар, і поверни ЛИШЕ JSON без пояснень:\n"
+        '{"title": "коротка приваблива назва оголошення польською, до 60 символів", '
+        '"description": "опис товару польською, 2-4 речення: стан, особливості, чому варто купити", '
+        '"category": "категорія товару, напр. Electronics/Furniture/Clothing/Sports/Other", '
+        '"price_pln": число (приблизна ринкова ціна в злотих, реалістична для вживаного товару такого типу), '
+        '"price_reasoning": "одне речення українською чому саме така ціна"}\n'
+        "Якщо не можеш точно визначити товар — вкажи найбільш ймовірний варіант і зазнач це в description. "
+        "Оцінюй ціну консервативно, як для вживаного товару середнього стану, якщо стан не видно чітко з фото."
+    )
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+        ],
+    }]
+
+    try:
+        try:
+            resp = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.4,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            logger.warning("Модель %s без response_format для фото товару, повторюю без нього", AI_MODEL)
+            resp = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.4,
+            )
+        raw = _strip_safety_noise((resp.choices[0].message.content or "").strip())
+    except Exception:
+        logger.exception("AI analyze_product_photo request failed (model=%s)", AI_MODEL)
+        return None
+
+    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        logger.exception("AI повернув некоректний JSON для товару: %s", raw[:300])
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data

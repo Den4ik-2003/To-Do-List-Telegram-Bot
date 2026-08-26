@@ -56,6 +56,9 @@ def register_routers(dp: Dispatcher) -> None:
         translator,
         nearby,
         decision,
+        product_photo,
+        resale,
+        business,
         insights,
         goals,
         projects,
@@ -77,6 +80,9 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(translator.router)
     dp.include_router(nearby.router)
     dp.include_router(decision.router)
+    dp.include_router(product_photo.router)
+    dp.include_router(resale.router)
+    dp.include_router(business.router)
     dp.include_router(insights.router)
     dp.include_router(goals.router)
     dp.include_router(projects.router)
@@ -112,17 +118,14 @@ async def main() -> None:
     register_scheduler_jobs(bot)
     logger.info("Scheduler jobs registered")
 
-    # ВАЖЛИВО: register_olx_jobs() очікує APScheduler-інстанс, а не просто
-    # реєструє asyncio-таску сам по собі (на відміну від daily_jobs.py).
-    # Без створення й запуску AsyncIOScheduler джоба перевірки цін OLX
-    # ніколи не виконувалась — тому сповіщення про падіння ціни не приходили,
-    # скільки б часу не пройшло.
     from scheduler.olx_jobs import register_olx_jobs
+    from scheduler.resale_jobs import register_resale_jobs
 
     olx_scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     register_olx_jobs(olx_scheduler, bot)
+    register_resale_jobs(olx_scheduler, bot)
     olx_scheduler.start()
-    logger.info("OLX scheduler started")
+    logger.info("OLX/resale scheduler started")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)

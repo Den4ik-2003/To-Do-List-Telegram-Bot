@@ -5,13 +5,11 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-# Мапа: текст кнопки-категорії -> список кнопок у її підменю.
-# Використовується і для побудови клавіатур, і в handlers/menu.py для
-# розпізнавання натискання категорії та повернення потрібного підменю.
 CATEGORY_TASKS_AI = "📝 Задачі та AI"
 CATEGORY_FINANCE = "💵 Гроші та ціни"
 CATEGORY_GOALS = "🎯 Цілі та проєкти"
 CATEGORY_LIFE = "🌍 Побут"
+CATEGORY_BUSINESS = "💼 Бізнес"
 
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
@@ -23,6 +21,7 @@ MAIN_CATEGORIES = {
         "💰 Фінанси", "📊 Статистика",
         "💱 Курс валют", "💰 Конвертер",
         "🧾 Чек", "📉 OLX Ціни",
+        "📷 Фото → Товар",
     ],
     CATEGORY_GOALS: [
         "🎯 Мої цілі", "📁 Мої проєкти",
@@ -30,6 +29,10 @@ MAIN_CATEGORIES = {
     CATEGORY_LIFE: [
         "🗺 Що поруч", "🌤️ Погода",
         "📅 Дні до дати", "💡 Поради",
+    ],
+    CATEGORY_BUSINESS: [
+        "🔎 Знайти перепродаж", "💡 Зробити з ідеї бізнес",
+        "⭐ Збережені можливості", "📊 Мої бізнес-ідеї",
     ],
 }
 
@@ -51,7 +54,6 @@ def kb_main() -> ReplyKeyboardMarkup:
 
 
 def kb_category(category: str) -> ReplyKeyboardMarkup:
-    """Підменю конкретної категорії + кнопка повернення в головне меню."""
     items = MAIN_CATEGORIES.get(category, [])
     keyboard = _rows_of_two(items)
     keyboard.append([KeyboardButton(text=BACK_TO_MAIN)])
