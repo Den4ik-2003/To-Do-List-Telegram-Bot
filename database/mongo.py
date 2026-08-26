@@ -22,13 +22,14 @@ ai_usage_col = None
 ai_conversations_col = None
 olx_tracked_col = None
 resale_saved_col = None
+business_ideas_col = None
 
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
     global goals_col, projects_col, rates_col, events_col
     global transactions_col, budgets_col, ai_usage_col, ai_conversations_col
-    global olx_tracked_col, resale_saved_col
+    global olx_tracked_col, resale_saved_col, business_ideas_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -54,6 +55,7 @@ async def init_mongo(mongo_uri: str):
     ai_conversations_col = db["ai_conversations"]
     olx_tracked_col = db["olx_tracked"]
     resale_saved_col = db["resale_saved"]
+    business_ideas_col = db["business_ideas"]
 
     await ping()
     return db
