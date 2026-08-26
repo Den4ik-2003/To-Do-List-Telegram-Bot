@@ -305,8 +305,21 @@ def _fmt_results(label: str, elements: list) -> str:
         return f"{label}\n\n📭 Нічого не знайдено поруч (1.5 км)."
     lines = [f"{label} поруч:\n"]
     for el in elements[:10]:
-        name = el.get("tags", {}).get("name", "Без назви")
-        lines.append(f"• {name}")
+        tags = el.get("tags", {})
+        name = tags.get("name", "Без назви")
+
+        # Overpass повертає адресу окремими тегами (addr:street, addr:housenumber),
+        # а не готовим рядком — раніше вони просто ігнорувались, тому в списку
+        # були лише назви закладів без жодної вулиці. Не всі об'єкти в OSM мають
+        # ці теги заповнені — тоді показуємо тільки назву, без адреси.
+        street = tags.get("addr:street", "")
+        house = tags.get("addr:housenumber", "")
+        address = f"{street} {house}".strip()
+
+        if address:
+            lines.append(f"• {name} — {address}")
+        else:
+            lines.append(f"• {name}")
     return "\n".join(lines)
 
 
