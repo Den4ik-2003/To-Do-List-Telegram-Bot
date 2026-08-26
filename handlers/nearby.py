@@ -4,6 +4,7 @@ import time
 
 import aiohttp
 from aiogram import Router, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
@@ -51,16 +52,11 @@ _pending_location: dict[int, tuple[float, float]] = {}
 _pending_geocode_options: dict[int, list[dict]] = {}
 
 # Короткочасний кеш результатів Overpass: (округлені lat/lon, категорія) -> (timestamp, elements).
-# Overpass-дзеркала часто лежать одночасно всі разом — якщо хтось щойно
-# успішно шукав ту саму категорію в тій самій точці, віддаємо готовий
-# результат миттєво замість нового звернення, яке може знову впасти.
 _RESULT_CACHE_TTL = 15 * 60  # 15 хвилин
 _result_cache: dict[tuple, tuple[float, list]] = {}
 
 
 def _cache_key(lat: float, lon: float, category: str) -> tuple:
-    # Округлюємо координати до ~100м, щоб невеликий дрейф GPS/геокодера
-    # не створював окремий кеш-запис на кожен мікроскопічний зсув.
     return (round(lat, 3), round(lon, 3), category)
 
 
@@ -116,10 +112,6 @@ async def nearby_start(msg: Message, state: FSMContext):
 
 
 async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
-    """
-    Повертає до `limit` кандидатів для неоднозначних запитів (напр. просто
-    назва вулиці без міста). Кожен елемент: {"lat", "lon", "display_name", "short"}.
-    """
     params = {"q": query, "format": "json", "limit": limit, "addressdetails": 1}
     headers = {"User-Agent": "todo-list-telegram-bot"}
     try:
@@ -141,8 +133,6 @@ async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
         except (KeyError, ValueError):
             continue
         display_name = item.get("display_name", query)
-        # Прибираємо дублікати, коли Nominatim повертає однакове місце
-        # кілька разів під різними тегами (напр. вулиця і зупинка на ній).
         dedup_key = (round(lat, 3), round(lon, 3))
         if dedup_key in seen:
             continue
@@ -160,11 +150,8 @@ async def _geocode_options(query: str, limit: int = 5) -> list[dict]:
 async def nearby_location(msg: Message, state: FSMContext):
     _pending_location[msg.from_user.id] = (msg.location.latitude, msg.location.longitude)
     await state.clear()
-    # Прибираємо стару reply-клавіатуру з "❌ Скасувати" — вона більше
-    # ні на що не реагує, бо стан вже очищений, і далі працюємо тільки
-    # через inline-кнопки категорій.
     await msg.answer("✅ Локацію отримано.", reply_markup=ReplyKeyboardRemove())
-    await msg.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
+    await _send_categories_prompt(msg.from_user.id, msg)
 
 
 @router.message(Nearby.waiting_address)
@@ -186,8 +173,6 @@ async def nearby_address(msg: Message, state: FSMContext):
         await _apply_location(msg.from_user.id, options[0], msg, state)
         return
 
-    # Кілька варіантів (напр. однойменна вулиця в різних містах) —
-    # показуємо на вибір, щоб не брати навмання перший результат.
     _pending_geocode_options[msg.from_user.id] = options
     await state.clear()
     await msg.answer(
@@ -223,19 +208,60 @@ async def nearby_address_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("🏠 Головне меню:", reply_markup=kb_main())
 
 
+async def _send_categories_prompt(uid: int, target: Message):
+    """
+    Надсилає повідомлення з кнопками категорій ("Що шукаємо поруч?") ОКРЕМИМ
+    надійним кроком з власним try/except — раніше, якщо попередній edit_text/answer
+    падав з помилкою (напр. "message can't be edited" через застаріле повідомлення),
+    виконання _apply_location зупинялось ДО цього кроку, і кнопки взагалі не
+    з'являлись — користувач бачив підтвердження локації, але без жодної кнопки,
+    і будь-яке подальше натискання на СТАРУ кнопку з попередньої сесії
+    видавало "Локація втрачена" (бо контекст насправді був втрачений раніше,
+    ще на етапі показу кнопок).
+    """
+    try:
+        await target.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
+    except TelegramAPIError:
+        logger.exception("Не вдалося надіслати кнопки категорій для uid=%s", uid)
+        try:
+            await target.answer(
+                "⚠️ Не вдалося показати кнопки. Спробуй натиснути «🗺 Що поруч» ще раз.",
+                reply_markup=kb_main(),
+            )
+        except TelegramAPIError:
+            pass
+
+
 async def _apply_location(uid: int, opt: dict, target: Message, state: FSMContext, edit: bool = False):
+    # Спочатку зберігаємо локацію — це найважливіший крок, і він не залежить
+    # від того, чи вдасться відредагувати/надіслати текстове підтвердження.
     _pending_location[uid] = (opt["lat"], opt["lon"])
     await state.clear()
 
     text = f"✅ Місце знайдено: {opt['short']}"
-    if edit:
-        await target.edit_text(text)
-    else:
-        # Прибираємо стару reply-клавіатуру "❌ Скасувати" — вона вже
-        # нерелевантна на цьому кроці.
-        await target.answer(text, reply_markup=ReplyKeyboardRemove())
 
-    await target.answer("Що шукаємо поруч?", reply_markup=_ikb_categories())
+    if edit:
+        try:
+            await target.edit_text(text)
+        except TelegramAPIError:
+            # Якщо редагування не вдалось (напр. повідомлення застаріле) —
+            # надсилаємо підтвердження новим повідомленням, щоб користувач
+            # точно побачив, що локація прийнята, і далі отримав кнопки.
+            logger.warning("Не вдалося відредагувати повідомлення локації для uid=%s, надсилаю нове", uid)
+            try:
+                await target.answer(text)
+            except TelegramAPIError:
+                logger.exception("Не вдалося надіслати підтвердження локації для uid=%s", uid)
+    else:
+        try:
+            await target.answer(text, reply_markup=ReplyKeyboardRemove())
+        except TelegramAPIError:
+            logger.exception("Не вдалося надіслати підтвердження локації для uid=%s", uid)
+
+    # Кнопки категорій надсилаємо ЗАВЖДИ, незалежно від того, чи вдалось
+    # попереднє підтвердження — це і є головний фікс: раніше якщо щось
+    # падало вище, до цього рядка виконання просто не доходило.
+    await _send_categories_prompt(uid, target)
 
 
 async def _query_overpass(query: str) -> list[dict] | None:
@@ -269,7 +295,14 @@ async def nearby_category(cb: CallbackQuery):
     coords = _pending_location.get(cb.from_user.id)
     if not coords:
         await cb.answer()
-        return await cb.message.edit_text("⚠️ Локація втрачена, почни спочатку через «🗺 Що поруч».")
+        # ВАЖЛИВО: якщо це трапляється одразу після успішного пошуку
+        # (не через довгий час) — це майже завжди означає, що процес бота
+        # перезапустився (наприклад, деплой на Render), бо _pending_location
+        # зберігається лише в пам'яті процесу і обнуляється при рестарті.
+        return await cb.message.edit_text(
+            "⚠️ Локація втрачена (можливо, бот щойно перезапустився). "
+            "Почни спочатку через «🗺 Що поруч»."
+        )
 
     lat, lon = coords
 
@@ -307,15 +340,9 @@ def _fmt_results(label: str, elements: list) -> str:
     for el in elements[:10]:
         tags = el.get("tags", {})
         name = tags.get("name", "Без назви")
-
-        # Overpass повертає адресу окремими тегами (addr:street, addr:housenumber),
-        # а не готовим рядком — раніше вони просто ігнорувались, тому в списку
-        # були лише назви закладів без жодної вулиці. Не всі об'єкти в OSM мають
-        # ці теги заповнені — тоді показуємо тільки назву, без адреси.
         street = tags.get("addr:street", "")
         house = tags.get("addr:housenumber", "")
         address = f"{street} {house}".strip()
-
         if address:
             lines.append(f"• {name} — {address}")
         else:
