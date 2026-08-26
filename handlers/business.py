@@ -109,7 +109,7 @@ async def business_idea_received(msg: Message, state: FSMContext):
     await _process_idea(msg, idea_text)
 
 
-@router.message(BUSINESS_TRIGGER_RE)
+@router.message(F.text.regexp(BUSINESS_TRIGGER_RE))
 async def business_natural_command(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
