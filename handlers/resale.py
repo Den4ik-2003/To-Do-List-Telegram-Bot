@@ -184,7 +184,7 @@ async def resale_count(msg: Message, state: FSMContext):
                        fd.get("min_profit"), fd.get("min_margin"), count)
 
 
-@router.message(RESALE_TRIGGER_RE)
+@router.message(F.text.regexp(RESALE_TRIGGER_RE))
 async def resale_natural_command(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
