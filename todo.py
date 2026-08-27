@@ -69,6 +69,8 @@ def register_routers(dp: Dispatcher) -> None:
         weather,
         receipts,
         olx,
+        movie,
+        site_watch,
         settings as settings_handlers,
     )
 
@@ -92,6 +94,8 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(weather.router)
     dp.include_router(receipts.router)
     dp.include_router(olx.router)
+    dp.include_router(movie.router)
+    dp.include_router(site_watch.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
     dp.include_router(finances.router)
@@ -120,12 +124,14 @@ async def main() -> None:
 
     from scheduler.olx_jobs import register_olx_jobs
     from scheduler.resale_jobs import register_resale_jobs
+    from scheduler.site_watch_jobs import register_site_watch_jobs
 
     olx_scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     register_olx_jobs(olx_scheduler, bot)
     register_resale_jobs(olx_scheduler, bot)
+    register_site_watch_jobs(olx_scheduler, bot)
     olx_scheduler.start()
-    logger.info("OLX/resale scheduler started")
+    logger.info("OLX/resale/site-watch scheduler started")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)

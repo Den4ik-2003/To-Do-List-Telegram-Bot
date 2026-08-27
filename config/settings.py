@@ -26,6 +26,10 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-1")
 OLX_CHECK_INTERVAL_MINUTES = int(os.environ.get("OLX_CHECK_INTERVAL_MINUTES", "180"))
 RESALE_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_CHECK_INTERVAL_MINUTES", "180"))
 
+# Моніторинг власних сайтів — перевіряємо часто, бо мета фічі — дізнатись
+# про падіння сайту за секунди/хвилини, а не години.
+SITE_CHECK_INTERVAL_MINUTES = int(os.environ.get("SITE_CHECK_INTERVAL_MINUTES", "2"))
+
 CURRENCY_UPDATE_TIME = os.environ.get("CURRENCY_UPDATE_TIME", "08:00")
 WEATHER_MORNING_TIME = os.environ.get("WEATHER_MORNING_TIME", "07:30")
 
