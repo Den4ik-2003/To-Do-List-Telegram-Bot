@@ -30,6 +30,7 @@ logger = logging.getLogger("tasks_bot")
 router = Router(name="tasks")
 
 CANCEL_TEXT = "❌ Скасувати"
+NO_DUE_TEXT = "⏭ Без терміну"
 
 
 class AddTask(StatesGroup):
@@ -119,13 +120,15 @@ async def at_category(msg: Message, state: FSMContext):
         return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
     await state.update_data(category=category)
     await state.set_state(AddTask.date)
-    await msg.answer("📅 Коли треба це зробити? Оберіть дату:", reply_markup=kb_date())
+    await msg.answer("📅 Коли треба це зробити? Оберіть дату, або обери «без терміну»:", reply_markup=kb_date())
 
 
 @router.message(StateFilter(AddTask.date))
 async def at_date(msg: Message, state: FSMContext):
     if is_cancel(msg.text):
         return await _cancel(msg, state)
+    if msg.text == NO_DUE_TEXT:
+        return await _save_task(msg, state, due="")
     if msg.text == "✏️ Своя дата (дд.мм.рррр)":
         await state.set_state(AddTask.date_manual)
         return await msg.answer("📅 Введіть дату як *дд.мм.рррр*:", reply_markup=kb_cancel())
@@ -177,6 +180,11 @@ async def at_time(msg: Message, state: FSMContext):
         )
     fd = await state.get_data()
     due_dt = datetime.strptime(f"{fd['date']} {raw}", "%d.%m.%Y %H:%M")
+    await _save_task(msg, state, due=fmt_due(due_dt))
+
+
+async def _save_task(msg: Message, state: FSMContext, due: str):
+    fd = await state.get_data()
     await state.clear()
 
     try:
@@ -190,7 +198,7 @@ async def at_time(msg: Message, state: FSMContext):
         "text": fd["text"],
         "label": fd["label"],
         "category": fd["category"],
-        "due": fmt_due(due_dt),
+        "due": due,
         "status": STATUS_PENDING,
         "pinned": False,
         "subtasks": [],
@@ -213,7 +221,9 @@ async def at_time(msg: Message, state: FSMContext):
 
     if not saved:
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_tasks_menu())
-    await msg.answer(f"✅ *Завдання додано!*\n\n{fmt_task(saved)}", reply_markup=kb_tasks_menu())
+
+    note = "" if due else " (без терміну)"
+    await msg.answer(f"✅ *Завдання додано{note}!*\n\n{fmt_task(saved)}", reply_markup=kb_tasks_menu())
 
 
 # =========================================================
@@ -622,15 +632,23 @@ async def edit_field_save(msg: Message, state: FSMContext):
             return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
         await tasks_db.update_task(tid, {"category": category})
     elif field == "date":
-        try:
-            datetime.strptime(msg.text.strip(), "%d.%m.%Y")
-        except ValueError:
-            return await msg.answer("⚠️ Невірний формат. Введіть як *дд.мм.рррр*:", reply_markup=kb_cancel())
-        old_due = parse_due(t.get("due", ""))
-        time_part = old_due.strftime("%H:%M") if old_due else "00:00"
-        new_due = f"{msg.text.strip()} {time_part}"
-        await tasks_db.update_task(tid, {"due": new_due, "status": STATUS_PENDING,
-                                          "reminded_before": False, "missed_flagged": False})
+        if msg.text.strip() == NO_DUE_TEXT:
+            await tasks_db.update_task(tid, {"due": "", "status": STATUS_PENDING,
+                                              "reminded_before": False, "missed_flagged": False})
+        else:
+            try:
+                datetime.strptime(msg.text.strip(), "%d.%m.%Y")
+            except ValueError:
+                return await msg.answer(
+                    "⚠️ Невірний формат. Введіть як *дд.мм.рррр*, або напишіть "
+                    f"«{NO_DUE_TEXT}», щоб прибрати термін:",
+                    reply_markup=kb_cancel(),
+                )
+            old_due = parse_due(t.get("due", ""))
+            time_part = old_due.strftime("%H:%M") if old_due else "00:00"
+            new_due = f"{msg.text.strip()} {time_part}"
+            await tasks_db.update_task(tid, {"due": new_due, "status": STATUS_PENDING,
+                                              "reminded_before": False, "missed_flagged": False})
     elif field == "time":
         try:
             datetime.strptime(msg.text.strip(), "%H:%M")

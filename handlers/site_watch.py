@@ -31,8 +31,8 @@ async def site_watch_menu(msg: Message, state: FSMContext):
         return
     await msg.answer(
         "🌐 *Моніторинг власних сайтів*\n\n"
-        "Додай сайт — і я перевірятиму, чи він доступний. "
-        "Якщо впаде — миттєво напишу сюди.",
+        "Додай сайт — і я перевірятиму, чи він доступний, а також можу запустити "
+        "QA-скан (сторінки, форми, биті посилання, швидкість).",
         reply_markup=_ikb_menu(),
     )
 
@@ -82,16 +82,48 @@ async def site_watch_list(cb: CallbackQuery):
     if not watches:
         return await cb.message.answer("📭 У тебе ще немає сайтів на моніторингу.")
 
-    lines = ["📋 *Твої сайти:*\n"]
-    rows = []
     for w in watches:
         wid = str(w["_id"])
         status = w.get("last_status")
         icon = "🟢" if status is True else ("🔴" if status is False else "⏳")
-        lines.append(f"{icon} {w.get('url', '')}")
-        rows.append([InlineKeyboardButton(text=f"🗑 {w.get('url', '')[:35]}", callback_data=f"sw_del:{wid}")])
+        qa_ok = w.get("last_qa_ok")
+        qa_line = ""
+        if qa_ok is True:
+            qa_line = "\n🧪 Останній QA: ✅ ок"
+        elif qa_ok is False:
+            qa_line = "\n🧪 Останній QA: ⚠️ є проблеми"
 
-    await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        text = f"{icon} {w.get('url', '')}{qa_line}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🧪 QA скан", callback_data=f"sw_qa:{wid}"),
+            InlineKeyboardButton(text="🗑 Видалити", callback_data=f"sw_del:{wid}"),
+        ]])
+        await cb.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("sw_qa:"))
+async def site_watch_qa_run(cb: CallbackQuery):
+    wid = cb.data.split(":", 1)[1]
+    watch = await site_watch_db.get_watch(wid)
+    if not watch:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    await cb.answer("Запускаю QA-скан, це займе трохи часу...")
+    wait_msg = await cb.message.answer("🧪 Сканую сайт (сторінки, форми, посилання, швидкість)...")
+
+    try:
+        report = await site_watch_service.run_qa_scan(watch["url"])
+    except Exception:
+        logger.exception("QA scan failed for watch=%s", wid)
+        return await wait_msg.edit_text("⚠️ Не вдалося провести скан. Спробуй пізніше.")
+
+    is_ok = not report.get("critical_error") and not report.get("broken_pages") and \
+        not report.get("form_issues") and not report.get("broken_images")
+
+    await site_watch_db.save_qa_result(wid, watch["uid"], watch["url"], report, is_ok)
+
+    text = site_watch_service.format_qa_report(report)
+    await wait_msg.edit_text(text)
 
 
 @router.callback_query(F.data.startswith("sw_del:"))

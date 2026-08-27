@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-from config.constants import AI_ERROR_TEXT, AI_LIMIT_TEXT
+from config.constants import AI_ERROR_TEXT, AI_LIMIT_TEXT, DEFAULT_CURRENCY
 from config.settings import AI_DAILY_LIMIT
 from database import ai_usage as ai_usage_db
 from services import ai_service
@@ -83,10 +83,13 @@ async def product_photo_received(msg: Message, state: FSMContext, bot):
     title = data.get("title", "").strip()
     description = data.get("description", "").strip()
     category = data.get("category", "").strip()
-    price = data.get("price_pln")
+    price = data.get("price_uah")
     price_reasoning = data.get("price_reasoning", "").strip()
 
-    price_line = f"💵 *Приблизна ціна:* {price:.0f} PLN" if price else "💵 *Ціна:* не вдалося оцінити"
+    price_line = (
+        f"💵 *Приблизна ціна:* {price:.0f} {DEFAULT_CURRENCY}" if price
+        else "💵 *Ціна:* не вдалося оцінити"
+    )
 
     text = (
         "📷 *Готове оголошення:*\n\n"

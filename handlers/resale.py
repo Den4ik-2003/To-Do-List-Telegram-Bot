@@ -66,7 +66,7 @@ def _fmt_item(item: dict, idx: int) -> str:
 
 def _ikb_item_actions(idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⭐ Зберегti", callback_data=f"rs_save:{idx}"),
+        InlineKeyboardButton(text="⭐ Зберегти", callback_data=f"rs_save:{idx}"),
     ]])
 
 
@@ -76,13 +76,19 @@ async def _run_search(msg: Message, uid: int, budget, category, min_profit, min_
         results = await resale_service.find_opportunities(budget, category, min_profit, min_margin, count)
     except Exception:
         logger.exception("resale search failed for uid=%s", uid)
-        return await wait_msg.edit_text(AI_ERROR_TEXT)
+        await wait_msg.edit_text(AI_ERROR_TEXT)
+        # ВИПРАВЛЕНО: edit_text не може замінити нижню reply-клавіатуру.
+        # Стан на цей момент вже очищено (в resale_count), тож стара
+        # кнопка "❌ Скасувати" від початку діалогу лишалась висіти на
+        # екрані взагалі без обробника — виглядала "непрацюючою".
+        return await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
     if not results:
-        return await wait_msg.edit_text(
+        await wait_msg.edit_text(
             "📭 Нічого підходящого не знайшов за цими критеріями. Спробуй ширший бюджет "
             "або іншу категорію."
         )
+        return await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
     _results_cache[uid] = results
     await wait_msg.edit_text(f"✅ Знайдено {len(results)} можлив(ості/остей). Показую топ за маржею:")
@@ -91,6 +97,10 @@ async def _run_search(msg: Message, uid: int, budget, category, min_profit, min_
         await msg.answer(_fmt_item(item, i), reply_markup=_ikb_item_actions(i))
 
     await msg.answer("Пересортувати результати?", reply_markup=_ikb_sort())
+    # ВИПРАВЛЕНО: той самий баг був і на успішному шляху — клавіатура
+    # "❌ Скасувати" ніде не замінювалась на kb_main() після завершення
+    # пошуку, хоч стан вже давно очищено. Явно повертаємо звичайне меню.
+    await msg.answer("🏠 Використай меню нижче або шукай ще раз:", reply_markup=kb_main())
 
 
 @router.message(F.text == "🔎 Знайти перепродаж")
@@ -248,6 +258,11 @@ async def resale_saved_list(msg: Message, state: FSMContext):
             InlineKeyboardButton(text="🗑 Видалити", callback_data=f"rs_del:{item['_id']}"),
         ]])
         await msg.answer(text, reply_markup=kb)
+
+    # ДОДАНО: раніше після списку збережених можливостей ніде не
+    # надсилалась звичайна клавіатура — нижче лишалось те, що було до
+    # відкриття цього розділу (могла бути мертва "❌ Скасувати").
+    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
 
 @router.callback_query(F.data.startswith("rs_del:"))

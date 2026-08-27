@@ -30,9 +30,28 @@ RESALE_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_CHECK_INTERVAL_MINUTE
 # про падіння сайту за секунди/хвилини, а не години.
 SITE_CHECK_INTERVAL_MINUTES = int(os.environ.get("SITE_CHECK_INTERVAL_MINUTES", "2"))
 
+# QA-скан (сторінки, форми, биті посилання, швидкість) — набагато важчий за
+# простий uptime-пінг, тому запускаємо рідко, за замовчуванням раз на добу.
+QA_CHECK_INTERVAL_HOURS = int(os.environ.get("QA_CHECK_INTERVAL_HOURS", "24"))
+QA_MAX_PAGES = int(os.environ.get("QA_MAX_PAGES", "8"))
+
 CURRENCY_UPDATE_TIME = os.environ.get("CURRENCY_UPDATE_TIME", "08:00")
 WEATHER_MORNING_TIME = os.environ.get("WEATHER_MORNING_TIME", "07:30")
 
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
+# Пошук вакансій — за замовчуванням перевіряємо раз на годину.
+JOB_CHECK_INTERVAL_MINUTES = int(os.environ.get("JOB_CHECK_INTERVAL_MINUTES", "60"))
+
 PORT = int(os.environ.get("PORT", "8080"))
+
+# --- Творча студія: генерація/редагування зображень ---
+IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+IMAGE_BASE_URL = os.environ.get("IMAGE_BASE_URL", "https://api.openai.com/v1")
+IMAGE_GEN_MODEL = os.environ.get("IMAGE_GEN_MODEL", "gpt-image-1.5")
+
+# скільки генерацій/редагувань на добу дозволено одному користувачу
+CREATIVE_DAILY_LIMIT = int(os.environ.get("CREATIVE_DAILY_LIMIT", "15"))
+
+# таймаут одного запиту до image API (генерація важча за текст)
+IMAGE_REQUEST_TIMEOUT = int(os.environ.get("IMAGE_REQUEST_TIMEOUT", "120"))

@@ -56,6 +56,7 @@ def kb_date() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📅 Сьогодні"), KeyboardButton(text="📅 Завтра")],
         [KeyboardButton(text="✏️ Своя дата (дд.мм.рррр)")],
+        [KeyboardButton(text="⏭ Без терміну")],
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
@@ -117,7 +118,8 @@ def ikb_tasks_list(tasks: list, page: int = 0, per_page: int = 6) -> InlineKeybo
         label = LABELS.get(t.get("label", "idea"), {"emoji": ""})
         status_icon = "✅" if t.get("status") == STATUS_DONE else ("⚠️" if is_missed(t) else "⏳")
         pin_str = "📌" if t.get("pinned") else ""
-        lbl = f"{status_icon} {pin_str}{label['emoji']} №{t['id']} {t.get('due','')[-5:]} {t.get('text','')[:18]}"
+        due_short = t.get("due", "")[-5:] if t.get("due") else "без терм."
+        lbl = f"{status_icon} {pin_str}{label['emoji']} №{t['id']} {due_short} {t.get('text','')[:18]}"
         rows.append([InlineKeyboardButton(text=lbl, callback_data=f"view:{t['id']}")])
     nav = []
     if page > 0:
