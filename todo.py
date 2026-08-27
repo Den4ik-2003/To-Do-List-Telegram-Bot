@@ -41,7 +41,6 @@ def setup_logging() -> None:
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("pymongo").setLevel(logging.WARNING)
-    # apscheduler логує кожен запуск джоби на INFO — це шумно, приглушуємо до WARNING
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 

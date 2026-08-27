@@ -43,8 +43,6 @@ WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 # Пошук вакансій — за замовчуванням перевіряємо раз на годину.
 JOB_CHECK_INTERVAL_MINUTES = int(os.environ.get("JOB_CHECK_INTERVAL_MINUTES", "60"))
 
-PORT = int(os.environ.get("PORT", "8080"))
-
 # --- Творча студія: генерація/редагування зображень ---
 IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 IMAGE_BASE_URL = os.environ.get("IMAGE_BASE_URL", "https://api.openai.com/v1")
@@ -55,3 +53,5 @@ CREATIVE_DAILY_LIMIT = int(os.environ.get("CREATIVE_DAILY_LIMIT", "15"))
 
 # таймаут одного запиту до image API (генерація важча за текст)
 IMAGE_REQUEST_TIMEOUT = int(os.environ.get("IMAGE_REQUEST_TIMEOUT", "120"))
+
+PORT = int(os.environ.get("PORT", "8080"))

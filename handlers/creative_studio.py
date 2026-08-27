@@ -257,7 +257,6 @@ async def _run_generation(
 
 @router.callback_query(F.data.startswith("cs_regen:"))
 async def regenerate(callback: CallbackQuery):
-    # Проста версія: просимо новий промпт з нуля (повний контекст не зберігаємо між кол-беками)
     await callback.message.answer("Опиши, що згенерувати цього разу:")
     await callback.answer()
 
