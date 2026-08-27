@@ -23,7 +23,7 @@ WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY") or AI_API_KEY
 WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL") or AI_BASE_URL
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-1")
 
-OLX_CHECK_INTERVAL_MINUTES = int(os.environ.get("OLX_CHECK_INTERVAL_MINUTES", "180"))
+OLX_CHECK_INTERVAL_MINUTES = int(os.environ.get("OLX_CHECK_INTERVAL_MINUTES", "30"))
 RESALE_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_CHECK_INTERVAL_MINUTES", "180"))
 
 # Моніторинг власних сайтів — перевіряємо часто, бо мета фічі — дізнатись

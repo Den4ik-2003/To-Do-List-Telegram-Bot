@@ -23,6 +23,7 @@ HEADERS = {
 }
 
 PRICE_RE = re.compile(r"([\d\s]+)(?:,\d+)?\s*(грн|UAH|zł|PLN|€|EUR|\$|USD)", re.IGNORECASE)
+VIEWS_RE = re.compile(r"([\d\s]+)\s*(?:переглядів|перегляд|views|wyświetleń)", re.IGNORECASE)
 
 CURRENCY_MAP = {
     "ГРН": "UAH", "UAH": "UAH",
@@ -56,7 +57,103 @@ def _domain_headers(domain: str) -> dict:
     return {**HEADERS, "Referer": cfg["referer"]}
 
 
-async def fetch_listing_price(url: str) -> tuple[float, str] | None:
+def _parse_listing_html(html: str, default_currency: str) -> dict:
+    """
+    Витягує з HTML оголошення все, що потрібно для оцінки вигідності
+    перепродажу: ціну, назву, опис, локацію, перегляди, кількість фото
+    та список характеристик (стан, бренд тощо, якщо вказані продавцем).
+    Кожне поле окремо обгорнуте в try, щоб відсутність одного елемента
+    (наприклад лічильника переглядів на старій версії сторінки) не ламала
+    весь парсинг решти даних.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    result: dict = {
+        "price": None, "currency": default_currency, "title": None,
+        "description": None, "location_text": None, "views": None,
+        "photos_count": None, "params": [],
+    }
+
+    # --- Ціна ---
+    price_el = soup.select_one('[data-testid="ad-price-container"]') or soup.select_one('[data-testid="ad-price"]')
+    price_text = price_el.get_text(" ", strip=True) if price_el else None
+    if price_text:
+        parsed = _parse_price(price_text)
+        if parsed:
+            result["price"], result["currency"] = parsed
+    if result["price"] is None:
+        meta = soup.find("meta", {"property": "product:price:amount"})
+        if meta and meta.get("content"):
+            currency_meta = soup.find("meta", {"property": "product:price:currency"})
+            try:
+                result["price"] = float(meta["content"])
+                result["currency"] = currency_meta["content"] if currency_meta else default_currency
+            except (ValueError, KeyError):
+                pass
+
+    # --- Назва ---
+    try:
+        title_el = soup.select_one('[data-cy="ad_title"]') or soup.find("h1")
+        if title_el:
+            result["title"] = title_el.get_text(strip=True)
+        elif soup.find("title"):
+            result["title"] = soup.find("title").get_text(strip=True)
+    except Exception:
+        logger.exception("Не вдалося розпарсити назву оголошення")
+
+    # --- Опис ---
+    try:
+        desc_el = soup.select_one('[data-cy="ad_description"]')
+        if desc_el:
+            result["description"] = desc_el.get_text(" ", strip=True)[:1500]
+    except Exception:
+        logger.exception("Не вдалося розпарсити опис оголошення")
+
+    # --- Локація/дата ---
+    try:
+        loc_el = soup.select_one('[data-testid="location-date"]')
+        if loc_el:
+            result["location_text"] = loc_el.get_text(" ", strip=True)
+    except Exception:
+        logger.exception("Не вдалося розпарсити локацію оголошення")
+
+    # --- Перегляди ---
+    try:
+        views_el = soup.select_one('[data-testid="page-view-counter"]')
+        views_text = views_el.get_text(" ", strip=True) if views_el else html
+        views_match = VIEWS_RE.search(views_text)
+        if views_match:
+            result["views"] = int(views_match.group(1).replace(" ", "").replace("\xa0", ""))
+    except Exception:
+        logger.exception("Не вдалося розпарсити кількість переглядів")
+
+    # --- Кількість фото ---
+    try:
+        gallery = soup.select('[data-testid="image-gallery-container"] img') or soup.select('[data-testid="swiper-image"]')
+        if gallery:
+            result["photos_count"] = len(gallery)
+    except Exception:
+        logger.exception("Не вдалося порахувати кількість фото")
+
+    # --- Характеристики (стан, бренд, рік тощо — якщо вказані продавцем) ---
+    try:
+        params_container = soup.select_one('[data-testid="ad-parameters-container"]')
+        if params_container:
+            for li in params_container.find_all("li"):
+                text = li.get_text(" ", strip=True)
+                if text:
+                    result["params"].append(text)
+    except Exception:
+        logger.exception("Не вдалося розпарсити характеристики оголошення")
+
+    return result
+
+
+async def fetch_listing_details(url: str) -> dict | None:
+    """
+    Повне зчитування оголошення: ціна, назва, опис, локація, перегляди,
+    кількість фото, характеристики. Використовується і для стеження за
+    ціною, і для AI-оцінки вигідності перепродажу.
+    """
     domain = "olx.pl" if "olx.pl" in url else "olx.ua"
     headers = _domain_headers(domain)
     default_currency = DOMAIN_CONFIG[domain]["default_currency"]
@@ -75,31 +172,20 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
 
     logger.info("OLX listing fetch OK, final_url=%s, html_len=%s", final_url, len(html))
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    price_el = soup.select_one('[data-testid="ad-price-container"]')
-    if not price_el:
-        price_el = soup.select_one('[data-testid="ad-price"]')
-
-    text = price_el.get_text(" ", strip=True) if price_el else None
-    if not text:
-        meta = soup.find("meta", {"property": "product:price:amount"})
-        if meta and meta.get("content"):
-            currency_meta = soup.find("meta", {"property": "product:price:currency"})
-            try:
-                return float(meta["content"]), (currency_meta["content"] if currency_meta else default_currency)
-            except (ValueError, KeyError):
-                pass
-
-        title_tag = soup.find("title")
-        logger.warning(
-            "OLX listing: price not found. page_title=%r, snippet=%r",
-            title_tag.get_text(strip=True) if title_tag else None,
-            html[:500],
-        )
+    details = _parse_listing_html(html, default_currency)
+    if details["price"] is None:
+        title_tag_text = details.get("title")
+        logger.warning("OLX listing: price not found. page_title=%r, snippet=%r", title_tag_text, html[:500])
         return None
+    return details
 
-    return _parse_price(text)
+
+async def fetch_listing_price(url: str) -> tuple[float, str] | None:
+    """Легка версія для періодичної джоби перевірки ціни (без опису/фото/параметрів)."""
+    details = await fetch_listing_details(url)
+    if not details or details["price"] is None:
+        return None
+    return details["price"], details["currency"]
 
 
 def _build_search_url(domain: str, title_query: str, max_price: float | None, location: str, radius_km: int) -> str:
