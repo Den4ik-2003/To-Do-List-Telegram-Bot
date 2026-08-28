@@ -7,7 +7,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 from database import site_watch as site_watch_db
 from services import site_watch_service
-from keyboards.main_menu import kb_main, kb_cancel
+from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_LIFE
 from handlers.common import require_auth
 
 logger = logging.getLogger("tasks_bot")
@@ -47,11 +47,23 @@ async def site_watch_add_start(cb: CallbackQuery, state: FSMContext):
     )
 
 
+# Окремий хендлер СПЕЦІАЛЬНО під скасування в цьому стані — реєструється в цьому
+# роутері, тож завжди спрацює для SiteWatch.waiting_url, навіть якщо десь є
+# сторонній глобальний обробник "❌ Скасувати" без фільтра стану, за умови що
+# site_watch.router підключений в register_routers() РАНІШЕ за той роутер.
+@router.message(SiteWatch.waiting_url, F.text == "❌ Скасувати")
+async def site_watch_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb_category(CATEGORY_LIFE))
+
+
 @router.message(SiteWatch.waiting_url)
 async def site_watch_add_url(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear()
-        return await msg.answer("Скасовано.", reply_markup=kb_main())
+    if not msg.text:
+        return await msg.answer(
+            "⚠️ Надішли, будь ласка, текстову адресу сайту (або натисни ❌ Скасувати):",
+            reply_markup=kb_cancel(),
+        )
 
     raw = msg.text.strip()
     url = site_watch_service.normalize_url(raw)
