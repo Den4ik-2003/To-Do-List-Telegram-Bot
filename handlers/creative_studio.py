@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 
-from keyboards.main_menu import CATEGORY_CREATIVE, kb_category, kb_main, BACK_TO_MAIN
+from keyboards.main_menu import kb_cancel, kb_category, CATEGORY_CREATIVE
 from keyboards.creative_kb import (
     FORMATS, STYLE_PROMPTS, TEMPLATES,
     kb_formats, kb_styles, kb_templates, kb_regenerate,
@@ -16,6 +16,8 @@ from database.creative import save_generation, get_user_generations, check_daily
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="creative_studio")
+
+CANCEL_TEXT = "❌ Скасувати"
 
 
 class CreativeStates(StatesGroup):
@@ -41,6 +43,14 @@ TEMPLATE_PROMPT_PREFIX = {
 }
 
 
+async def _cancel_and_exit(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Скасовано.",
+        reply_markup=kb_category(CATEGORY_CREATIVE),
+    )
+
+
 # ---------- Головне меню розділу ----------
 
 @router.message(F.text == "🖼️ Згенерувати картинку")
@@ -50,7 +60,11 @@ async def start_generate(message: Message, state: FSMContext):
         return
     await state.set_state(CreativeStates.waiting_format)
     await state.update_data(mode="generate")
-    await message.answer("Обери формат картинки:", reply_markup=kb_formats())
+    await message.answer(
+        "Обери формат картинки (або натисни ❌ Скасувати):",
+        reply_markup=kb_formats(),
+    )
+    await message.answer("👇", reply_markup=kb_cancel())
 
 
 @router.message(F.text == "😀 Стікер")
@@ -60,7 +74,10 @@ async def start_sticker(message: Message, state: FSMContext):
         return
     await state.set_state(CreativeStates.waiting_prompt)
     await state.update_data(mode="sticker")
-    await message.answer("Опиши стікер, наприклад: «кіт каже Давай!»")
+    await message.answer(
+        "Опиши стікер, наприклад: «кіт каже Давай!»",
+        reply_markup=kb_cancel(),
+    )
 
 
 @router.message(F.text == "😎 AI Emoji")
@@ -70,7 +87,10 @@ async def start_emoji(message: Message, state: FSMContext):
         return
     await state.set_state(CreativeStates.waiting_prompt)
     await state.update_data(mode="emoji")
-    await message.answer("Опиши emoji, наприклад: «здивований смайл 🤯»")
+    await message.answer(
+        "Опиши emoji, наприклад: «здивований смайл 🤯»",
+        reply_markup=kb_cancel(),
+    )
 
 
 @router.message(F.text == "🤖 Редагувати фото")
@@ -80,7 +100,10 @@ async def start_edit(message: Message, state: FSMContext):
         await message.answer("⛔ Денний ліміт генерацій вичерпано. Спробуй завтра.")
         return
     await state.set_state(CreativeStates.waiting_edit_photo)
-    await message.answer("Надішли фото, яке треба відредагувати/використати як референс.")
+    await message.answer(
+        "Надішли фото, яке треба відредагувати/використати як референс.",
+        reply_markup=kb_cancel(),
+    )
 
 
 @router.message(F.text == "📱 Шаблони")
@@ -99,7 +122,17 @@ async def show_history(message: Message):
         await message.answer_photo(photo=item["file_id"], caption=caption)
 
 
-# ---------- Формат / стиль (для generate) ----------
+# ---------- Скасування — окремий хендлер під кожен текстовий стан ----------
+
+@router.message(CreativeStates.waiting_prompt, F.text == CANCEL_TEXT)
+@router.message(CreativeStates.waiting_edit_photo, F.text == CANCEL_TEXT)
+@router.message(CreativeStates.waiting_edit_instruction, F.text == CANCEL_TEXT)
+@router.message(CreativeStates.waiting_template_prompt, F.text == CANCEL_TEXT)
+async def cancel_creative(message: Message, state: FSMContext):
+    await _cancel_and_exit(message, state)
+
+
+# ---------- Формат / стиль (для generate) — інлайн, тому даємо і кнопку "Скасувати" в клавіатурі ----------
 
 @router.callback_query(CreativeStates.waiting_format, F.data.startswith("cs_fmt:"))
 async def choose_format(callback: CallbackQuery, state: FSMContext):
@@ -115,8 +148,16 @@ async def choose_style(callback: CallbackQuery, state: FSMContext):
     style = callback.data.split(":", 1)[1]
     await state.update_data(style=style)
     await state.set_state(CreativeStates.waiting_prompt)
-    await callback.message.edit_text("Тепер опиши, що згенерувати:")
+    await callback.message.edit_text("Тепер опиши, що згенерувати (або натисни ❌ Скасувати нижче):")
     await callback.answer()
+
+
+# на випадок, якщо юзер натисне звичайну reply-кнопку "❌ Скасувати" поки ще
+# формально в waiting_format/waiting_style (клавіатура kb_cancel лишається знизу)
+@router.message(CreativeStates.waiting_format, F.text == CANCEL_TEXT)
+@router.message(CreativeStates.waiting_style, F.text == CANCEL_TEXT)
+async def cancel_format_style(message: Message, state: FSMContext):
+    await _cancel_and_exit(message, state)
 
 
 # ---------- Шаблони ----------
@@ -129,11 +170,15 @@ async def choose_template(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"{TEMPLATES[tpl]}. Опиши деталі (кого/що зобразити):"
     )
+    await callback.message.answer("👇", reply_markup=kb_cancel())
     await callback.answer()
 
 
 @router.message(CreativeStates.waiting_template_prompt)
 async def handle_template_prompt(message: Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("⚠️ Напиши текстовий опис або натисни ❌ Скасувати:")
+
     data = await state.get_data()
     tpl = data["template"]
     prefix = TEMPLATE_PROMPT_PREFIX.get(tpl, "")
@@ -156,6 +201,9 @@ async def handle_template_prompt(message: Message, state: FSMContext):
 
 @router.message(CreativeStates.waiting_prompt)
 async def handle_prompt(message: Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("⚠️ Надішли текстовий опис або натисни ❌ Скасувати:")
+
     data = await state.get_data()
     mode = data.get("mode", "generate")
 
@@ -190,16 +238,24 @@ async def receive_edit_photo(message: Message, state: FSMContext, bot):
     buf = await bot.download_file(file.file_path)
     await state.update_data(source_image=buf.read())
     await state.set_state(CreativeStates.waiting_edit_instruction)
-    await message.answer("Що зробити з фото? Наприклад: «прибери фон» або «додай напис SALE».")
+    await message.answer(
+        "Що зробити з фото? Наприклад: «прибери фон» або «додай напис SALE».",
+        reply_markup=kb_cancel(),
+    )
 
 
 @router.message(CreativeStates.waiting_edit_photo)
 async def receive_edit_photo_wrong(message: Message):
-    await message.answer("Надішли саме фото 🙂")
+    if message.text == CANCEL_TEXT:
+        return  # обробить cancel_creative вище
+    await message.answer("Надішли саме фото 🙂 (або натисни ❌ Скасувати)")
 
 
 @router.message(CreativeStates.waiting_edit_instruction)
 async def handle_edit_instruction(message: Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("⚠️ Напиши текстову інструкцію або натисни ❌ Скасувати:")
+
     data = await state.get_data()
     image_bytes = data["source_image"]
 
@@ -214,6 +270,7 @@ async def handle_edit_instruction(message: Message, state: FSMContext):
     sent = await message.answer_photo(
         photo=BufferedInputFile(result, filename="edited.png"),
         caption="Готово! Результат редагування.",
+        reply_markup=kb_category(CATEGORY_CREATIVE),
     )
     file_id = sent.photo[-1].file_id
     gen_id = await save_generation(message.from_user.id, "edit", message.text, file_id)
@@ -236,7 +293,7 @@ async def _run_generation(
     try:
         result = await generate_image(prompt, size=size, transparent=transparent)
     except ImageServiceError as e:
-        await message.answer(f"❌ Не вдалося згенерувати: {e}")
+        await message.answer(f"❌ Не вдалося згенерувати: {e}", reply_markup=kb_category(CATEGORY_CREATIVE))
         return
 
     if post_process == "sticker":
@@ -249,6 +306,7 @@ async def _run_generation(
     sent = await message.answer_photo(
         photo=BufferedInputFile(result, filename="result.png"),
         caption="Готово! Тисни 🔄, якщо хочеш інший варіант.",
+        reply_markup=kb_category(CATEGORY_CREATIVE),
     )
     file_id = sent.photo[-1].file_id
     gen_id = await save_generation(message.from_user.id, kind, prompt, file_id, meta={"size": size})
@@ -257,7 +315,7 @@ async def _run_generation(
 
 @router.callback_query(F.data.startswith("cs_regen:"))
 async def regenerate(callback: CallbackQuery):
-    await callback.message.answer("Опиши, що згенерувати цього разу:")
+    await callback.message.answer("Опиши, що згенерувати цього разу:", reply_markup=kb_cancel())
     await callback.answer()
 
 
