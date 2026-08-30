@@ -37,6 +37,13 @@ DOMAIN_CONFIG = {
     "olx.pl": {"list_path": "/oferty/q-", "referer": "https://www.olx.pl/", "default_currency": "PLN"},
 }
 
+# Максимум фото, які передаємо в AI. OLX-оголошення інколи мають 20+ фото —
+# передавати всі і дорого (токени/оплата за vision-запит), і не потрібно:
+# для аналізу товару достатньо репрезентативної вибірки. Якщо фото більше —
+# беремо перші MAX_PHOTOS_FOR_AI (як правило, продавці ставлять найбільш
+# інформативні фото першими) і чесно показуємо "N з M" користувачу.
+MAX_PHOTOS_FOR_AI = 10
+
 
 def _parse_price(text: str) -> tuple[float, str] | None:
     if not text:
@@ -57,20 +64,75 @@ def _domain_headers(domain: str) -> dict:
     return {**HEADERS, "Referer": cfg["referer"]}
 
 
+def _best_srcset_url(srcset: str) -> str | None:
+    """З атрибута srcset ("url1 400w, url2 800w, ...") бере URL із найбільшою
+    шириною — потрібне максимально якісне фото для розпізнавання дефектів/
+    напису на етикетках, а не мініатюра 100x100."""
+    candidates = []
+    for part in srcset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.rsplit(" ", 1)
+        url = bits[0].strip()
+        width = 0
+        if len(bits) == 2 and bits[1].endswith("w"):
+            try:
+                width = int(bits[1][:-1])
+            except ValueError:
+                width = 0
+        candidates.append((width, url))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return candidates[0][1]
+
+
+def _extract_photos(soup: BeautifulSoup) -> tuple[list[str], int]:
+    """
+    Збирає URL усіх фото галереї оголошення (не лише count!). Без реальних
+    посилань на зображення AI фізично не може проаналізувати нічого, крім
+    першого прев'ю — саме це і була причина неточних/однакових висновків.
+    Повертає (фото_для_AI[:MAX_PHOTOS_FOR_AI], загальна_кількість_знайдених).
+    """
+    """Повертає (фото_для_AI[:MAX], загальна_кількість_знайдених)."""
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    gallery = (
+        soup.select('[data-testid="image-gallery-container"] img')
+        or soup.select('[data-testid="swiper-image"] img')
+        or soup.select('[data-testid="ad-photo"] img')
+    )
+
+    for img in gallery:
+        candidate = None
+        if img.get("srcset"):
+            candidate = _best_srcset_url(img["srcset"])
+        if not candidate:
+            candidate = img.get("data-src") or img.get("src")
+        if not candidate or candidate.startswith("data:"):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        urls.append(candidate)
+
+    return urls[:MAX_PHOTOS_FOR_AI], len(urls)
+
+
 def _parse_listing_html(html: str, default_currency: str) -> dict:
     """
     Витягує з HTML оголошення все, що потрібно для оцінки вигідності
-    перепродажу: ціну, назву, опис, локацію, перегляди, кількість фото
-    та список характеристик (стан, бренд тощо, якщо вказані продавцем).
-    Кожне поле окремо обгорнуте в try, щоб відсутність одного елемента
-    (наприклад лічильника переглядів на старій версії сторінки) не ламала
-    весь парсинг решти даних.
+    перепродажу: ціну, назву, опис, локацію, перегляди, УСІ фото (URL, не
+    лише кількість) та список характеристик. Кожне поле окремо обгорнуте
+    в try, щоб відсутність одного елемента не ламала весь парсинг решти.
     """
     soup = BeautifulSoup(html, "html.parser")
     result: dict = {
         "price": None, "currency": default_currency, "title": None,
         "description": None, "location_text": None, "views": None,
-        "photos_count": None, "params": [],
+        "photos": [], "photos_count": None, "params": [],
     }
 
     # --- Ціна ---
@@ -126,13 +188,13 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити кількість переглядів")
 
-    # --- Кількість фото ---
+    # --- Фото (URL-и, для AI-аналізу; ЗМІНЕНО — раніше тут рахували лише len()) ---
     try:
-        gallery = soup.select('[data-testid="image-gallery-container"] img') or soup.select('[data-testid="swiper-image"]')
-        if gallery:
-            result["photos_count"] = len(gallery)
+        photos, total = _extract_photos(soup)
+        result["photos"] = photos
+        result["photos_count"] = total
     except Exception:
-        logger.exception("Не вдалося порахувати кількість фото")
+        logger.exception("Не вдалося розпарсити фото оголошення")
 
     # --- Характеристики (стан, бренд, рік тощо — якщо вказані продавцем) ---
     try:
@@ -151,7 +213,7 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
 async def fetch_listing_details(url: str) -> dict | None:
     """
     Повне зчитування оголошення: ціна, назва, опис, локація, перегляди,
-    кількість фото, характеристики. Використовується і для стеження за
+    фото (URL-и), характеристики. Використовується і для стеження за
     ціною, і для AI-оцінки вигідності перепродажу.
     """
     domain = "olx.pl" if "olx.pl" in url else "olx.ua"

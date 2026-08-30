@@ -24,6 +24,13 @@ _SAFETY_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Скільки фото максимум передаємо в одному vision-запиті. Обмеження не
+# технічне (провайдер прийме й більше), а економічне: кожне фото — це
+# суттєва частка вартості запиту, а для resale-аналізу товару 8-10 фото
+# з різних ракурсів вже достатньо (services/olx_service.py й так обрізає
+# список раніше MAX_PHOTOS_FOR_AI=10, це друга лінія захисту).
+MAX_IMAGES_PER_REQUEST = 10
+
 
 def _strip_safety_noise(text: str) -> str:
     if not text:
@@ -95,9 +102,33 @@ def _extract_json_object(raw: str) -> str | None:
     return None
 
 
-async def _complete(prompt: str, temperature: float, json_mode: bool) -> str | None:
+def _build_content(prompt: str, images: list[str] | None):
+    """
+    Якщо images не передано — повертає звичайний текстовий content (як і
+    раніше, щоб не міняти поведінку для всіх існуючих викликів generate_json
+    без фото). Якщо images передано — будує мультимодальний content-список
+    за тим самим патерном, що вже використовується в analyze_product_photo/
+    extract_receipt: [{"type": "text"}, {"type": "image_url"}, ...].
+
+    ВАЖЛИВО: тут передаються прямі http(s) URL фото (як їх віддає OLX), а
+    не base64 — OpenAI-сумісні vision-моделі приймають image_url.url як
+    звичайне посилання, це не вимагає завантажувати байти фото на боті.
+    Якщо конкретний провайдер це не підтримує (не вміє тягнути зовнішні
+    URL самостійно) — доведеться перейти на base64, як у analyze_product_photo.
+    """
+    if not images:
+        return prompt
+
+    content = [{"type": "text", "text": prompt}]
+    for url in images[:MAX_IMAGES_PER_REQUEST]:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return content
+
+
+async def _complete(prompt: str, temperature: float, json_mode: bool, images: list[str] | None = None) -> str | None:
     if not client:
         return None
+    content = _build_content(prompt, images)
     try:
         try:
             kwargs = {"temperature": temperature}
@@ -105,7 +136,7 @@ async def _complete(prompt: str, temperature: float, json_mode: bool) -> str | N
                 kwargs["response_format"] = {"type": "json_object"}
             resp = await client.chat.completions.create(
                 model=AI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": content}],
                 **kwargs,
             )
         except Exception:
@@ -114,13 +145,13 @@ async def _complete(prompt: str, temperature: float, json_mode: bool) -> str | N
             logger.warning("Модель %s не підтримує response_format=json_object, повторюю без нього", AI_MODEL)
             resp = await client.chat.completions.create(
                 model=AI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": content}],
                 temperature=temperature,
             )
         raw = (resp.choices[0].message.content or "").strip()
         return _strip_safety_noise(raw)
     except Exception:
-        logger.exception("AI request failed (model=%s)", AI_MODEL)
+        logger.exception("AI request failed (model=%s, images=%s)", AI_MODEL, len(images) if images else 0)
         return None
 
 
@@ -128,8 +159,14 @@ async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
     return await _complete(prompt, temperature, json_mode=False)
 
 
-async def generate_json(prompt: str, temperature: float = 0.7) -> dict | None:
-    raw = await _complete(prompt, temperature, json_mode=True)
+async def generate_json(prompt: str, temperature: float = 0.7, images: list[str] | None = None) -> dict | None:
+    """
+    ЗМІНЕНО: додано опціональний параметр images (список URL фото) для
+    multi-photo vision-аналізу (AI Resale Hunter, services/resale_engine.py).
+    Без images поведінка ідентична попередній версії — жоден існуючий
+    виклик generate_json(prompt, temperature=...) не ламається.
+    """
+    raw = await _complete(prompt, temperature, json_mode=True, images=images)
     if raw is None:
         return None
     candidate = _extract_json_object(raw) or _strip_json_fence(raw)
