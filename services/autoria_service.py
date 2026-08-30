@@ -7,7 +7,7 @@ logger = logging.getLogger("tasks_bot")
 
 MARKS_URL = "http://api.auto.ria.com/categories/1/marks"
 MODELS_URL = "http://api.auto.ria.com/categories/1/marks/{marka_id}/models/_group"
-SEARCH_BASE_URL = "https://auto.ria.com/search/"
+SEARCH_BASE_URL = "https://auto.ria.com/uk/search/"
 
 FUEL_IDS = {
     "бензин": 1,
@@ -62,20 +62,16 @@ async def find_brand_id(name: str) -> tuple[int, str] | None:
 
 
 def _flatten_models_response(raw) -> list[dict]:
-    """API повертає моделі або як список ГРУП (list[list[dict]]) — коли
-    в марки є серії/підмоделі, або як вже ПЛАСКИЙ список (list[dict]) —
-    коли групування немає. Обробляємо обидва варіанти безпечно, замість
-    сліпо вважати формат завжди вкладеним."""
+    """API повертає моделі або як список ГРУП (list[list[dict]]), або вже
+    ПЛАСКИЙ список (list[dict]) — обробляємо обидва варіанти безпечно."""
     flat: list[dict] = []
     if not isinstance(raw, list):
         return flat
 
     for entry in raw:
         if isinstance(entry, dict):
-            # вже готовий елемент {name, value} — плаский формат
             flat.append(entry)
         elif isinstance(entry, list):
-            # група — список елементів {name, value}
             for item in entry:
                 if isinstance(item, dict):
                     flat.append(item)
@@ -119,38 +115,38 @@ async def list_top_models(marka_id: int, limit: int = 8) -> list[dict]:
 
 
 def build_search_url(filters: dict) -> str:
-    """Будує URL пошуку AUTO.RIA на основі підтвердженої живим прикладом
-    схеми (all[].any[].any[].brand/model). Для параметрів, які не вдалося
-    підтвердити з такою ж певністю (ціна/рік/пробіг/паливо/КПП), додаємо
-    їх у "класичному" плоскому вигляді (marka_id/model_id-стиль), який
-    історично підтримувався сайтом як fallback-параметри — якщо AUTO.RIA
-    їх ігнорує, посилання все одно відкриє коректний пошук за маркою/моделлю.
-    ВАЖЛИВО: рекомендуємо один раз вручну звірити згенероване посилання."""
-    params = []
+    """Будує URL пошуку AUTO.RIA за схемою, підтвердженою двома незалежними
+    джерелами (реальний робочий приклад стороннього скрапера + офіційний
+    конвертер параметрів RIA): categories.main.id / brand.id[0] /
+    model.id[0] / year[0].gte-lte / price.currency + price.USD.gte-lte /
+    fuel.id[n] / gearbox.id[n]. Параметри пробігу та міста лишаються
+    best-effort — для них немає такого ж підтвердженого джерела, тож варто
+    вручну звірити згенероване посилання, якщо вони важливі."""
+    params = ["categories.main.id=1"]
 
     brand_id = filters.get("brand_id")
     model_id = filters.get("model_id")
     if brand_id:
-        params.append(f"all%5B0%5D.any%5B0%5D.brand={brand_id}")
-    if model_id:
-        params.append(f"all%5B0%5D.any%5B0%5D.any%5B0%5D.model={model_id}")
-
-    params.append("category=1")
-    params.append("search_type=1")
+        params.append(f"brand.id[0]={brand_id}")
+        params.append(f"model.id[0]={model_id if model_id else 0}")
 
     year_from = filters.get("year_from")
     year_to = filters.get("year_to")
     if year_from:
-        params.append(f"yeariFrom={year_from}")
+        params.append(f"year[0].gte={year_from}")
     if year_to:
-        params.append(f"yeariTo={year_to}")
+        params.append(f"year[0].lte={year_to}")
 
     price_from = filters.get("price_from")
     price_to = filters.get("price_to")
-    if price_from:
-        params.append(f"price.USD.gte={int(price_from)}")
-    if price_to:
-        params.append(f"price.USD.lte={int(price_to)}")
+    if price_from or price_to:
+        # currency=1 означає USD — обов'язковий параметр, без нього
+        # price.USD.gte/lte ігнорується сайтом.
+        params.append("price.currency=1")
+        if price_from:
+            params.append(f"price.USD.gte={int(price_from)}")
+        if price_to:
+            params.append(f"price.USD.lte={int(price_to)}")
 
     fuel_id = filters.get("fuel_id")
     if fuel_id:
@@ -163,9 +159,9 @@ def build_search_url(filters: dict) -> str:
     mileage_from = filters.get("mileage_from")
     mileage_to = filters.get("mileage_to")
     if mileage_from:
-        params.append(f"raceInt[0]={int(mileage_from)}")
+        params.append(f"raceInt[0].gte={int(mileage_from)}")
     if mileage_to:
-        params.append(f"raceInt[1]={int(mileage_to)}")
+        params.append(f"raceInt[0].lte={int(mileage_to)}")
 
     city = filters.get("city")
     if city:
