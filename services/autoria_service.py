@@ -61,6 +61,27 @@ async def find_brand_id(name: str) -> tuple[int, str] | None:
     return None
 
 
+def _flatten_models_response(raw) -> list[dict]:
+    """API повертає моделі або як список ГРУП (list[list[dict]]) — коли
+    в марки є серії/підмоделі, або як вже ПЛАСКИЙ список (list[dict]) —
+    коли групування немає. Обробляємо обидва варіанти безпечно, замість
+    сліпо вважати формат завжди вкладеним."""
+    flat: list[dict] = []
+    if not isinstance(raw, list):
+        return flat
+
+    for entry in raw:
+        if isinstance(entry, dict):
+            # вже готовий елемент {name, value} — плаский формат
+            flat.append(entry)
+        elif isinstance(entry, list):
+            # група — список елементів {name, value}
+            for item in entry:
+                if isinstance(item, dict):
+                    flat.append(item)
+    return flat
+
+
 async def _fetch_models(marka_id: int) -> list[dict]:
     if marka_id in _models_cache:
         return _models_cache[marka_id]
@@ -71,8 +92,8 @@ async def _fetch_models(marka_id: int) -> list[dict]:
                 if resp.status != 200:
                     logger.warning("AUTO.RIA models status=%s for marka_id=%s", resp.status, marka_id)
                     return []
-                grouped = await resp.json()
-                flat = [item for group in grouped for item in group]
+                raw = await resp.json()
+                flat = _flatten_models_response(raw)
                 _models_cache[marka_id] = flat
                 return flat
     except Exception:
