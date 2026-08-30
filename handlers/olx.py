@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 
 from aiogram import Router, F
@@ -469,6 +470,34 @@ async def olx_bought_cb(cb: CallbackQuery):
 # ДОДАНО: 🔎 Знайти схожі (п.13 ТЗ)
 # =========================================================
 
+_JUNK_CHARS_RE = re.compile(r"[\"'«»()\[\]{}]")
+_NULLISH = {"null", "none", "невідомо", "не вказано", ""}
+
+
+def _clean_query_text(text: str) -> str:
+    text = _JUNK_CHARS_RE.sub("", text or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _build_similar_query(analysis: dict, tracker: dict) -> str:
+    """
+    ЗМІНЕНО: раніше в пошук йшла повна AI-назва товару (item_name),
+    яка часто виглядає як "Смартфон Xiaomi Redmi Note 12 128GB чорний,
+    б/в, гарний стан" — на такий довгий і специфічний рядок пошук OLX
+    майже завжди повертає 0 карток. Тепер запит будується коротко:
+    спершу пробуємо "бренд + модель" (найточніше і найкоротше), і лише
+    якщо їх немає — беремо перші кілька слів з item_name/title.
+    """
+    brand = _clean_query_text((analysis.get("item_brand") or "")).lower()
+    model = _clean_query_text((analysis.get("item_model") or "")).lower()
+    if brand not in _NULLISH and model not in _NULLISH:
+        return _clean_query_text(f"{analysis.get('item_brand')} {analysis.get('item_model')}")
+
+    name = _clean_query_text(analysis.get("item_name") or tracker.get("title") or "")
+    words = name.split()
+    return " ".join(words[:4])
+
+
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
     tid = cb.data.split(":", 1)[1]
@@ -480,7 +509,7 @@ async def olx_similar_cb(cb: CallbackQuery):
         return await cb.message.answer("⚠️ Підписку не знайдено.")
 
     analysis = tracker.get("resale_analysis") or {}
-    query_text = analysis.get("item_name") or tracker.get("title") or ""
+    query_text = _build_similar_query(analysis, tracker)
     if not query_text:
         await cb.answer()
         return await cb.message.answer(
@@ -491,11 +520,24 @@ async def olx_similar_cb(cb: CallbackQuery):
     domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
     results = await olx_service.search_listings(query_text, None, "", 0, domain=domain)
 
+    # ЗМІНЕНО: search_listings тепер повертає None при технічному збої
+    # запиту (403/timeout) і [] лише коли запит успішний, але карток
+    # немає — раніше обидва випадки виглядали як "нічого не знайдено",
+    # хоча причина могла бути в тому, що OLX просто заблокував запит.
+    if results is None:
+        return await cb.message.answer(
+            "⚠️ Не вдалося виконати пошук на OLX прямо зараз (сайт тимчасово "
+            "заблокував запит або недоступний). Спробуй ще раз за хвилину."
+        )
+
     own_url = tracker.get("url")
     results = [r for r in results if r.get("url") != own_url][:5]
 
     if not results:
-        return await cb.message.answer(f"📭 Схожих оголошень за «{query_text}» не знайдено.")
+        return await cb.message.answer(
+            f"📭 Схожих оголошень за «{query_text}» не знайдено. "
+            f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
+        )
 
     lines = [f"🔎 *Схожі оголошення* — «{query_text}»", ""]
     for r in results:

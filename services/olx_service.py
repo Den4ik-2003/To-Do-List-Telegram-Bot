@@ -1,5 +1,6 @@
 import logging
 import re
+from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
@@ -37,11 +38,7 @@ DOMAIN_CONFIG = {
     "olx.pl": {"list_path": "/oferty/q-", "referer": "https://www.olx.pl/", "default_currency": "PLN"},
 }
 
-# Максимум фото, які передаємо в AI. OLX-оголошення інколи мають 20+ фото —
-# передавати всі і дорого (токени/оплата за vision-запит), і не потрібно:
-# для аналізу товару достатньо репрезентативної вибірки. Якщо фото більше —
-# беремо перші MAX_PHOTOS_FOR_AI (як правило, продавці ставлять найбільш
-# інформативні фото першими) і чесно показуємо "N з M" користувачу.
+# Максимум фото, які передаємо в AI.
 MAX_PHOTOS_FOR_AI = 10
 
 
@@ -89,13 +86,7 @@ def _best_srcset_url(srcset: str) -> str | None:
 
 
 def _extract_photos(soup: BeautifulSoup) -> tuple[list[str], int]:
-    """
-    Збирає URL усіх фото галереї оголошення (не лише count!). Без реальних
-    посилань на зображення AI фізично не може проаналізувати нічого, крім
-    першого прев'ю — саме це і була причина неточних/однакових висновків.
-    Повертає (фото_для_AI[:MAX_PHOTOS_FOR_AI], загальна_кількість_знайдених).
-    """
-    """Повертає (фото_для_AI[:MAX], загальна_кількість_знайдених)."""
+    """Збирає URL усіх фото галереї оголошення. Повертає (фото_для_AI[:MAX], загальна_кількість)."""
     urls: list[str] = []
     seen: set[str] = set()
 
@@ -125,8 +116,7 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     """
     Витягує з HTML оголошення все, що потрібно для оцінки вигідності
     перепродажу: ціну, назву, опис, локацію, перегляди, УСІ фото (URL, не
-    лише кількість) та список характеристик. Кожне поле окремо обгорнуте
-    в try, щоб відсутність одного елемента не ламала весь парсинг решти.
+    лише кількість) та список характеристик.
     """
     soup = BeautifulSoup(html, "html.parser")
     result: dict = {
@@ -135,7 +125,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
         "photos": [], "photos_count": None, "params": [],
     }
 
-    # --- Ціна ---
     price_el = soup.select_one('[data-testid="ad-price-container"]') or soup.select_one('[data-testid="ad-price"]')
     price_text = price_el.get_text(" ", strip=True) if price_el else None
     if price_text:
@@ -152,7 +141,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
             except (ValueError, KeyError):
                 pass
 
-    # --- Назва ---
     try:
         title_el = soup.select_one('[data-cy="ad_title"]') or soup.find("h1")
         if title_el:
@@ -162,7 +150,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити назву оголошення")
 
-    # --- Опис ---
     try:
         desc_el = soup.select_one('[data-cy="ad_description"]')
         if desc_el:
@@ -170,7 +157,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити опис оголошення")
 
-    # --- Локація/дата ---
     try:
         loc_el = soup.select_one('[data-testid="location-date"]')
         if loc_el:
@@ -178,7 +164,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити локацію оголошення")
 
-    # --- Перегляди ---
     try:
         views_el = soup.select_one('[data-testid="page-view-counter"]')
         views_text = views_el.get_text(" ", strip=True) if views_el else html
@@ -188,7 +173,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити кількість переглядів")
 
-    # --- Фото (URL-и, для AI-аналізу; ЗМІНЕНО — раніше тут рахували лише len()) ---
     try:
         photos, total = _extract_photos(soup)
         result["photos"] = photos
@@ -196,7 +180,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
     except Exception:
         logger.exception("Не вдалося розпарсити фото оголошення")
 
-    # --- Характеристики (стан, бренд, рік тощо — якщо вказані продавцем) ---
     try:
         params_container = soup.select_one('[data-testid="ad-parameters-container"]')
         if params_container:
@@ -213,8 +196,7 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
 async def fetch_listing_details(url: str) -> dict | None:
     """
     Повне зчитування оголошення: ціна, назва, опис, локація, перегляди,
-    фото (URL-и), характеристики. Використовується і для стеження за
-    ціною, і для AI-оцінки вигідності перепродажу.
+    фото (URL-и), характеристики.
     """
     domain = "olx.pl" if "olx.pl" in url else "olx.ua"
     headers = _domain_headers(domain)
@@ -252,7 +234,12 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
 
 def _build_search_url(domain: str, title_query: str, max_price: float | None, location: str, radius_km: int) -> str:
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
-    query = title_query.strip().replace(" ", "-")
+    # ЗМІНЕНО: раніше пробіли замінялись на "-" без URL-кодування — кириличні
+    # символи в такому вигляді інколи ламали запит або давали 0 результатів
+    # залежно від того, як curl_cffi/сервер трактує неекранований UTF-8 у
+    # шляху. quote() коректно кодує кожен сегмент, лишаючи "-" як є.
+    slug = title_query.strip().replace(" ", "-")
+    query = quote(slug, safe="-")
     base = f"https://www.{domain}{cfg['list_path']}{query}/"
     params = []
     if max_price:
@@ -270,7 +257,16 @@ async def search_listings(
     location: str,
     radius_km: int,
     domain: str = "olx.ua",
-) -> list[dict]:
+) -> list[dict] | None:
+    """
+    ЗМІНЕНО: тепер розрізняє два різних випадки, які раніше обидва
+    поверталися як порожній список — через що користувач бачив "нічого не
+    знайдено" навіть тоді, коли насправді запит до OLX провалився
+    (403/timeout/мережева помилка):
+      - None  -> технічний збій запиту (сайт заблокував/недоступний),
+                 виклик мав би показати користувачу помилку, а не "0 знайдено";
+      - []    -> запит виконано успішно, але реальних карток товарів немає.
+    """
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
     url = _build_search_url(domain, title_query, max_price, location, radius_km)
     headers = _domain_headers(domain)
@@ -280,14 +276,15 @@ async def search_listings(
             resp = await session.get(url, timeout=20, allow_redirects=True)
             if resp.status_code != 200:
                 logger.warning("OLX search fetch status=%s for %s", resp.status_code, url)
-                return []
+                return None
             html = resp.text
     except Exception:
         logger.exception("OLX search fetch failed for %s", url)
-        return []
+        return None
 
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select('[data-cy="l-card"]')
+    logger.info("OLX search OK url=%s cards_found=%s", url, len(cards))
 
     results = []
     for card in cards:
