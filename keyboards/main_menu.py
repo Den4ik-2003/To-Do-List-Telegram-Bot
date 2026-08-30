@@ -11,7 +11,6 @@ CATEGORY_GOALS = "🎯 Цілі та проєкти"
 CATEGORY_LIFE = "🌍 Побут"
 CATEGORY_BUSINESS = "💼 Бізнес"
 CATEGORY_JOBS = "💼 Вакансії"
-CATEGORY_CREATIVE = "🎨 Творча студія"
 
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
@@ -41,12 +40,6 @@ MAIN_CATEGORIES = {
     CATEGORY_JOBS: [
         "🔎 Знайти вакансії", "👤 Мої дані для пошуку",
         "⭐ Збережені вакансії", "🔔 Мої монітори вакансій",
-    ],
-    CATEGORY_CREATIVE: [
-        "🖼️ Згенерувати картинку", "🤖 Редагувати фото",
-        "😀 Стікер", "😎 AI Emoji",
-        "🎨 З мого фото", "📱 Шаблони",
-        "🗂️ Мої генерації",
     ],
 }
 
