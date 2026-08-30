@@ -29,6 +29,7 @@ job_profiles_col = None
 job_searches_col = None
 job_saved_col = None
 creative_generations_col = None
+autoria_saved_col = None
 
 
 async def init_mongo(mongo_uri: str):
@@ -39,6 +40,7 @@ async def init_mongo(mongo_uri: str):
     global qa_results_col
     global job_profiles_col, job_searches_col, job_saved_col
     global creative_generations_col
+    global autoria_saved_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -73,6 +75,8 @@ async def init_mongo(mongo_uri: str):
     job_saved_col = db["job_saved"]
 
     creative_generations_col = db["creative_generations"]
+
+    autoria_saved_col = db["autoria_saved"]
 
     await ping()
     return db
