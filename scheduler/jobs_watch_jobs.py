@@ -4,6 +4,7 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config.settings import JOB_CHECK_INTERVAL_MINUTES
+from database import job_profile as job_profile_db
 from database import jobs as jobs_db
 from services import jobs_service
 
@@ -20,11 +21,17 @@ async def _check_watch(bot: Bot, watch: dict):
     new_items = [v for v in vacancies if v["id"] not in seen_ids]
 
     if new_items:
+        profile = await job_profile_db.get_profile(watch["uid"])
         for v in new_items[:5]:
+            score = await jobs_service.score_vacancy(v, profile)
+            match_line = f"\n🎯 Match: {score['match_percent']}%" if score.get("match_percent") is not None else ""
             text = (
-                f"🆕 *Нова вакансія*\n\n"
+                f"🆕 *Нова вакансія для тебе*\n\n"
                 f"💼 {v.get('title','')}\n"
                 f"🏢 {v.get('company') or '—'}\n"
+                f"💰 {v.get('salary') or '—'}\n"
+                f"📍 {v.get('location') or '—'}"
+                f"{match_line}\n\n"
                 f"🔗 {v.get('url','')}\n"
                 f"_(джерело: {v.get('source','')})_"
             )

@@ -28,6 +28,7 @@ qa_results_col = None
 job_profiles_col = None
 job_searches_col = None
 job_saved_col = None
+job_feedback_col = None
 creative_generations_col = None
 autoria_saved_col = None
 
@@ -38,7 +39,7 @@ async def init_mongo(mongo_uri: str):
     global transactions_col, budgets_col, ai_usage_col, ai_conversations_col
     global olx_tracked_col, resale_saved_col, business_ideas_col, site_watch_col
     global qa_results_col
-    global job_profiles_col, job_searches_col, job_saved_col
+    global job_profiles_col, job_searches_col, job_saved_col, job_feedback_col
     global creative_generations_col
     global autoria_saved_col
 
@@ -73,6 +74,7 @@ async def init_mongo(mongo_uri: str):
     job_profiles_col = db["job_profiles"]
     job_searches_col = db["job_searches"]
     job_saved_col = db["job_saved"]
+    job_feedback_col = db["job_feedback"]
 
     creative_generations_col = db["creative_generations"]
 

@@ -23,6 +23,9 @@ class JobProfile(StatesGroup):
     location = State()
     work_format = State()
     employment_type = State()
+    portfolio_url = State()
+    linkedin = State()
+    github = State()
     resume_summary = State()
 
 
@@ -36,6 +39,9 @@ STEPS = [
     (JobProfile.location, "location", "📍 Бажана локація?"),
     (JobProfile.work_format, "work_format", "💻 Формат роботи (remote/office/hybrid)?"),
     (JobProfile.employment_type, "employment_type", "🕐 Тип зайнятості (повна/неповна)?"),
+    (JobProfile.portfolio_url, "portfolio_url", "🔗 Посилання на портфоліо? (або «-» якщо немає)"),
+    (JobProfile.linkedin, "linkedin", "💼 LinkedIn? (або «-»)"),
+    (JobProfile.github, "github", "🐙 GitHub? (або «-»)"),
     (JobProfile.resume_summary, "resume_summary", "📄 Коротко про себе (як для резюме, 2-4 речення)?"),
 ]
 
@@ -62,7 +68,8 @@ def _find_step_index(current_state: str) -> int:
 @router.message(
     JobProfile.profession, JobProfile.experience, JobProfile.skills, JobProfile.education,
     JobProfile.languages, JobProfile.desired_salary, JobProfile.location,
-    JobProfile.work_format, JobProfile.employment_type, JobProfile.resume_summary,
+    JobProfile.work_format, JobProfile.employment_type, JobProfile.portfolio_url,
+    JobProfile.linkedin, JobProfile.github, JobProfile.resume_summary,
 )
 async def profile_step(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
@@ -76,7 +83,8 @@ async def profile_step(msg: Message, state: FSMContext):
         return await msg.answer("Щось пішло не так, спробуй ще раз.", reply_markup=kb_main())
 
     _, field, _ = STEPS[idx]
-    await state.update_data(**{field: msg.text.strip()})
+    value = msg.text.strip()
+    await state.update_data(**{field: "" if value == "-" else value})
 
     if idx + 1 < len(STEPS):
         next_state, _, next_prompt = STEPS[idx + 1]

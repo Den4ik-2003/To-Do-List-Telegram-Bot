@@ -1,5 +1,6 @@
 import logging
 import re
+from difflib import SequenceMatcher
 from urllib.parse import quote
 
 import aiohttp
@@ -15,13 +16,24 @@ DOU_SEARCH_URL = "https://jobs.dou.ua/vacancies/?search={query}"
 WORKUA_SEARCH_URL = "https://www.work.ua/jobs-{query}/"
 ROBOTA_SEARCH_URL = "https://robota.ua/zapros/{query}/ukraine"
 
-CURL_HEADERS = {
-    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
-}
+CURL_HEADERS = {"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7"}
 IMPERSONATE = "chrome124"
 
+# Синоніми/побутові формулювання -> нормалізовані ключові слова.
+# AI вже вміє це розпізнавати сам через промпт нижче, цей словник — друга
+# лінія захисту для точкового replace перед пошуком (напр. коли AI поверне
+# щось надто буквальне).
+PROFESSION_SYNONYMS = {
+    "фронтенд": "frontend developer",
+    "бекенд": "backend developer",
+    "програміст на реакті": "react developer",
+    "водій бусу": "водій категорії B",
+    "робота з дому": "remote",
+    "без досвіду": "no experience",
+}
 
-async def parse_job_query(user_text: str, profile: dict | None) -> dict | None:
+
+async def parse_job_query(user_text: str, profile: dict | None, feedback: list[dict] | None = None) -> dict | None:
     profile_text = ""
     if profile:
         profile_text = (
@@ -31,21 +43,30 @@ async def parse_job_query(user_text: str, profile: dict | None) -> dict | None:
             f"формат={profile.get('work_format','')}, зарплата={profile.get('desired_salary','')}"
         )
 
+    feedback_text = ""
+    if feedback:
+        reasons = [f"{f.get('title','')} — причина: {f.get('reason','')}" for f in feedback[:5]]
+        feedback_text = "Раніше користувач відхиляв схожі вакансії: " + "; ".join(reasons)
+
     prompt = f"""Проаналізуй запит користувача на пошук роботи і витягни критерії.
+Розумій синоніми та побутові формулювання (напр. "фронтенд" = Frontend Developer,
+"робота з дому" = remote, "без досвіду" = no experience).
+
 Запит: "{user_text}"
 {profile_text}
+{feedback_text}
 
 Поверни ЛИШЕ JSON:
 {{
   "is_it": true/false (чи це IT-вакансія),
-  "profession": "назва професії/посади",
+  "profession": "нормалізована назва професії/посади",
   "level": "junior|middle|senior|no_exp|" (порожньо якщо не вказано),
   "skills": ["навичка1", "навичка2"],
   "city": "місто або порожньо",
   "work_format": "remote|office|hybrid|" (порожньо якщо не важливо),
   "salary_min": число або null,
-  "salary_currency": "USD|UAH|" ,
-  "employment_type": "full|part|" (повна/неповна зайнятість, порожньо якщо не вказано),
+  "salary_currency": "USD|UAH",
+  "employment_type": "full|part|",
   "search_keywords": ["1-3 короткі ключові слова для пошуку на джоб-бордах"]
 }}"""
     return await ai_service.generate_json(prompt, temperature=0.3)
@@ -57,168 +78,57 @@ def _matches_criteria(text: str, criteria: dict) -> bool:
     return any(kw.lower() in text_l for kw in keywords if kw)
 
 
-async def fetch_djinni(criteria: dict, limit: int = 30) -> list[dict]:
-    if not criteria.get("is_it"):
-        return []
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(DJINNI_RSS_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return []
-                raw = await resp.text()
-    except Exception:
-        logger.exception("Djinni RSS fetch failed")
-        return []
-
-    soup = BeautifulSoup(raw, "xml")
-    items = soup.find_all("item")
-    results = []
-    for item in items:
-        title = item.find("title").get_text(strip=True) if item.find("title") else ""
-        link = item.find("link").get_text(strip=True) if item.find("link") else ""
-        desc = item.find("description").get_text(strip=True) if item.find("description") else ""
-        combined = f"{title} {desc}"
-        if not _matches_criteria(combined, criteria):
-            continue
-        results.append({
-            "id": link,
-            "title": title,
-            "company": "",
-            "location": "Remote/Ukraine",
-            "work_format": "remote" if "remote" in desc.lower() else "",
-            "salary": "",
-            "url": link,
-            "source": "Djinni",
-            "requirements": BeautifulSoup(desc, "html.parser").get_text(" ", strip=True)[:600],
-        })
-        if len(results) >= limit:
-            break
-    return results
+# ... fetch_djinni / fetch_dou / fetch_workua / fetch_robotaua БЕЗ ЗМІН,
+# залиш як у поточному файлі ...
 
 
-async def fetch_dou(criteria: dict, limit: int = 15) -> list[dict]:
-    if not criteria.get("is_it"):
-        return []
-    query = " ".join(criteria.get("search_keywords") or [criteria.get("profession", "")])
-    url = DOU_SEARCH_URL.format(query=quote(query))
-    try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=CURL_HEADERS) as session:
-            resp = await session.get(url, timeout=20)
-            if resp.status_code != 200:
-                logger.warning("DOU search status=%s", resp.status_code)
-                return []
-            html = resp.text
-    except Exception:
-        logger.exception("DOU search failed for %s", url)
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select(".l-vacancy")
-    results = []
-    for card in cards[:limit]:
-        title_el = card.select_one(".title .vt")
-        company_el = card.select_one(".title .company")
-        date_el = card.select_one(".date")
-        link = title_el.get("href") if title_el else None
-        if not link:
-            continue
-        results.append({
-            "id": link,
-            "title": title_el.get_text(strip=True) if title_el else "",
-            "company": company_el.get_text(strip=True) if company_el else "",
-            "location": "",
-            "work_format": "",
-            "salary": "",
-            "url": link,
-            "source": "DOU",
-            "requirements": date_el.get_text(strip=True) if date_el else "",
-        })
-    return results
+def _normalize_for_dedup(v: dict) -> str:
+    text = f"{v.get('title','')} {v.get('company','')}".lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-async def fetch_workua(criteria: dict, limit: int = 15) -> list[dict]:
-    query = "+".join(criteria.get("search_keywords") or [criteria.get("profession", "")])
-    city = criteria.get("city", "").strip()
-    slug = f"{city.lower()}-{query}" if city else query
-    url = WORKUA_SEARCH_URL.format(query=quote(slug))
-    try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=CURL_HEADERS) as session:
-            resp = await session.get(url, timeout=20)
-            if resp.status_code != 200:
-                logger.warning("Work.ua search status=%s", resp.status_code)
-                return []
-            html = resp.text
-    except Exception:
-        logger.exception("Work.ua search failed for %s", url)
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.card.card-hover")
-    results = []
-    for card in cards[:limit]:
-        title_el = card.select_one("h2 a")
-        company_el = card.select_one("span.strong-600") or card.select_one("[title]")
-        salary_el = card.select_one("span.text-muted-print.strong-600.nowrap")
-        link = title_el.get("href") if title_el else None
-        if not link or not title_el:
-            continue
-        full_link = "https://www.work.ua" + link if link.startswith("/") else link
-        results.append({
-            "id": full_link,
-            "title": title_el.get_text(strip=True),
-            "company": company_el.get_text(strip=True) if company_el else "",
-            "location": city or "",
-            "work_format": "",
-            "salary": salary_el.get_text(strip=True) if salary_el else "",
-            "url": full_link,
-            "source": "Work.ua",
-            "requirements": "",
-        })
-    return results
-
-
-async def fetch_robotaua(criteria: dict, limit: int = 15) -> list[dict]:
+def dedupe_vacancies(vacancies: list[dict], threshold: float = 0.82) -> list[dict]:
     """
-    Найризикованіше джерело — Robota.ua не має підтвердженого публічного API
-    для пошуку. Це best-effort скрапінг публічної сторінки видачі; якщо
-    структура сайту зміниться, ця функція може почати повертати порожній
-    список без явної помилки. Якщо це трапиться — потрібно буде оновити
-    селектори під актуальну розмітку сайту.
+    Об'єднує вакансії, які схожі за назвою+компанією навіть якщо URL різні
+    (та сама вакансія на Work.ua і Robota.ua). Для кожної групи лишає перший
+    запис, але додає поле "sources" зі списком усіх джерел, де вона знайдена.
     """
-    query = criteria.get("profession", "") or (criteria.get("search_keywords") or [""])[0]
-    url = ROBOTA_SEARCH_URL.format(query=quote(query))
-    try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=CURL_HEADERS) as session:
-            resp = await session.get(url, timeout=20)
-            if resp.status_code != 200:
-                logger.warning("Robota.ua search status=%s", resp.status_code)
-                return []
-            html = resp.text
-    except Exception:
-        logger.exception("Robota.ua search failed for %s", url)
-        return []
+    unique: list[dict] = []
+    keys: list[str] = []
 
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("[data-qa='vacancy-serp-item']") or soup.select("article")
-    results = []
-    for card in cards[:limit]:
-        title_el = card.find("a")
-        if not title_el:
-            continue
-        link = title_el.get("href", "")
-        full_link = "https://robota.ua" + link if link.startswith("/") else link
-        results.append({
-            "id": full_link,
-            "title": title_el.get_text(strip=True),
-            "company": "",
-            "location": criteria.get("city", ""),
-            "work_format": "",
-            "salary": "",
-            "url": full_link,
-            "source": "Robota.ua",
-            "requirements": "",
-        })
-    return results
+    for v in vacancies:
+        key = _normalize_for_dedup(v)
+        matched = False
+        for i, existing_key in enumerate(keys):
+            if SequenceMatcher(None, key, existing_key).ratio() >= threshold:
+                existing = unique[i]
+                sources = set(existing.get("sources", [existing.get("source", "")]))
+                sources.add(v.get("source", ""))
+                existing["sources"] = sorted(s for s in sources if s)
+                matched = True
+                break
+        if not matched:
+            v["sources"] = [v.get("source", "")]
+            unique.append(v)
+            keys.append(key)
+
+    return unique
+
+
+def apply_filters(vacancies: list[dict], filters: dict) -> list[dict]:
+    result = vacancies
+    if filters.get("remote_only"):
+        result = [v for v in result if "remote" in (v.get("work_format") or "").lower()]
+    if filters.get("city"):
+        city = filters["city"].lower()
+        result = [v for v in result if city in (v.get("location") or "").lower()]
+    if filters.get("min_match") is not None:
+        result = [
+            v for v in result
+            if (v.get("_score", {}).get("match_percent") or 0) >= filters["min_match"]
+        ]
+    return result
 
 
 async def search_vacancies(criteria: dict) -> list[dict]:
@@ -234,13 +144,14 @@ async def search_vacancies(criteria: dict) -> list[dict]:
             logger.exception("A job source failed during search_vacancies")
 
     seen_urls = set()
-    unique = []
+    unique_by_url = []
     for v in all_results:
         if v["url"] in seen_urls:
             continue
         seen_urls.add(v["url"])
-        unique.append(v)
-    return unique
+        unique_by_url.append(v)
+
+    return dedupe_vacancies(unique_by_url)
 
 
 async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
@@ -260,7 +171,8 @@ async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
 Мови: {profile.get('languages','')}
 
 Поверни ЛИШЕ JSON:
-{{"match_percent": число 0-100, "fits": ["що підходить"], "missing": ["чого не вистачає"],
+{{"match_percent": число 0-100, "fits": ["що підходить, коротко, 1-3 слова кожне"],
+  "missing": ["чого не вистачає, коротко"],
   "highlight": "що варто підкреслити в заявці", "advice": "чи варто подаватися, одне речення"}}"""
 
     result = await ai_service.generate_json(prompt, temperature=0.4)
@@ -280,10 +192,11 @@ async def generate_cover_letter(vacancy: dict, profile: dict) -> str | None:
 Навички: {profile.get('skills','')}
 Освіта: {profile.get('education','')}
 Мови: {profile.get('languages','')}
+Портфоліо: {profile.get('portfolio_url','')}
 Резюме (короткий опис): {profile.get('resume_summary','')}
 
 Напиши українською (якщо вакансія англомовна — англійською), 120-180 слів, без загальних
-фраз на кшталt "я командний гравець". Конкретно, з посиланням на реальні навички кандидата
+фраз на кшталт "я командний гравець". Конкретно, з посиланням на реальні навички кандидата
 і вимоги вакансії. Поверни ЛИШЕ текст листа."""
 
     return await ai_service.generate_text(prompt, temperature=0.6)

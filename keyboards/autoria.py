@@ -22,6 +22,7 @@ def ikb_models(models: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=m["name"], callback_data=f"ar_model:{m['value']}:{m['name']}")] for m in models]
     rows.append([InlineKeyboardButton(text="✏️ Інша модель (ввести текстом)", callback_data="ar_model_other")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="ar_manual")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="ar_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -34,6 +35,7 @@ def ikb_year_from() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="✏️ Свій рік", callback_data="ar_year_from_other")],
         [InlineKeyboardButton(text="➡️ Пропустити", callback_data="ar_year_from:0")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ar_cancel")],
     ])
 
 
@@ -49,6 +51,7 @@ def ikb_price() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="✏️ Своя сума", callback_data="ar_price_other")],
         [InlineKeyboardButton(text="➡️ Пропустити", callback_data="ar_price:0")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ar_cancel")],
     ])
 
 
@@ -63,6 +66,7 @@ def ikb_fuel() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔌 Електро", callback_data="ar_fuel:5"),
         ],
         [InlineKeyboardButton(text="➡️ Будь-яке", callback_data="ar_fuel:0")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ar_cancel")],
     ])
 
 
@@ -73,6 +77,7 @@ def ikb_gearbox() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⚙️ Механіка", callback_data="ar_gearbox:1"),
         ],
         [InlineKeyboardButton(text="➡️ Будь-яка", callback_data="ar_gearbox:0")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ar_cancel")],
     ])
 
 

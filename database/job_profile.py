@@ -11,6 +11,16 @@ async def save_profile(uid: int, data: dict) -> None:
     )
 
 
+async def update_profile_field(uid: int, field: str, value: str) -> None:
+    await db_call(
+        job_profiles_col.update_one(
+            {"uid": uid},
+            {"$set": {field: value, "updated_at": datetime.now().isoformat()}},
+            upsert=True,
+        )
+    )
+
+
 async def get_profile(uid: int) -> dict | None:
     return await db_call(job_profiles_col.find_one({"uid": uid}), raise_on_fail=False)
 
