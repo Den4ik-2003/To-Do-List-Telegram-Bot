@@ -20,9 +20,6 @@ from handlers.common import require_auth
 logger = logging.getLogger("tasks_bot")
 router = Router(name="olx")
 
-# Якщо AI-оцінку вже рахували менше AI_EVAL_CACHE_HOURS годин тому І
-# оголошення не змінилось (порівнюємо content_hash) — беремо з кешу
-# замість повторного (платного) AI-запиту.
 AI_EVAL_CACHE_HOURS = 12
 
 
@@ -45,7 +42,6 @@ class OlxCalc(StatesGroup):
     waiting_sell_price = State()
 
 
-# ДОДАНО: стан для введення бюджету (п.15 ТЗ)
 class OlxBudget(StatesGroup):
     waiting_amount = State()
 
@@ -56,7 +52,6 @@ def _ikb_olx_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔥 Автопошук за критеріями", callback_data="olx_add_search")],
         [InlineKeyboardButton(text="📋 Мої підписки", callback_data="olx_list")],
         [InlineKeyboardButton(text="🧮 Калькулятор перепродажу", callback_data="olx_calc_start")],
-        # ДОДАНО: TOP DEALS (п.14 ТЗ) і Бюджет (п.15 ТЗ)
         [
             InlineKeyboardButton(text="🏆 TOP Deals", callback_data="olx_top_deals"),
             InlineKeyboardButton(text="💰 Мій бюджет", callback_data="olx_budget_start"),
@@ -71,11 +66,6 @@ def _ikb_after_add(tracker_id: str) -> InlineKeyboardMarkup:
 
 
 def _ikb_after_analysis(tracker_id: str, status: str = "watching") -> InlineKeyboardMarkup:
-    """
-    ЗМІНЕНО: додано кнопки "🔎 Схожі" та "⭐ Зберегти" (п.13, 17 ТЗ).
-    Кнопка "✅ Купив" замінюється на "📸 Створити оголошення" після покупки,
-    щоб не показувати неактуальну дію (п.16 ТЗ).
-    """
     rows = [
         [
             InlineKeyboardButton(text="💬 Торг", callback_data=f"olx_negotiate:{tracker_id}"),
@@ -304,7 +294,6 @@ async def olx_delete_tracker(cb: CallbackQuery):
 # =========================================================
 
 def _listing_payload(tracker: dict) -> dict:
-    """Приводить документ трекера до формату, який очікує resale_engine."""
     return {
         "source": "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua",
         "url": tracker.get("url"),
@@ -321,7 +310,6 @@ def _listing_payload(tracker: dict) -> dict:
 
 
 async def _run_analysis(cb_or_msg, tracker: dict, tid: str, uid: int, force: bool = False):
-    """Спільна логіка для olx_analyze та olx_reanalyze."""
     current_hash = olx_db.compute_content_hash(tracker)
     cached = tracker.get("resale_analysis")
     cached_at = tracker.get("resale_analysis_at")
@@ -385,8 +373,6 @@ async def olx_reanalyze_cb(cb: CallbackQuery):
         await cb.answer()
         return await cb.message.answer("⚠️ Підписку не знайдено.")
 
-    # На перерахунок примусово тягнемо свіжі дані з OLX (ціна/фото могли
-    # змінитись) і форсуємо новий AI-запит, ігноруючи кеш.
     await cb.answer("Оновлюю дані і перераховую...")
     wait_msg = await cb.message.answer("🔁 Тягну свіжі дані оголошення і перераховую...")
 
@@ -451,9 +437,6 @@ async def olx_bought_cb(cb: CallbackQuery):
     await olx_db.set_tracker_status(tid, "bought")
     await cb.answer("Позначено як куплено ✅")
 
-    # ЗМІНЕНО: одразу перемальовуємо клавіатуру під аналізом, замінюючи
-    # "✅ Купив" на "📸 Створити оголошення" (п.16 ТЗ) — без цього кнопка
-    # створення оголошення була б доступна лише з нового повідомлення.
     try:
         await cb.message.edit_reply_markup(reply_markup=_ikb_after_analysis(tid, status="bought"))
     except Exception:
@@ -467,88 +450,120 @@ async def olx_bought_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# ДОДАНО: 🔎 Знайти схожі (п.13 ТЗ)
+# 🔎 Знайти схожі
 # =========================================================
 
 _JUNK_CHARS_RE = re.compile(r"[\"'«»()\[\]{}]")
 _NULLISH = {"null", "none", "невідомо", "не вказано", ""}
 
 
-def _clean_query_text(text: str) -> str:
-    text = _JUNK_CHARS_RE.sub("", text or "")
+def _clean_query_text(text) -> str:
+    """Приймає будь-що (str, None, число тощо) і завжди повертає безпечний рядок —
+    ніколи не кидає виняток, скільки б несподіваним не був вхідний тип/значення."""
+    if text is None:
+        text = ""
+    text = str(text)
+    text = _JUNK_CHARS_RE.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _first_nonempty(*values) -> str:
+    for v in values:
+        cleaned = _clean_query_text(v)
+        if cleaned and cleaned.lower() not in _NULLISH:
+            return cleaned
+    return ""
 
 
 def _build_similar_query(analysis: dict, tracker: dict) -> str:
     """
-    ЗМІНЕНО: раніше в пошук йшла повна AI-назва товару (item_name),
-    яка часто виглядає як "Смартфон Xiaomi Redmi Note 12 128GB чорний,
-    б/в, гарний стан" — на такий довгий і специфічний рядок пошук OLX
-    майже завжди повертає 0 карток. Тепер запит будується коротко:
-    спершу пробуємо "бренд + модель" (найточніше і найкоротше), і лише
-    якщо їх немає — беремо перші кілька слів з item_name/title.
+    ВИПРАВЛЕНО: раніше функція покладалась на конкретні ключі AI-відповіді
+    ("item_brand"/"item_model"/"item_name"), яких могло просто не бути в
+    реальній структурі resale_analysis (залежно від того, що саме повертає
+    resale_engine.analyze_listing) — тоді query_text міг вийти порожнім,
+    і подальша логіка ламалась мовчки. Тепер функція перебирає кілька
+    можливих варіантів назв полів (з різних можливих версій AI-відповіді)
+    і завжди має надійний fallback на назву самого оголошення (tracker
+    title), яка точно є в БД незалежно від того, чи вдався AI-аналіз.
     """
-    brand = _clean_query_text((analysis.get("item_brand") or "")).lower()
-    model = _clean_query_text((analysis.get("item_model") or "")).lower()
-    if brand not in _NULLISH and model not in _NULLISH:
-        return _clean_query_text(f"{analysis.get('item_brand')} {analysis.get('item_model')}")
+    if not isinstance(analysis, dict):
+        analysis = {}
 
-    name = _clean_query_text(analysis.get("item_name") or tracker.get("title") or "")
+    brand = _first_nonempty(analysis.get("item_brand"), analysis.get("brand"))
+    model = _first_nonempty(analysis.get("item_model"), analysis.get("model"))
+    if brand and model:
+        return f"{brand} {model}"
+
+    name = _first_nonempty(
+        analysis.get("item_name"), analysis.get("name"), analysis.get("title"),
+        tracker.get("title"),
+    )
     words = name.split()
     return " ".join(words[:4])
 
 
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
+    # ВИПРАВЛЕНО: раніше cb.answer() викликався лише в кінці функції, після
+    # звернень до БД і побудови запиту. Якщо будь-де посередині траплявся
+    # виняток — виконання обривалось ДО cb.answer(), і кнопка в Telegram
+    # просто зависала у стані "завантаження" назавжди (це і виглядало як
+    # "взагалі нічого не відбувається"). Тепер відповідаємо одразу на вході,
+    # а всю подальшу логіку загортаємо в try/except з логуванням, щоб
+    # будь-яка несподівана помилка показувала користувачу повідомлення
+    # замість мовчазного зависання.
+    await cb.answer("Шукаю схожі оголошення...")
+
     tid = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
 
-    tracker = await olx_db.get_tracker(tid)
-    if not tracker or tracker.get("uid") != uid:
-        await cb.answer()
-        return await cb.message.answer("⚠️ Підписку не знайдено.")
+    try:
+        tracker = await olx_db.get_tracker(tid)
+        if not tracker or tracker.get("uid") != uid:
+            return await cb.message.answer("⚠️ Підписку не знайдено.")
 
-    analysis = tracker.get("resale_analysis") or {}
-    query_text = _build_similar_query(analysis, tracker)
-    if not query_text:
-        await cb.answer()
-        return await cb.message.answer(
-            "⚠️ Спочатку зроби AI-аналіз («🤖 AI Resale Hunter: оцінити»), щоб визначити назву товару для пошуку."
-        )
+        analysis = tracker.get("resale_analysis") or {}
+        query_text = _build_similar_query(analysis, tracker)
+        if not query_text:
+            return await cb.message.answer(
+                "⚠️ Не вдалося визначити назву товару для пошуку. Спробуй спершу зробити "
+                "AI-аналіз («🤖 AI Resale Hunter: оцінити»)."
+            )
 
-    await cb.answer("Шукаю схожі оголошення...")
-    domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
-    results = await olx_service.search_listings(query_text, None, "", 0, domain=domain)
+        domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
+        results = await olx_service.search_listings(query_text, None, "", 0, domain=domain)
 
-    # ЗМІНЕНО: search_listings тепер повертає None при технічному збої
-    # запиту (403/timeout) і [] лише коли запит успішний, але карток
-    # немає — раніше обидва випадки виглядали як "нічого не знайдено",
-    # хоча причина могла бути в тому, що OLX просто заблокував запит.
-    if results is None:
-        return await cb.message.answer(
-            "⚠️ Не вдалося виконати пошук на OLX прямо зараз (сайт тимчасово "
-            "заблокував запит або недоступний). Спробуй ще раз за хвилину."
-        )
+        if results is None:
+            return await cb.message.answer(
+                "⚠️ Не вдалося виконати пошук на OLX прямо зараз (сайт тимчасово "
+                "заблокував запит або недоступний). Спробуй ще раз за хвилину."
+            )
 
-    own_url = tracker.get("url")
-    results = [r for r in results if r.get("url") != own_url][:5]
+        own_url = tracker.get("url")
+        results = [r for r in results if r.get("url") != own_url][:5]
 
-    if not results:
-        return await cb.message.answer(
-            f"📭 Схожих оголошень за «{query_text}» не знайдено. "
-            f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
-        )
+        if not results:
+            return await cb.message.answer(
+                f"📭 Схожих оголошень за «{query_text}» не знайдено. "
+                f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
+            )
 
-    lines = [f"🔎 *Схожі оголошення* — «{query_text}»", ""]
-    for r in results:
-        price_text = f"{r['price']:.0f} {r['currency']}" if r.get("price") else "ціна не вказана"
-        lines.append(f"• {r['title']} — {price_text}")
-        lines.append(f"  {r['url']}")
-    await cb.message.answer("\n".join(lines))
+        lines = [f"🔎 *Схожі оголошення* — «{query_text}»", ""]
+        for r in results:
+            price_text = f"{r['price']:.0f} {r['currency']}" if r.get("price") else "ціна не вказана"
+            lines.append(f"• {r['title']} — {price_text}")
+            lines.append(f"  {r['url']}")
+        await cb.message.answer("\n".join(lines))
+    except Exception:
+        logger.exception("olx_similar_cb failed for tracker=%s uid=%s", tid, uid)
+        try:
+            await cb.message.answer("⚠️ Сталася технічна помилка під час пошуку схожих. Спробуй ще раз.")
+        except Exception:
+            pass
 
 
 # =========================================================
-# ДОДАНО: ⭐ Зберегти в обране (п.13, 17 ТЗ)
+# ⭐ Зберегти в обране
 # =========================================================
 
 @router.callback_query(F.data.startswith("olx_fav:"))
@@ -566,7 +581,7 @@ async def olx_favorite_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# ДОДАНО: 📸 Створити оголошення після покупки (п.16 ТЗ)
+# 📸 Створити оголошення після покупки
 # =========================================================
 
 @router.callback_query(F.data.startswith("olx_mkListing:"))
@@ -605,7 +620,7 @@ async def olx_create_listing_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# ДОДАНО: 🏆 TOP DEALS (п.14 ТЗ)
+# 🏆 TOP DEALS
 # =========================================================
 
 @router.callback_query(F.data == "olx_top_deals")
@@ -620,7 +635,7 @@ async def olx_top_deals_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# ДОДАНО: 💰 Мій бюджет (п.15 ТЗ)
+# 💰 Мій бюджет
 # =========================================================
 
 @router.callback_query(F.data == "olx_budget_start")
