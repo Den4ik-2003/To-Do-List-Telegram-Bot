@@ -31,6 +31,23 @@ def _is_missed(t: dict) -> bool:
     return bool(due and due <= datetime.now())
 
 
+def _project_stage_line(p: dict) -> str:
+    """
+    Додає до опису проєкту інформацію про поточний етап (перший ще не
+    завершений), щоб AI генерував задачі, які просувають саме цей етап,
+    а не абстрактні задачі по проєкту в цілому.
+    """
+    stages = p.get("stages") or []
+    if not stages:
+        return ""
+    current = projects_db.get_current_stage(p)
+    done, total = projects_db.stage_progress(p)
+    if current:
+        desc = f": {current.get('description','')[:120]}" if current.get("description") else ""
+        return f" | Етап {done + 1}/{total} — «{current.get('title','')}»{desc}"
+    return f" | Усі {total} етапів завершено"
+
+
 async def check_ai_limit(uid: int) -> tuple[bool, int]:
     remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
     return remaining > 0, remaining
@@ -70,6 +87,7 @@ async def _build_context(uid: int) -> dict:
         f"- {p.get('title','')}"
         + (f" — {p.get('description','')[:100]}" if p.get("description") else "")
         + (f" — бюджет {p.get('spent', 0)}/{p.get('budget')} {DEFAULT_CURRENCY}" if p.get("budget") else "")
+        + _project_stage_line(p)
         for p in projects
     ) or "(активних проєктів немає)"
 
@@ -113,13 +131,17 @@ XP: {ctx['state'].get('xp', 0)}
 Довгострокові цілі користувача (від найважливіших):
 {ctx['goals_text']}
 
-Активні проєкти користувача (окремі напрямки роботи, не обов'язково пов'язані із задачами напряму):
+Активні проєкти користувача (окремі напрямки роботи, не обов'язково пов'язані із задачами напряму).
+Якщо у проєкту вказано "Етап X/Y" — це поточний етап, над яким зараз реально
+працює користувач; генеруй задачі, що просувають САМЕ цей етап (за його
+описом), а не абстрактні задачі по проєкту в цілому:
 {ctx['projects_text']}
 
 Запропонуй 3-6 НОВИХ конкретних задач на сьогодні, реалістичних для виконання за день.
 Правила:
 - Не дублюй активні задачі.
 - Задачі мають бути конкретними, а не абстрактними.
+- Якщо у проєкту є поточний етап — хоча б одна задача має напряму просувати саме цей етап.
 - Врахуй робочий графік: задачі про IT/навчання/пошук роботи став до початку або після завершення робочого дня, якщо немає інших вказівок.
 - Не став дві задачі на однаковий час і не став задачу поверх уже запланованої активної задачі.
 - Балансуй між напрямками (проєкти, робота, фінанси, особисте) — не роби весь план лише про одне.
@@ -186,7 +208,9 @@ async def generate_daily_analysis(uid: int, daily_stats: dict) -> str | None:
     state = await users_db.get_user_state(uid)
     projects = await projects_db.get_active_projects(uid)
     projects_text = "\n".join(
-        f"- {p.get('title','')}" + (f" — {p.get('description','')[:100]}" if p.get("description") else "")
+        f"- {p.get('title','')}"
+        + (f" — {p.get('description','')[:100]}" if p.get("description") else "")
+        + _project_stage_line(p)
         for p in projects
     ) or "(активних проєктів немає)"
 
@@ -199,13 +223,13 @@ async def generate_daily_analysis(uid: int, daily_stats: dict) -> str | None:
 Серія (streak): {state.get('streak', 0)} днів
 XP: {state.get('xp', 0)}
 
-Активні проєкти користувача:
+Активні проєкти користувача (з поточним етапом, якщо він є):
 {projects_text}
 
 Дай короткий, конкретний і корисний аналіз у форматі (українською, збережи ці підзаголовки):
 🎯 Найкраще: ...
 ⚠️ Проблема: ...
-📁 Проєкти: коментар щодо прогресу активних проєктів і що варто зробити далі
+📁 Проєкти: коментар щодо прогресу активних проєктів і поточних етапів, що варто зробити далі
 💡 Що змінити завтра: ..."""
 
     text = await ai_service.generate_text(prompt)

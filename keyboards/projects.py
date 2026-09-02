@@ -19,6 +19,7 @@ def ikb_projects(projects: list) -> InlineKeyboardMarkup:
 def ikb_project_actions(pid: str, active: bool) -> InlineKeyboardMarkup:
     toggle_text = "✅ Завершити" if active else "▶️ Відновити"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧩 Етапи проєкту", callback_data=f"projstages:{pid}")],
         [InlineKeyboardButton(text="📋 Задачі проєкту", callback_data=f"projtasks:{pid}")],
         [InlineKeyboardButton(text="💰 Бюджет проєкту", callback_data=f"projbudget:{pid}")],
         [
@@ -26,4 +27,24 @@ def ikb_project_actions(pid: str, active: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Видалити", callback_data=f"projdel:{pid}"),
         ],
         [InlineKeyboardButton(text="◀️ До списку", callback_data="projects_menu")],
+    ])
+
+
+def ikb_stages_list(pid: str, stages: list) -> InlineKeyboardMarkup:
+    rows = []
+    for s in stages:
+        icon = "✅" if s.get("status") == "done" else "⬜️"
+        title = s.get("title", "")[:28]
+        rows.append([InlineKeyboardButton(text=f"{icon} {title}", callback_data=f"stageopen:{pid}:{s['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Додати етап", callback_data=f"stage_add:{pid}")])
+    rows.append([InlineKeyboardButton(text="◀️ До проєкту", callback_data=f"projopen:{pid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_stage_actions(pid: str, stage_id: str, done: bool) -> InlineKeyboardMarkup:
+    toggle_text = "↩️ Повернути в роботу" if done else "✅ Завершити етап"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"stagetoggle:{pid}:{stage_id}")],
+        [InlineKeyboardButton(text="🗑 Видалити етап", callback_data=f"stagedel:{pid}:{stage_id}")],
+        [InlineKeyboardButton(text="◀️ До етапів", callback_data=f"projstages:{pid}")],
     ])

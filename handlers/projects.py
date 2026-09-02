@@ -13,7 +13,7 @@ from database import projects as projects_db
 from database import tasks as tasks_db
 from services import project_service
 from keyboards.main_menu import kb_main, kb_cancel
-from keyboards.projects import ikb_projects, ikb_project_actions
+from keyboards.projects import ikb_projects, ikb_project_actions, ikb_stages_list, ikb_stage_actions
 from handlers.common import require_auth, fmt_task, user_list_cache
 
 logger = logging.getLogger("tasks_bot")
@@ -25,6 +25,11 @@ class AddProject(StatesGroup):
     description = State()
     has_budget = State()
     budget = State()
+
+
+class AddStage(StatesGroup):
+    title = State()
+    description = State()
 
 
 def _fmt_projects_list(projects: list) -> str:
@@ -42,6 +47,10 @@ def _fmt_projects_list(projects: list) -> str:
             lines.append(f"   _{p['description'][:100]}_")
         if p.get("budget"):
             lines.append(f"   💰 {p.get('spent',0)} / {p.get('budget')} {DEFAULT_CURRENCY}")
+        stages = p.get("stages") or []
+        if stages:
+            done, total = projects_db.stage_progress(p)
+            lines.append(f"   🧩 Етапи: {done}/{total}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -54,6 +63,20 @@ async def _fmt_project_detail(uid: int, p: dict) -> str:
     progress = await project_service.get_project_progress(uid, str(p["_id"]))
     lines.append("")
     lines.append(f"📋 Задач: {progress['done']} / {progress['total']} ({progress['percent']}%)")
+
+    stages = p.get("stages") or []
+    if stages:
+        done, total = projects_db.stage_progress(p)
+        current = projects_db.get_current_stage(p)
+        lines.append("")
+        lines.append(f"🧩 Етапи: {done}/{total}")
+        if current:
+            lines.append(f"▶️ Поточний етап: *{current.get('title','')}*")
+            if current.get("description"):
+                lines.append(f"   _{current['description'][:150]}_")
+        else:
+            lines.append("🎉 Усі етапи завершено!")
+
     if p.get("budget"):
         percent = project_service.budget_percent(p)
         bar = "█" * round(percent / 10) + "░" * (10 - round(percent / 10))
@@ -185,6 +208,150 @@ async def project_budget_cb(cb: CallbackQuery):
 
 
 # =========================================================
+# ЕТАПИ ПРОЄКТУ
+# =========================================================
+
+def _fmt_stage_detail(p: dict, stage: dict) -> str:
+    stages = p.get("stages") or []
+    idx = next((i for i, s in enumerate(stages) if s.get("id") == stage.get("id")), 0)
+    status_text = "✅ Завершено" if stage.get("status") == "done" else "⬜️ У роботі"
+    lines = [
+        f"🧩 *Етап {idx + 1}/{len(stages)}: {stage.get('title','')}*",
+        "",
+        f"Статус: {status_text}",
+    ]
+    if stage.get("description"):
+        lines.append(f"\n📝 {stage['description']}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("projstages:"))
+async def project_stages_cb(cb: CallbackQuery):
+    try:
+        pid = cb.data.split(":", 1)[1]
+        p = await projects_db.get_project(pid)
+        if not p:
+            return await cb.answer("Не знайдено", show_alert=True)
+        stages = p.get("stages") or []
+        text = f"🧩 *Етапи проєкту «{p.get('title','')}»*\n\n"
+        if not stages:
+            text += "Ще немає жодного етапу.\nДодай перший, щоб AI генерував задачі саме під поточний етап роботи."
+        else:
+            done, total = projects_db.stage_progress(p)
+            text += f"Прогрес: {done}/{total}\n\nТисни на етап, щоб побачити опис і позначити виконаним."
+        await cb.message.edit_text(text, reply_markup=ikb_stages_list(pid, stages))
+        await cb.answer()
+    except Exception:
+        logger.exception("project_stages_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("stageopen:"))
+async def stage_open_cb(cb: CallbackQuery):
+    try:
+        _, pid, stage_id = cb.data.split(":", 2)
+        p = await projects_db.get_project(pid)
+        if not p:
+            return await cb.answer("Не знайдено", show_alert=True)
+        stage = next((s for s in (p.get("stages") or []) if s.get("id") == stage_id), None)
+        if not stage:
+            return await cb.answer("Етап не знайдено.", show_alert=True)
+        done = stage.get("status") == "done"
+        await cb.message.edit_text(_fmt_stage_detail(p, stage), reply_markup=ikb_stage_actions(pid, stage_id, done))
+        await cb.answer()
+    except Exception:
+        logger.exception("stage_open_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("stagetoggle:"))
+async def stage_toggle_cb(cb: CallbackQuery):
+    try:
+        _, pid, stage_id = cb.data.split(":", 2)
+        stage = await projects_db.get_stage(pid, stage_id)
+        if not stage:
+            return await cb.answer("Етап не знайдено.", show_alert=True)
+        new_status = "pending" if stage.get("status") == "done" else "done"
+        await projects_db.update_stage(pid, stage_id, {"status": new_status})
+        p = await projects_db.get_project(pid)
+        stage = await projects_db.get_stage(pid, stage_id)
+        await cb.message.edit_text(
+            _fmt_stage_detail(p, stage),
+            reply_markup=ikb_stage_actions(pid, stage_id, new_status == "done"),
+        )
+        await cb.answer("Оновлено")
+    except Exception:
+        logger.exception("stage_toggle_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("stagedel:"))
+async def stage_delete_cb(cb: CallbackQuery):
+    try:
+        _, pid, stage_id = cb.data.split(":", 2)
+        await projects_db.delete_stage(pid, stage_id)
+        p = await projects_db.get_project(pid)
+        stages = (p or {}).get("stages") or []
+        await cb.message.edit_text(
+            f"🧩 *Етапи проєкту «{(p or {}).get('title','')}»*\n\nЕтап видалено.",
+            reply_markup=ikb_stages_list(pid, stages),
+        )
+        await cb.answer("Видалено")
+    except Exception:
+        logger.exception("stage_delete_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("stage_add:"))
+async def stage_add_start(cb: CallbackQuery, state: FSMContext):
+    pid = cb.data.split(":", 1)[1]
+    await state.set_state(AddStage.title)
+    await state.update_data(pid=pid)
+    await cb.message.answer("🧩 Введи назву етапу (коротко, напр. «Дизайн», «Верстка», «Тестування»):", reply_markup=kb_cancel())
+    await cb.answer()
+
+
+@router.message(AddStage.title)
+async def stage_add_title(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+    await state.update_data(title=msg.text.strip()[:100])
+    await state.set_state(AddStage.description)
+    await msg.answer(
+        "📝 Опиши, що саме треба зробити на цьому етапі (це побачить AI при генерації задач). "
+        "Або напиши «-», щоб пропустити:",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(AddStage.description)
+async def stage_add_description(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+
+    desc = "" if msg.text.strip() == "-" else msg.text.strip()[:400]
+    fd = await state.get_data()
+    pid = fd["pid"]
+    title = fd["title"]
+    await state.clear()
+
+    try:
+        await projects_db.add_stage(pid, title, desc)
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+    p = await projects_db.get_project(pid)
+    stages = (p or {}).get("stages") or []
+    await msg.answer("✅ Етап додано!", reply_markup=kb_main())
+    await msg.answer(
+        f"🧩 *Етапи проєкту «{(p or {}).get('title','')}»*\n\nПрогрес: 0/{len(stages)}",
+        reply_markup=ikb_stages_list(pid, stages),
+    )
+
+
+# =========================================================
 # ДОДАВАННЯ ПРОЄКТУ
 # =========================================================
 
@@ -245,7 +412,12 @@ async def project_add_budget(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     await state.clear()
-    await msg.answer("✅ Проєкт додано! AI буде враховувати його при плануванні та аналізі.", reply_markup=kb_main())
+    await msg.answer(
+        "✅ Проєкт додано! AI буде враховувати його при плануванні та аналізі.\n\n"
+        "💡 Порада: додай етапи проєкту (кнопка «🧩 Етапи проєкту» в картці проєкту) — "
+        "тоді AI генеруватиме задачі саме під поточний етап, а не абстрактні задачі по проєкту.",
+        reply_markup=kb_main(),
+    )
 
 
 async def _safe_alert(cb: CallbackQuery):
