@@ -20,6 +20,19 @@
     "risk": str,               # "низький"/"середній"/"високий"
     "reasoning": str,
 }
+
+ВИПРАВЛЕНО (find_opportunities): раніше виклик
+olx_service.search_listings(query=..., max_price=..., limit=...) завжди
+падав з TypeError — реальна сигнатура функції в olx_service.py:
+    search_listings(title_query, max_price, location, radius_km, domain=..., condition=...)
+Немає ані "query", ані "limit"; "location"/"radius_km" — обов'язкові
+позиційні аргументи. Через try/except TypeError мовчки ковтався і функція
+завжди повертала [] — тому розділ "Знайти перепродаж" завжди відповідав
+"Нічого не знайшов за цими критеріями" незалежно від введених даних.
+Тепер виклик відповідає реальній сигнатурі; location="" і radius_km=0
+дають "широкий пошук без прив'язки до локації" — саме так, як і було
+задумано для цієї фічі (search[dist] додається в URL лише якщо location
+непорожній — див. _build_search_url в olx_service.py).
 """
 
 import asyncio
@@ -107,22 +120,30 @@ async def find_opportunities(
     3. Фільтрує за min_profit / min_margin.
     4. Сортує за маржею (дефолтне сортування) і повертає top `count`.
     """
-    # TODO: перевір сигнатуру — підлаштуй під реальний olx_service.py
     try:
         listings = await olx_service.search_listings(
-            query=category,
+            title_query=category or "",
             max_price=budget,
-            limit=MAX_CANDIDATES,
+            location="",
+            radius_km=0,
         )
     except Exception:
         logger.exception("resale_service: OLX search failed (budget=%s, category=%s)", budget, category)
         return []
 
+    if listings is None:
+        # Технічний збій запиту до OLX (403/timeout/мережева помилка) —
+        # відрізняємо від "результатів справді немає" (порожній список).
+        logger.warning("resale_service: OLX search returned None (technical failure) budget=%s category=%s", budget, category)
+        return []
+
     if not listings:
         return []
 
+    listings = listings[:MAX_CANDIDATES]
+
     sem = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
-    tasks = [_analyze_one(listing, min_margin, sem) for listing in listings[:MAX_CANDIDATES]]
+    tasks = [_analyze_one(listing, min_margin, sem) for listing in listings]
     analyzed = await asyncio.gather(*tasks)
 
     results = [r for r in analyzed if r is not None]
@@ -133,9 +154,6 @@ async def find_opportunities(
         results = [r for r in results if r["margin"] >= min_margin]
 
     results.sort(key=lambda r: r["margin"], reverse=True)
-
-    for r in results:
-        r.pop("_speed", None) if False else None  # лишаємо _speed для сортування нижче
 
     return results[:count] if count else results
 
