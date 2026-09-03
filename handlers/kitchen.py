@@ -1,13 +1,30 @@
 """
-НОВИЙ ФАЙЛ: handlers/kitchen.py
+handlers/kitchen.py
 
-Фіча 🍳 Кухня. Стиль повністю відповідає handlers/goals.py та
-handlers/ai_chat.py: Router, StatesGroup для FSM, try/except з
-DBUnavailable → DB_ERROR_TEXT, generic except → лог + safe alert,
-усі дії — через InlineKeyboard.
+ВИПРАВЛЕНО (баг "тап по кнопці Головне меню під час генерації рецепту
+сприймається як назва страви"): раніше в кожному waiting_*-хендлері
+(kitchen_find_msg, kitchen_from_products_msg, kitchen_budget_msg,
+kitchen_single_product_msg, kitchen_substitute_msg) стан FSM скидався
+(`await state.set_state(None)`) ТІЛЬКИ ПІСЛЯ того, як AI вже відповів.
+Поки йшов AI-запит (від секунд до кількох хвилин — залежить від
+завантаженості провайдера), стан лишався в очікуванні тексту. Якщо
+користувач у цей час тис будь-яку reply-кнопку меню (напр. "🏠 Головне
+меню") — це звичайне текстове повідомлення потрапляло в той самий
+хендлер і сприймалось як назва страви/продукту/бюджету, замість того щоб
+відпрацювати навігацію. Симптом: другий "🤖 Генерую рецепт..." замість
+переходу в головне меню.
 
-Точка входу — reply-кнопка "🍳 Кухня" (додана в keyboards/main_menu.py).
-Все інше далі — виключно callback-и (kitchen_*).
+Фікс: стан скидається ОДРАЗУ після валідації вхідного тексту, ДО виклику
+AI — так наступний тап користувача (навіть якщо AI ще не відповів)
+обробляється нормально відповідним хендлером, а не застряє в цьому стані.
+
+Додатково: редагування/видалення "🤖 Генерую..." повідомлення тепер
+загорнуте в try/except TelegramAPIError (як і в _render_recipe/
+_render_cook_step нижче) — раніше необроблений виняток на цьому кроці
+міг залишити повідомлення "Генерую рецепт..." висіти назавжди без жодної
+відповіді користувачу.
+
+Решта файлу — без змін відносно оригіналу.
 """
 
 import logging
@@ -136,6 +153,23 @@ async def _safe_alert(cb: CallbackQuery, text: str = DB_ERROR_TEXT):
         pass
 
 
+async def _safe_edit_or_answer(thinking: Message, text: str, reply_markup=None):
+    """
+    НОВЕ: безпечне оновлення "думаючого" повідомлення. Раніше прямий виклик
+    `thinking.edit_text(...)` без обробки винятку міг залишити повідомлення
+    "🤖 Генерую..." висіти назавжди, якщо edit_text з будь-якої причини
+    падав (наприклад TelegramAPIError) — виняток просто зупиняв обробку
+    без відповіді користувачу.
+    """
+    try:
+        await thinking.edit_text(text, reply_markup=reply_markup)
+    except TelegramAPIError:
+        try:
+            await thinking.answer(text, reply_markup=reply_markup)
+        except TelegramAPIError:
+            logger.exception("kitchen: не вдалося показати результат користувачу (ні edit, ні answer)")
+
+
 # ============================================================
 # ГОЛОВНЕ МЕНЮ КУХНІ
 # ============================================================
@@ -189,12 +223,22 @@ async def kitchen_find_cb(cb: CallbackQuery, state: FSMContext):
 async def kitchen_find_msg(msg: Message, state: FSMContext):
     if not (msg.text or "").strip():
         return await msg.answer("Напиши текстом, яку страву приготувати 🙂")
-    thinking = await msg.answer("🤖 Генерую рецепт...")
-    recipe = await kitchen_service.generate_recipe(msg.text.strip())
+
+    dish_query = msg.text.strip()
+    # ЗМІНЕНО: стан скидається ТУТ, до запиту в AI — щоб будь-який наступний
+    # тап користувача (навіть якщо AI ще не відповів) не сприймався як
+    # продовження цього ж діалогу "яку страву приготувати".
     await state.set_state(None)
+
+    thinking = await msg.answer("🤖 Генерую рецепт...")
+    recipe = await kitchen_service.generate_recipe(dish_query)
     if not recipe:
-        return await thinking.edit_text(AI_ERROR_TEXT)
-    await thinking.delete()
+        return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+
+    try:
+        await thinking.delete()
+    except TelegramAPIError:
+        pass
     await _render_recipe(msg, msg.from_user.id, recipe, state, add_to_history=True)
 
 
@@ -216,14 +260,20 @@ async def kitchen_from_products_cb(cb: CallbackQuery, state: FSMContext):
 async def kitchen_from_products_msg(msg: Message, state: FSMContext):
     if not (msg.text or "").strip():
         return await msg.answer("Напиши текстом, які продукти маєш 🙂")
+
+    ingredients_text = msg.text.strip()
+    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+
     thinking = await msg.answer("🤖 Аналізую продукти...")
-    dishes = await kitchen_service.suggest_from_ingredients(msg.text.strip())
+    dishes = await kitchen_service.suggest_from_ingredients(ingredients_text)
     if not dishes:
-        await state.set_state(None)
-        return await thinking.edit_text(AI_ERROR_TEXT)
-    await state.update_data(suggestions=dishes, suggestion_type="ingredients", suggestion_context=msg.text.strip())
-    await state.set_state(None)
-    await thinking.delete()
+        return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+
+    await state.update_data(suggestions=dishes, suggestion_type="ingredients", suggestion_context=ingredients_text)
+    try:
+        await thinking.delete()
+    except TelegramAPIError:
+        pass
     text = _fmt_suggestions(dishes, "🥕 *З твоїх продуктів можна приготувати:*")
     await msg.answer(text, reply_markup=ikb_dish_list(dishes, back_cb="kitchen_menu"))
 
@@ -278,15 +328,21 @@ async def kitchen_budget_cb(cb: CallbackQuery, state: FSMContext):
 async def kitchen_budget_msg(msg: Message, state: FSMContext):
     if not (msg.text or "").strip():
         return await msg.answer("Напиши бюджет текстом 🙂")
+
+    budget_text = msg.text.strip()
+    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+
     thinking = await msg.answer("🤖 Підбираю варіанти...")
-    dishes = await kitchen_service.suggest_budget(msg.text.strip())
+    dishes = await kitchen_service.suggest_budget(budget_text)
     if not dishes:
-        await state.set_state(None)
-        return await thinking.edit_text(AI_ERROR_TEXT)
-    await state.update_data(suggestions=dishes, suggestion_type="budget", budget_text=msg.text.strip())
-    await state.set_state(None)
-    await thinking.delete()
-    text = _fmt_suggestions(dishes, f"💰 *Страви в межах бюджету «{msg.text.strip()}»:*")
+        return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+
+    await state.update_data(suggestions=dishes, suggestion_type="budget", budget_text=budget_text)
+    try:
+        await thinking.delete()
+    except TelegramAPIError:
+        pass
+    text = _fmt_suggestions(dishes, f"💰 *Страви в межах бюджету «{budget_text}»:*")
     await msg.answer(text, reply_markup=ikb_dish_list(dishes, back_cb="kitchen_menu"))
 
 
@@ -308,15 +364,21 @@ async def kitchen_single_product_cb(cb: CallbackQuery, state: FSMContext):
 async def kitchen_single_product_msg(msg: Message, state: FSMContext):
     if not (msg.text or "").strip():
         return await msg.answer("Напиши назву продукту текстом 🙂")
+
+    product = msg.text.strip()
+    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+
     thinking = await msg.answer("🤖 Підбираю страви...")
-    dishes = await kitchen_service.suggest_from_product(msg.text.strip())
+    dishes = await kitchen_service.suggest_from_product(product)
     if not dishes:
-        await state.set_state(None)
-        return await thinking.edit_text(AI_ERROR_TEXT)
-    await state.update_data(suggestions=dishes, suggestion_type="product", product=msg.text.strip())
-    await state.set_state(None)
-    await thinking.delete()
-    text = _fmt_suggestions(dishes, f"🍗 *Що можна приготувати з «{msg.text.strip()}»:*")
+        return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+
+    await state.update_data(suggestions=dishes, suggestion_type="product", product=product)
+    try:
+        await thinking.delete()
+    except TelegramAPIError:
+        pass
+    text = _fmt_suggestions(dishes, f"🍗 *Що можна приготувати з «{product}»:*")
     await msg.answer(text, reply_markup=ikb_dish_list(dishes, back_cb="kitchen_menu"))
 
 
@@ -495,12 +557,14 @@ async def kitchen_substitute_msg(msg: Message, state: FSMContext):
     if not (msg.text or "").strip():
         return await msg.answer("Напиши назву інгредієнта текстом 🙂")
 
+    missing_item = msg.text.strip()
+    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+
     thinking = await msg.answer("🤖 Підбираю заміну...")
-    answer_text = await kitchen_service.substitute_ingredient(recipe.get("title", ""), msg.text.strip())
-    await state.set_state(None)
+    answer_text = await kitchen_service.substitute_ingredient(recipe.get("title", ""), missing_item)
     if not answer_text:
-        return await thinking.edit_text(AI_ERROR_TEXT)
-    await thinking.edit_text(f"🔄 {answer_text}", reply_markup=ikb_back_to_kitchen())
+        return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+    await _safe_edit_or_answer(thinking, f"🔄 {answer_text}", reply_markup=ikb_back_to_kitchen())
 
 
 # ============================================================
