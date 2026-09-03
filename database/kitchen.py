@@ -1,15 +1,9 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: database/mongo.py
 
-Відносно оригіналу додано 3 нові колекції для розширення фічі OLX:
-  olx_deals_col          — Resale History (вже був safe-guard в database/olx.py,
-                            тепер підключаємо по-справжньому)
-  olx_user_settings_col  — теж вже очікувався database/olx.py через safe-guard
-  olx_search_stats_col   — знімки статистики автопошуків (кількість/середня ціна
-                            на момент кожної перевірки) — база для 🔥 OLX Тренди
-
-Колекції фічі 🍳 Кухня (favorite_recipes_col і т.д.) залишені без змін.
-Усе інше — без змін.
+Єдина зміна відносно оригіналу — додано 4 нові колекції для фічі 🍳 Кухня:
+favorite_recipes_col, recipe_history_col, shopping_items_col, cooking_sessions_col.
+Усе інше (клієнт, db_call, DBUnavailable, ping) — без змін.
 """
 
 import asyncio
@@ -46,14 +40,7 @@ job_feedback_col = None
 creative_generations_col = None
 autoria_saved_col = None
 
-# ---- НОВЕ: Resale History / налаштування користувача OLX ----
-olx_deals_col = None
-olx_user_settings_col = None
-
-# ---- НОВЕ: знімки статистики автопошуків -> база для 🔥 OLX Тренди ----
-olx_search_stats_col = None
-
-# ---- колекції фічі 🍳 Кухня ----
+# ---- НОВЕ: колекції фічі 🍳 Кухня ----
 favorite_recipes_col = None
 recipe_history_col = None
 shopping_items_col = None
@@ -69,7 +56,6 @@ async def init_mongo(mongo_uri: str):
     global job_profiles_col, job_searches_col, job_saved_col, job_feedback_col
     global creative_generations_col
     global autoria_saved_col
-    global olx_deals_col, olx_user_settings_col, olx_search_stats_col
     global favorite_recipes_col, recipe_history_col, shopping_items_col, cooking_sessions_col
 
     mongo_client = AsyncIOMotorClient(
@@ -109,12 +95,7 @@ async def init_mongo(mongo_uri: str):
 
     autoria_saved_col = db["autoria_saved"]
 
-    # ---- НОВЕ ----
-    olx_deals_col = db["olx_deals"]
-    olx_user_settings_col = db["olx_user_settings"]
-    olx_search_stats_col = db["olx_search_stats"]
-
-    # ---- колекції фічі 🍳 Кухня ----
+    # ---- НОВЕ: колекції фічі 🍳 Кухня ----
     favorite_recipes_col = db["favorite_recipes"]
     recipe_history_col = db["recipe_history"]
     shopping_items_col = db["shopping_items"]

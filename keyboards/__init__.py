@@ -1,3 +1,10 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: keyboards/__init__.py
+
+Додано імпорт та реекспорт нових клавіатур keyboards/kitchen.py.
+Решта — без змін.
+"""
+
 from keyboards.main_menu import kb_main, kb_cancel, kb_yes_no, ikb_back, ikb_confirm
 from keyboards.tasks import (
     kb_tasks_menu,
@@ -46,6 +53,18 @@ from keyboards.settings import (
     currency_from_text,
     ikb_archive_clear,
 )
+from keyboards.kitchen import (
+    ikb_kitchen_menu,
+    ikb_quick_time,
+    ikb_dish_list,
+    ikb_recipe_actions,
+    ikb_servings,
+    ikb_cooking_step,
+    ikb_favorites_list,
+    ikb_history_list,
+    ikb_shopping_list,
+    ikb_back_to_kitchen,
+)
 
 __all__ = [
     "kb_main", "kb_cancel", "kb_yes_no", "ikb_back", "ikb_confirm",
@@ -63,4 +82,7 @@ __all__ = [
     "ikb_budgets_list", "ikb_budget_actions",
     "ikb_settings_menu", "kb_currency_select", "currency_from_text",
     "ikb_archive_clear",
+    "ikb_kitchen_menu", "ikb_quick_time", "ikb_dish_list", "ikb_recipe_actions",
+    "ikb_servings", "ikb_cooking_step", "ikb_favorites_list", "ikb_history_list",
+    "ikb_shopping_list", "ikb_back_to_kitchen",
 ]

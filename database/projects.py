@@ -62,10 +62,14 @@ async def delete_project(pid: str):
 # ЕТАПИ ПРОЄКТУ
 # =========================================================
 # Кожен етап: {"id": str, "title": str, "description": str, "status": "pending"|"done", "created_at": str}
-# Явного поля "поточний етап" немає навмисно — поточним вважається ПЕРШИЙ
-# етап зі статусом "pending" (за порядком у масиві). Це прибирає ризик
-# розсинхронізації двох джерел правди (окремий "current_stage_id" міг би
-# вказувати на вже видалений/завершений етап).
+# Порядковий номер етапу = його позиція в масиві "stages" (позиція+1), окреме
+# поле для номера навмисно не заводимо — це прибирає ризик розсинхронізації
+# двох джерел правди при зміні порядку.
+#
+# "Статус" в UI має 3 стани (⏳ Очікує / 🔵 В процесі / ✅ Завершено), але в базі
+# зберігаємо тільки 2 ("pending"/"done") — так само, як і раніше. "В процесі"
+# обчислюється на льоту: це ПЕРШИЙ pending-етап за порядком (get_current_stage).
+# Так гарантовано лише один етап "в процесі" одночасно, без нового поля.
 
 async def add_stage(pid: str, title: str, description: str = "") -> str:
     stage_id = uuid.uuid4().hex[:8]
@@ -78,6 +82,22 @@ async def add_stage(pid: str, title: str, description: str = "") -> str:
     }
     await db_call(m.projects_col.update_one({"_id": ObjectId(pid)}, {"$push": {"stages": stage}}))
     return stage_id
+
+
+async def add_stages_bulk(pid: str, stages: list[dict]) -> None:
+    """Додає одразу декілька етапів — використовується після підтвердження AI-пропозиції."""
+    prepared = []
+    for s in stages:
+        prepared.append({
+            "id": uuid.uuid4().hex[:8],
+            "title": (s.get("title") or "")[:100],
+            "description": (s.get("description") or "")[:400],
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+        })
+    if not prepared:
+        return
+    await db_call(m.projects_col.update_one({"_id": ObjectId(pid)}, {"$push": {"stages": {"$each": prepared}}}))
 
 
 async def get_stages(pid: str) -> list:
@@ -100,12 +120,43 @@ async def update_stage(pid: str, stage_id: str, fields: dict):
     ))
 
 
+async def edit_stage(pid: str, stage_id: str, title: str | None = None, description: str | None = None):
+    """None означає «не змінювати це поле» (на відміну від "" — порожній рядок)."""
+    fields = {}
+    if title is not None:
+        fields["title"] = title
+    if description is not None:
+        fields["description"] = description
+    if fields:
+        await update_stage(pid, stage_id, fields)
+
+
 async def delete_stage(pid: str, stage_id: str):
     await db_call(m.projects_col.update_one({"_id": ObjectId(pid)}, {"$pull": {"stages": {"id": stage_id}}}))
 
 
+async def reorder_stage(pid: str, stage_id: str, direction: str) -> bool:
+    """direction: 'up' або 'down'. Міняє етап місцями із сусіднім у масиві.
+    Повертає True, якщо переміщення відбулось (False — якщо етап уже крайній)."""
+    p = await get_project(pid)
+    if not p:
+        return False
+    stages = list(p.get("stages") or [])
+    idx = next((i for i, s in enumerate(stages) if s.get("id") == stage_id), None)
+    if idx is None:
+        return False
+    if direction == "up" and idx > 0:
+        stages[idx - 1], stages[idx] = stages[idx], stages[idx - 1]
+    elif direction == "down" and idx < len(stages) - 1:
+        stages[idx + 1], stages[idx] = stages[idx], stages[idx + 1]
+    else:
+        return False
+    await db_call(m.projects_col.update_one({"_id": ObjectId(pid)}, {"$set": {"stages": stages}}))
+    return True
+
+
 def get_current_stage(project: dict) -> dict | None:
-    """Перший ще не завершений етап вважається поточним активним етапом проєкту."""
+    """Перший ще не завершений етап вважається поточним активним етапом проєкту (🔵 В процесі)."""
     stages = project.get("stages") or []
     for s in stages:
         if s.get("status") != "done":

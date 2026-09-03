@@ -1,3 +1,13 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: твій головний файл запуску бота (той, що містить main(),
+register_routers(), Bot(...), dp.start_polling(...) — судячи зі скріншотів
+файл-дерева, він у тебе в корені проєкту, назви типу main.py / bot.py).
+
+Заміни весь вміст цього файлу на код нижче.
+Єдина зміна відносно оригіналу — доданий імпорт "kitchen" та рядок
+dp.include_router(kitchen.router). Все інше — 1:1 як було.
+"""
+
 import asyncio
 import logging
 import sys
@@ -74,6 +84,7 @@ def register_routers(dp: Dispatcher) -> None:
         job_profile,
         jobs,
         settings as settings_handlers,
+        kitchen,  # НОВЕ: фіча 🍳 Кухня
     )
 
     dp.include_router(start.router)
@@ -102,6 +113,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(job_profile.router)
     dp.include_router(jobs.router)
     dp.include_router(settings_handlers.router)
+    dp.include_router(kitchen.router)  # НОВЕ: фіча 🍳 Кухня
     dp.include_router(menu.router)
     dp.include_router(finances.router)
 

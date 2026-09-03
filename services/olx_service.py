@@ -38,6 +38,16 @@ DOMAIN_CONFIG = {
     "olx.pl": {"list_path": "/oferty/q-", "referer": "https://www.olx.pl/", "default_currency": "PLN"},
 }
 
+# OLX-параметр стану товару. ВАЖЛИВО: це best-effort за аналогією з уже
+# перевіреним синтаксисом filter_float_price/dist нижче (той самий bracket-
+# стиль search[filter_...]). Я не мав змоги емпірично протестувати цей
+# конкретний параметр проти живого сайту в рамках цієї відповіді. Якщо OLX
+# його ігнорує — гіршого не станеться: сайт просто поверне нефільтрований
+# результат (як і будь-який невідомий параметр), нічого не зламається.
+# Якщо після деплою побачиш, що фільтр не працює — скинь мені реальний URL
+# зі сторінки з застосованим фільтром "Стан: Вживане" з сайту, і я поправлю.
+CONDITION_PARAM_MAP = {"used": "used", "new": "new"}
+
 # Максимум фото, які передаємо в AI.
 MAX_PHOTOS_FOR_AI = 10
 
@@ -232,7 +242,14 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
     return details["price"], details["currency"]
 
 
-def _build_search_url(domain: str, title_query: str, max_price: float | None, location: str, radius_km: int) -> str:
+def _build_search_url(
+    domain: str,
+    title_query: str,
+    max_price: float | None,
+    location: str,
+    radius_km: int,
+    condition: str | None = None,
+) -> str:
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
     # ЗМІНЕНО: раніше пробіли замінялись на "-" без URL-кодування — кириличні
     # символи в такому вигляді інколи ламали запит або давали 0 результатів
@@ -246,6 +263,9 @@ def _build_search_url(domain: str, title_query: str, max_price: float | None, lo
         params.append(f"search[filter_float_price:to]={int(max_price)}")
     if location:
         params.append(f"search[dist]={radius_km}")
+    if condition and condition in CONDITION_PARAM_MAP:
+        # best-effort, див. коментар біля CONDITION_PARAM_MAP вище
+        params.append(f"search[filter_enum_state][0]={CONDITION_PARAM_MAP[condition]}")
     if params:
         base += "?" + "&".join(params)
     return base
@@ -257,6 +277,7 @@ async def search_listings(
     location: str,
     radius_km: int,
     domain: str = "olx.ua",
+    condition: str | None = None,
 ) -> list[dict] | None:
     """
     ЗМІНЕНО: тепер розрізняє два різних випадки, які раніше обидва
@@ -266,9 +287,18 @@ async def search_listings(
       - None  -> технічний збій запиту (сайт заблокував/недоступний),
                  виклик мав би показати користувачу помилку, а не "0 знайдено";
       - []    -> запит виконано успішно, але реальних карток товарів немає.
+
+    НОВЕ: `condition` ("used"/"new") — best-effort фільтр стану товару через
+    URL-параметр (див. CONDITION_PARAM_MAP). Категорія свідомо НЕ підтримується
+    як окремий параметр — OLX прив'язує категорію до дерева URL-шляхів, яке
+    треба або мапити вручну по кожній категорії, або отримувати з окремого
+    API категорій, якого зараз в інтеграції немає. Тому "категорія" з боку
+    користувача (аукціон навпаки, п.1 ТЗ) наразі приймається як додаткове
+    текстове уточнення до пошукового запиту, а не як справжній фільтр дерева
+    категорій — це чесно позначено в UI хендлера.
     """
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
-    url = _build_search_url(domain, title_query, max_price, location, radius_km)
+    url = _build_search_url(domain, title_query, max_price, location, radius_km, condition)
     headers = _domain_headers(domain)
 
     try:
@@ -318,3 +348,11 @@ async def search_listings(
         })
 
     return results
+
+
+def sort_by_price(results: list[dict], ascending: bool = True) -> list[dict]:
+    """НОВЕ: допоміжна функція для 🔨 Аукціон навпаки — сортування карток з ціною, без ціни в кінець."""
+    priced = [r for r in results if r.get("price") is not None]
+    unpriced = [r for r in results if r.get("price") is None]
+    priced.sort(key=lambda r: r["price"], reverse=not ascending)
+    return priced + unpriced
