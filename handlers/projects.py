@@ -6,9 +6,11 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
+from bson import ObjectId
 
 from config.constants import PROJECT_ACTIVE, DB_ERROR_TEXT, DEFAULT_CURRENCY
-from database.mongo import DBUnavailable
+from database.mongo import DBUnavailable, db_call
+from database import mongo as m
 from database import projects as projects_db
 from database import tasks as tasks_db
 from services import project_service
@@ -19,6 +21,7 @@ from keyboards.projects import (
     ikb_stages_list,
     ikb_stage_actions,
     ikb_stages_ai_confirm,
+    ikb_budget_edit,
 )
 from handlers.common import require_auth, fmt_task, user_list_cache
 
@@ -41,6 +44,11 @@ class AddStage(StatesGroup):
 class EditStage(StatesGroup):
     title = State()
     description = State()
+
+
+# НОВЕ: FSM для задання/зміни бюджету проєкту вже ПІСЛЯ його створення
+class SetBudget(StatesGroup):
+    amount = State()
 
 
 def _fmt_projects_list(projects: list) -> str:
@@ -198,27 +206,116 @@ async def project_tasks_cb(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
+# =========================================================
+# 💰 БЮДЖЕТ ПРОЄКТУ
+# =========================================================
+# ЗМІНЕНО: раніше, якщо бюджет не був заданий при створенні проєкту,
+# кнопка "💰 Бюджет проєкту" вела в глухий кут (просто alert
+# "У цього проєкту не задано бюджет" без жодної дії). Тепер вона сама
+# пропонує його задати. Якщо бюджет уже є — показує прогрес і додає
+# кнопку "✏️ Змінити бюджет".
+
+async def _set_project_budget(pid: str, budget: float) -> None:
+    """Записує/оновлює бюджет проєкту напряму через projects_col.
+    Зроблено локально в цьому файлі (а не через projects_db/project_service),
+    щоб не чіпати ті модулі, поки не бачив їхню актуальну версію в репо."""
+    await db_call(m.projects_col.update_one({"_id": ObjectId(pid)}, {"$set": {"budget": budget}}))
+    # "spent" ініціалізується нулем, лише якщо його ще не було (щоб не обнулити
+    # вже накопичені витрати при простій ЗМІНІ суми бюджету).
+    await db_call(
+        m.projects_col.update_one({"_id": ObjectId(pid), "spent": {"$exists": False}}, {"$set": {"spent": 0}}),
+        raise_on_fail=False,
+    )
+
+
 @router.callback_query(F.data.startswith("projbudget:"))
-async def project_budget_cb(cb: CallbackQuery):
+async def project_budget_cb(cb: CallbackQuery, state: FSMContext):
     try:
         pid = cb.data.split(":", 1)[1]
         p = await projects_db.get_project(pid)
         if not p:
             return await cb.answer("Не знайдено", show_alert=True)
+
         if not p.get("budget"):
-            await cb.answer("У цього проєкту не задано бюджет.", show_alert=True)
+            # Бюджету ще немає — одразу пропонуємо задати, замість глухого alert.
+            await state.set_state(SetBudget.amount)
+            await state.update_data(pid=pid)
+            await cb.answer()
+            await cb.message.answer(
+                f"💰 У проєкту «{p.get('title','')}» ще не задано бюджет.\n\n"
+                f"Введи суму бюджету в {DEFAULT_CURRENCY} (наприклад 500000):",
+                reply_markup=kb_cancel(),
+            )
             return
+
         percent = project_service.budget_percent(p)
         bar = "█" * round(percent / 10) + "░" * (10 - round(percent / 10))
         await cb.message.answer(
             f"💰 *Бюджет проєкту «{p.get('title','')}»*\n\n"
             f"{bar} {percent}%\n"
-            f"Витрачено: {p.get('spent',0)} / {p.get('budget')} {DEFAULT_CURRENCY}"
+            f"Витрачено: {p.get('spent',0)} / {p.get('budget')} {DEFAULT_CURRENCY}",
+            reply_markup=ikb_budget_edit(pid),
         )
         await cb.answer()
     except Exception:
         logger.exception("project_budget_cb failed")
         await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("projbudget_edit:"))
+async def project_budget_edit_start(cb: CallbackQuery, state: FSMContext):
+    try:
+        pid = cb.data.split(":", 1)[1]
+        p = await projects_db.get_project(pid)
+        if not p:
+            return await cb.answer("Не знайдено", show_alert=True)
+        await state.set_state(SetBudget.amount)
+        await state.update_data(pid=pid)
+        await cb.message.answer(
+            f"✏️ Поточний бюджет: {p.get('budget')} {DEFAULT_CURRENCY}\n\n"
+            f"Введи нову суму бюджету в {DEFAULT_CURRENCY}:",
+            reply_markup=kb_cancel(),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("project_budget_edit_start failed")
+        await _safe_alert(cb)
+
+
+@router.message(SetBudget.amount)
+async def project_budget_amount_msg(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+
+    raw = msg.text.strip().replace(",", ".").replace(" ", "")
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        return await msg.answer("⚠️ Введи додатнє число, наприклад 500000:", reply_markup=kb_cancel())
+
+    fd = await state.get_data()
+    pid = fd.get("pid")
+    await state.clear()
+
+    if not pid:
+        return await msg.answer("Проєкт не знайдено, спробуй ще раз через меню проєктів.", reply_markup=kb_main())
+
+    try:
+        await _set_project_budget(pid, amount)
+    except DBUnavailable:
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+    p = await projects_db.get_project(pid)
+    if not p:
+        return await msg.answer("✅ Бюджет збережено!", reply_markup=kb_main())
+
+    active = p.get("status") == PROJECT_ACTIVE
+    text = await _fmt_project_detail(msg.from_user.id, p)
+    await msg.answer("✅ Бюджет збережено!", reply_markup=kb_main())
+    await msg.answer(text, reply_markup=ikb_project_actions(pid, active))
 
 
 # =========================================================

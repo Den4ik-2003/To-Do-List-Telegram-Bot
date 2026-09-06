@@ -82,3 +82,12 @@ def ikb_stages_ai_confirm(pid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Згенерувати ще раз", callback_data=f"stages_ai:{pid}")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"stages_ai_cancel:{pid}")],
     ])
+
+
+# НОВЕ: клавіатура під переглядом бюджету, коли він уже задано —
+# дає можливість його змінити, а не лише подивитись.
+def ikb_budget_edit(pid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Змінити бюджет", callback_data=f"projbudget_edit:{pid}")],
+        [InlineKeyboardButton(text="◀️ До проєкту", callback_data=f"projopen:{pid}")],
+    ])
