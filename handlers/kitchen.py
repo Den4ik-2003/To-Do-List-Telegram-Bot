@@ -1,30 +1,22 @@
 """
 handlers/kitchen.py
 
-ВИПРАВЛЕНО (баг "тап по кнопці Головне меню під час генерації рецепту
-сприймається як назва страви"): раніше в кожному waiting_*-хендлері
-(kitchen_find_msg, kitchen_from_products_msg, kitchen_budget_msg,
-kitchen_single_product_msg, kitchen_substitute_msg) стан FSM скидався
-(`await state.set_state(None)`) ТІЛЬКИ ПІСЛЯ того, як AI вже відповів.
-Поки йшов AI-запит (від секунд до кількох хвилин — залежить від
-завантаженості провайдера), стан лишався в очікуванні тексту. Якщо
-користувач у цей час тис будь-яку reply-кнопку меню (напр. "🏠 Головне
-меню") — це звичайне текстове повідомлення потрапляло в той самий
-хендлер і сприймалось як назва страви/продукту/бюджету, замість того щоб
-відпрацювати навігацію. Симптом: другий "🤖 Генерую рецепт..." замість
-переходу в головне меню.
+ЗМІНЕНО (баг "AI-планувальник тимчасово недоступний" без пояснення причини):
+Кухня раніше не перевіряла і не рахувала спільний денний AI-ліміт
+(AI_DAILY_LIMIT / ai_usage_db), на відміну від усіх інших AI-фіч бота
+(ai_chat.py, ai_planner.py тощо). Через це:
+  1. Користувач бачив загальний AI_ERROR_TEXT навіть тоді, коли причина —
+     вичерпаний денний ліміт запитів (мав би бачити AI_LIMIT_TEXT).
+  2. Кухня могла необмежено витрачати спільну квоту, не позначаючи це
+     ніде, тоді як інші фічі вважають кожен свій виклик "одним запитом".
+Тепер перед кожним AI-викликом перевіряється remaining, а після успішної
+відповіді викликається increment_usage — так само, як у решті бота.
 
-Фікс: стан скидається ОДРАЗУ після валідації вхідного тексту, ДО виклику
-AI — так наступний тап користувача (навіть якщо AI ще не відповів)
-обробляється нормально відповідним хендлером, а не застряє в цьому стані.
+Раніше виправлений баг "тап по кнопці Головне меню під час генерації
+рецепту сприймається як назва страви" — лишається виправленим (стан
+FSM скидається одразу після валідації вводу, до виклику AI).
 
-Додатково: редагування/видалення "🤖 Генерую..." повідомлення тепер
-загорнуте в try/except TelegramAPIError (як і в _render_recipe/
-_render_cook_step нижче) — раніше необроблений виняток на цьому кроці
-міг залишити повідомлення "Генерую рецепт..." висіти назавжди без жодної
-відповіді користувачу.
-
-Решта файлу — без змін відносно оригіналу.
+Решта файлу — без змін відносно попередньої версії.
 """
 
 import logging
@@ -35,10 +27,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 
-from config.constants import DB_ERROR_TEXT, AI_ERROR_TEXT
+from config.constants import DB_ERROR_TEXT, AI_ERROR_TEXT, AI_LIMIT_TEXT
+from config.settings import AI_DAILY_LIMIT
 from database.mongo import DBUnavailable
 from database import kitchen as kitchen_db
-from services import kitchen_service
+from database import ai_usage as ai_usage_db
+from services import kitchen_service, ai_service
 from keyboards.main_menu import kb_main
 from keyboards.kitchen import (
     ikb_kitchen_menu,
@@ -64,6 +58,31 @@ class KitchenStates(StatesGroup):
     waiting_budget = State()
     waiting_single_product = State()
     waiting_substitute = State()
+
+
+# ============================================================
+# ПЕРЕВІРКА ДОСТУПНОСТІ / ЛІМІТУ AI
+# ============================================================
+
+async def _check_ai_or_notify(target) -> bool:
+    """
+    Повертає True, якщо можна робити AI-запит. Інакше сама показує
+    користувачу відповідне повідомлення (недоступність або вичерпаний
+    ліміт) і повертає False.
+    target — Message або CallbackQuery.message (куди відповісти).
+    """
+    if not ai_service.is_available():
+        await target.answer(AI_ERROR_TEXT)
+        return False
+    return True
+
+
+async def _check_ai_limit_or_notify(uid: int, target) -> bool:
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await target.answer(AI_LIMIT_TEXT)
+        return False
+    return True
 
 
 # ============================================================
@@ -154,13 +173,6 @@ async def _safe_alert(cb: CallbackQuery, text: str = DB_ERROR_TEXT):
 
 
 async def _safe_edit_or_answer(thinking: Message, text: str, reply_markup=None):
-    """
-    НОВЕ: безпечне оновлення "думаючого" повідомлення. Раніше прямий виклик
-    `thinking.edit_text(...)` без обробки винятку міг залишити повідомлення
-    "🤖 Генерую..." висіти назавжди, якщо edit_text з будь-якої причини
-    падав (наприклад TelegramAPIError) — виняток просто зупиняв обробку
-    без відповіді користувачу.
-    """
     try:
         await thinking.edit_text(text, reply_markup=reply_markup)
     except TelegramAPIError:
@@ -225,21 +237,25 @@ async def kitchen_find_msg(msg: Message, state: FSMContext):
         return await msg.answer("Напиши текстом, яку страву приготувати 🙂")
 
     dish_query = msg.text.strip()
-    # ЗМІНЕНО: стан скидається ТУТ, до запиту в AI — щоб будь-який наступний
-    # тап користувача (навіть якщо AI ще не відповів) не сприймався як
-    # продовження цього ж діалогу "яку страву приготувати".
     await state.set_state(None)
+
+    uid = msg.from_user.id
+    if not await _check_ai_or_notify(msg):
+        return
+    if not await _check_ai_limit_or_notify(uid, msg):
+        return
 
     thinking = await msg.answer("🤖 Генерую рецепт...")
     recipe = await kitchen_service.generate_recipe(dish_query)
     if not recipe:
         return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
 
+    await ai_usage_db.increment_usage(uid)
     try:
         await thinking.delete()
     except TelegramAPIError:
         pass
-    await _render_recipe(msg, msg.from_user.id, recipe, state, add_to_history=True)
+    await _render_recipe(msg, uid, recipe, state, add_to_history=True)
 
 
 # ============================================================
@@ -262,13 +278,20 @@ async def kitchen_from_products_msg(msg: Message, state: FSMContext):
         return await msg.answer("Напиши текстом, які продукти маєш 🙂")
 
     ingredients_text = msg.text.strip()
-    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+    await state.set_state(None)
+
+    uid = msg.from_user.id
+    if not await _check_ai_or_notify(msg):
+        return
+    if not await _check_ai_limit_or_notify(uid, msg):
+        return
 
     thinking = await msg.answer("🤖 Аналізую продукти...")
     dishes = await kitchen_service.suggest_from_ingredients(ingredients_text)
     if not dishes:
         return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
 
+    await ai_usage_db.increment_usage(uid)
     await state.update_data(suggestions=dishes, suggestion_type="ingredients", suggestion_context=ingredients_text)
     try:
         await thinking.delete()
@@ -297,6 +320,16 @@ async def kitchen_quick_time_cb(cb: CallbackQuery, state: FSMContext):
         minutes = int(cb.data.split(":", 1)[1])
     except ValueError:
         return await cb.answer()
+
+    uid = cb.from_user.id
+    if not ai_service.is_available():
+        await cb.answer()
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await cb.answer()
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_back_to_kitchen())
+
     await cb.answer()
     try:
         await cb.message.edit_text("🤖 Підбираю швидкі рецепти...")
@@ -305,6 +338,7 @@ async def kitchen_quick_time_cb(cb: CallbackQuery, state: FSMContext):
     dishes = await kitchen_service.suggest_quick(minutes)
     if not dishes:
         return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
+    await ai_usage_db.increment_usage(uid)
     await state.update_data(suggestions=dishes, suggestion_type="quick", time_limit=minutes)
     text = _fmt_suggestions(dishes, f"⚡ *Страви до {minutes} хв:*")
     await cb.message.edit_text(text, reply_markup=ikb_dish_list(dishes, back_cb="kitchen_menu"))
@@ -330,13 +364,20 @@ async def kitchen_budget_msg(msg: Message, state: FSMContext):
         return await msg.answer("Напиши бюджет текстом 🙂")
 
     budget_text = msg.text.strip()
-    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+    await state.set_state(None)
+
+    uid = msg.from_user.id
+    if not await _check_ai_or_notify(msg):
+        return
+    if not await _check_ai_limit_or_notify(uid, msg):
+        return
 
     thinking = await msg.answer("🤖 Підбираю варіанти...")
     dishes = await kitchen_service.suggest_budget(budget_text)
     if not dishes:
         return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
 
+    await ai_usage_db.increment_usage(uid)
     await state.update_data(suggestions=dishes, suggestion_type="budget", budget_text=budget_text)
     try:
         await thinking.delete()
@@ -366,13 +407,20 @@ async def kitchen_single_product_msg(msg: Message, state: FSMContext):
         return await msg.answer("Напиши назву продукту текстом 🙂")
 
     product = msg.text.strip()
-    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+    await state.set_state(None)
+
+    uid = msg.from_user.id
+    if not await _check_ai_or_notify(msg):
+        return
+    if not await _check_ai_limit_or_notify(uid, msg):
+        return
 
     thinking = await msg.answer("🤖 Підбираю страви...")
     dishes = await kitchen_service.suggest_from_product(product)
     if not dishes:
         return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
 
+    await ai_usage_db.increment_usage(uid)
     await state.update_data(suggestions=dishes, suggestion_type="product", product=product)
     try:
         await thinking.delete()
@@ -412,6 +460,15 @@ async def kitchen_pick_cb(cb: CallbackQuery, state: FSMContext):
         context_parts.append(f"Основний інгредієнт, який треба використати: {fd.get('product', '')}.")
     context_text = " ".join(context_parts) or "Немає додаткового контексту."
 
+    uid = cb.from_user.id
+    if not ai_service.is_available():
+        await cb.answer()
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await cb.answer()
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_back_to_kitchen())
+
     await cb.answer()
     try:
         await cb.message.edit_text("🤖 Генерую повний рецепт...")
@@ -422,7 +479,8 @@ async def kitchen_pick_cb(cb: CallbackQuery, state: FSMContext):
     if not recipe:
         return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
 
-    await _render_recipe(cb.message, cb.from_user.id, recipe, state, add_to_history=True)
+    await ai_usage_db.increment_usage(uid)
+    await _render_recipe(cb.message, uid, recipe, state, add_to_history=True)
 
 
 # ============================================================
@@ -435,6 +493,16 @@ async def kitchen_recipe_regen_cb(cb: CallbackQuery, state: FSMContext):
     recipe = fd.get("current_recipe")
     if not recipe:
         return await _safe_alert(cb, "Рецепт не знайдено, спробуй згенерувати новий.")
+
+    uid = cb.from_user.id
+    if not ai_service.is_available():
+        await cb.answer()
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await cb.answer()
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_back_to_kitchen())
+
     await cb.answer()
     try:
         await cb.message.edit_text("🤖 Генерую інший варіант...")
@@ -443,7 +511,8 @@ async def kitchen_recipe_regen_cb(cb: CallbackQuery, state: FSMContext):
     new_recipe = await kitchen_service.generate_recipe(recipe.get("title", ""), alt=True)
     if not new_recipe:
         return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
-    await _render_recipe(cb.message, cb.from_user.id, new_recipe, state, add_to_history=True)
+    await ai_usage_db.increment_usage(uid)
+    await _render_recipe(cb.message, uid, new_recipe, state, add_to_history=True)
 
 
 @router.callback_query(F.data == "kitchen_recipe_fav")
@@ -506,10 +575,21 @@ async def kitchen_servings_pick_cb(cb: CallbackQuery, state: FSMContext):
         return await _safe_alert(cb, "Рецепт не знайдено.")
 
     from_servings = recipe.get("servings", 2)
-    await cb.answer()
-    if from_servings == new_servings:
-        return await _render_recipe(cb.message, cb.from_user.id, recipe, state, add_to_history=False)
+    uid = cb.from_user.id
 
+    if from_servings == new_servings:
+        await cb.answer()
+        return await _render_recipe(cb.message, uid, recipe, state, add_to_history=False)
+
+    if not ai_service.is_available():
+        await cb.answer()
+        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await cb.answer()
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_back_to_kitchen())
+
+    await cb.answer()
     try:
         await cb.message.edit_text("🤖 Перераховую інгредієнти...")
     except TelegramAPIError:
@@ -519,9 +599,10 @@ async def kitchen_servings_pick_cb(cb: CallbackQuery, state: FSMContext):
     if new_ings is None:
         return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_back_to_kitchen())
 
+    await ai_usage_db.increment_usage(uid)
     recipe["ingredients"] = new_ings
     recipe["servings"] = new_servings
-    await _render_recipe(cb.message, cb.from_user.id, recipe, state, add_to_history=False)
+    await _render_recipe(cb.message, uid, recipe, state, add_to_history=False)
 
 
 @router.callback_query(F.data == "kitchen_recipe_back")
@@ -558,12 +639,19 @@ async def kitchen_substitute_msg(msg: Message, state: FSMContext):
         return await msg.answer("Напиши назву інгредієнта текстом 🙂")
 
     missing_item = msg.text.strip()
-    await state.set_state(None)  # ЗМІНЕНО: скидання до AI-запиту
+    await state.set_state(None)
+
+    uid = msg.from_user.id
+    if not await _check_ai_or_notify(msg):
+        return
+    if not await _check_ai_limit_or_notify(uid, msg):
+        return
 
     thinking = await msg.answer("🤖 Підбираю заміну...")
     answer_text = await kitchen_service.substitute_ingredient(recipe.get("title", ""), missing_item)
     if not answer_text:
         return await _safe_edit_or_answer(thinking, AI_ERROR_TEXT)
+    await ai_usage_db.increment_usage(uid)
     await _safe_edit_or_answer(thinking, f"🔄 {answer_text}", reply_markup=ikb_back_to_kitchen())
 
 

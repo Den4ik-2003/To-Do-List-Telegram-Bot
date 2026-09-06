@@ -1,9 +1,16 @@
 """
-НОВИЙ ФАЙЛ: services/kitchen_service.py
+services/kitchen_service.py
 
 Уся AI-логіка фічі 🍳 Кухня. НЕ створює власного AI-клієнта — повністю
 використовує вже наявний services/ai_service.py (generate_json/generate_text),
 той самий провайдер/модель/ключ, що й решта бота.
+
+ЗМІНЕНО: додано retry (2 спроби) навколо кожного виклику AI. Безкоштовна
+модель (google/gemini-2.0-flash-exp:free) регулярно разово не відповідає
+або повертає невалідний JSON — раніше це одразу показувало користувачу
+"AI недоступний", хоча повторний виклик за секунду міг спрацювати
+нормально. Retry живе тут, а не в ai_service.py, щоб не змінювати
+поведінку інших фіч, які вже мають власну обробку помилок.
 
 Формат рецепту (уніфікований JSON, який повертає AI):
 {
@@ -17,11 +24,14 @@
 }
 """
 
+import asyncio
 import logging
 
 from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
+
+_RETRY_ATTEMPTS = 2
 
 _SAFETY_NOTE = (
     "Обов'язково вказуй потрібну термічну обробку м'яса, риби, яєць там, де це "
@@ -40,6 +50,32 @@ _RECIPE_JSON_SCHEMA = (
     '"steps": ["крок 1", "крок 2", "..."]}\n'
     "Пиши українською мовою. " + _SAFETY_NOTE
 )
+
+
+async def _generate_json_retry(prompt: str, temperature: float) -> dict | None:
+    last_result = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        result = await ai_service.generate_json(prompt, temperature=temperature)
+        if result:
+            return result
+        last_result = result
+        if attempt < _RETRY_ATTEMPTS:
+            logger.warning("kitchen: generate_json порожній результат, спроба %s/%s", attempt, _RETRY_ATTEMPTS)
+            await asyncio.sleep(1)
+    return last_result
+
+
+async def _generate_text_retry(prompt: str, temperature: float) -> str | None:
+    last_result = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        result = await ai_service.generate_text(prompt, temperature=temperature)
+        if result:
+            return result
+        last_result = result
+        if attempt < _RETRY_ATTEMPTS:
+            logger.warning("kitchen: generate_text порожній результат, спроба %s/%s", attempt, _RETRY_ATTEMPTS)
+            await asyncio.sleep(1)
+    return last_result
 
 
 def _safe_recipe(data: dict | None) -> dict | None:
@@ -71,7 +107,7 @@ async def generate_recipe(dish_query: str, alt: bool = False) -> dict | None:
         f'Користувач хоче приготувати: "{dish_query}".{alt_note}\n'
         f"Згенеруй повний зрозумілий рецепт цієї страви.\n{_RECIPE_JSON_SCHEMA}"
     )
-    data = await ai_service.generate_json(prompt, temperature=0.6)
+    data = await _generate_json_retry(prompt, temperature=0.6)
     return _safe_recipe(data)
 
 
@@ -81,7 +117,7 @@ async def generate_recipe_with_context(title: str, context_text: str) -> dict | 
         f'Згенеруй повний рецепт страви "{title}".\n'
         f"Контекст, який треба врахувати: {context_text}\n{_RECIPE_JSON_SCHEMA}"
     )
-    data = await ai_service.generate_json(prompt, temperature=0.6)
+    data = await _generate_json_retry(prompt, temperature=0.6)
     return _safe_recipe(data)
 
 
@@ -102,7 +138,7 @@ async def suggest_from_ingredients(ingredients_text: str) -> list[dict] | None:
         '"have_note": "коротко що з наявного підходить", '
         '"missing_note": "чого бракує, або порожній рядок"}]}'
     )
-    data = await ai_service.generate_json(prompt, temperature=0.7)
+    data = await _generate_json_retry(prompt, temperature=0.7)
     if not data or not isinstance(data.get("dishes"), list):
         return None
     return data["dishes"][:5]
@@ -122,7 +158,7 @@ async def suggest_quick(minutes: int, extra_text: str = "") -> list[dict] | None
         "Категорично не пропонуй страви, які фізично неможливо встигнути "
         "приготувати за вказаний час."
     )
-    data = await ai_service.generate_json(prompt, temperature=0.7)
+    data = await _generate_json_retry(prompt, temperature=0.7)
     if not data or not isinstance(data.get("dishes"), list):
         return None
     return data["dishes"][:4]
@@ -141,7 +177,7 @@ async def suggest_budget(budget_text: str) -> list[dict] | None:
         'Поверни ЛИШЕ JSON: {"dishes": [{"title": "назва", "emoji": "емодзі", '
         '"estimated_cost": "приблизна вартість, напр. \'~90 грн\'"}]}'
     )
-    data = await ai_service.generate_json(prompt, temperature=0.7)
+    data = await _generate_json_retry(prompt, temperature=0.7)
     if not data or not isinstance(data.get("dishes"), list):
         return None
     return data["dishes"][:4]
@@ -158,7 +194,7 @@ async def suggest_from_product(product: str) -> list[dict] | None:
         'Поверни ЛИШЕ JSON: {"dishes": [{"title": "назва", "emoji": "емодзі"}]} '
         "(рівно 5 елементів)"
     )
-    data = await ai_service.generate_json(prompt, temperature=0.7)
+    data = await _generate_json_retry(prompt, temperature=0.7)
     if not data or not isinstance(data.get("dishes"), list):
         return None
     return data["dishes"][:5]
@@ -175,7 +211,7 @@ async def substitute_ingredient(recipe_title: str, missing_item: str) -> str | N
         "чи результат. Відповідай простим текстом українською, без "
         "markdown-заголовків, компактно (до 5 речень)."
     )
-    return await ai_service.generate_text(prompt, temperature=0.5)
+    return await _generate_text_retry(prompt, temperature=0.5)
 
 
 # ============================================================
@@ -196,7 +232,7 @@ async def scale_ingredients(ingredients: list[str], from_servings: int, to_servi
         "має ЗБІГАТИСЯ з вхідним списком, і кількість елементів має бути та сама.\n"
         'Поверни ЛИШЕ JSON: {"ingredients": ["перерахований інгредієнт 1", "..."]}'
     )
-    data = await ai_service.generate_json(prompt, temperature=0.3)
+    data = await _generate_json_retry(prompt, temperature=0.3)
     if not data or not isinstance(data.get("ingredients"), list):
         return None
     if len(data["ingredients"]) != len(ingredients):
