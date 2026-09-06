@@ -482,17 +482,6 @@ _SKU_CODE_RE = re.compile(
     r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
 )
 
-# Назви товарів приходять "сирими" з OLX і можуть містити символи, які
-# Telegram сприймає як (недопарну) Markdown-розмітку — *, _, [, ], ` — і тоді
-# ВСЕ повідомлення падає з "can't find end of the entity", навіть якщо ламає
-# формат лише один символ в одному товарі. Екрануємо їх перед вставкою в
-# markdown-форматоване повідомлення.
-_MD_SPECIAL_RE = re.compile(r"([_*\[\]`])")
-
-
-def _md_escape(text) -> str:
-    return _MD_SPECIAL_RE.sub(r"\\\1", str(text or ""))
-
 
 def _clean_query_text(text) -> str:
     if text is None:
@@ -538,20 +527,21 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
 
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
-    await cb.answer("Шукаю схожі оголошення...")
+    await cb.answer()
 
     tid = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
+    wait_msg = await cb.message.answer("🔎 Шукаю схожі оголошення...")
 
     try:
         tracker = await olx_db.get_tracker(tid)
         if not tracker or tracker.get("uid") != uid:
-            return await cb.message.answer("⚠️ Підписку не знайдено.")
+            return await wait_msg.edit_text("⚠️ Підписку не знайдено.")
 
         analysis = tracker.get("resale_analysis") or {}
         query_text = _build_similar_query(analysis, tracker)
         if not query_text:
-            return await cb.message.answer(
+            return await wait_msg.edit_text(
                 "⚠️ Не вдалося визначити назву товару для пошуку (заголовок оголошення "
                 "містить лише артикул/код без назви). Спробуй спершу зробити AI-аналіз "
                 "(«🤖 AI Resale Hunter: оцінити»)."
@@ -561,7 +551,7 @@ async def olx_similar_cb(cb: CallbackQuery):
         results = await olx_service.search_listings(query_text, None, "", 0, domain=domain)
 
         if results is None:
-            return await cb.message.answer(
+            return await wait_msg.edit_text(
                 "⚠️ Не вдалося виконати пошук на OLX прямо зараз (сайт тимчасово "
                 "заблокував запит або недоступний). Спробуй ще раз за хвилину."
             )
@@ -575,21 +565,26 @@ async def olx_similar_cb(cb: CallbackQuery):
             # fallback-картки, які search_listings() уже відкинув — в обох
             # випадках чесно кажемо, що реально схожого нічого не знайдено,
             # а не показуємо випадкові товари.
-            return await cb.message.answer(
+            return await wait_msg.edit_text(
                 f"📭 Схожих оголошень за «{query_text}» не знайдено. "
                 f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
             )
 
-        lines = [f"🔎 *Схожі оголошення* — «{_md_escape(query_text)}»", ""]
+        # Назви товарів і URL приходять "сирими" з OLX і можуть містити будь-які
+        # символи (*, _, [, ] тощо), тому це повідомлення навмисно надсилається
+        # БЕЗ парсингу Markdown/HTML (parse_mode="") — інакше один "кривий"
+        # символ в одному товарі ламає ВСЕ повідомлення помилкою
+        # "can't find end of the entity", навіть після ручного екранування.
+        lines = [f"🔎 Схожі оголошення — «{query_text}»", ""]
         for r in results:
             price_text = f"{r['price']:.0f} {r['currency']}" if r.get("price") else "ціна не вказана"
-            lines.append(f"• {_md_escape(r['title'])} — {price_text}")
+            lines.append(f"• {r['title']} — {price_text}")
             lines.append(f"  {r['url']}")
-        await cb.message.answer("\n".join(lines))
+        await wait_msg.edit_text("\n".join(lines), parse_mode="")
     except Exception:
         logger.exception("olx_similar_cb failed for tracker=%s uid=%s", tid, uid)
         try:
-            await cb.message.answer("⚠️ Сталася технічна помилка під час пошуку схожих. Спробуй ще раз.")
+            await wait_msg.edit_text("⚠️ Сталася технічна помилка під час пошуку схожих. Спробуй ще раз.")
         except Exception:
             pass
 
