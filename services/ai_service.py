@@ -1,3 +1,42 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/ai_service.py
+
+КОРІНЬ ПРОБЛЕМИ "AI повернув некоректний JSON: " (порожній рядок після
+двокрапки) видно прямо в traceback: json.decoder.JSONDecodeError:
+Expecting value: line 1 column 1 (char 0). Це означає, що AI відповів
+HTTP 200 OK, АЛЕ content відповіді був ПОРОЖНІМ рядком. json.loads("")
+завжди падає саме так — це не проблема парсингу, це AI віддав пусту
+відповідь.
+
+Це типова поведінка деяких reasoning-моделей через OpenRouter в режимі
+response_format=json_object: модель "думає" (внутрішній reasoning), і
+іноді не встигає/не може сформувати фінальний текстовий content —
+провайдер все одно повертає 200 OK з порожнім message.content замість
+помилки. Раніше жодного захисту від цього не було: одна порожня
+відповідь = мовчазний None → "AI-планувальник тимчасово недоступний"
+у ВСІХ розділах бота, що юзають generate_json (кухня, AI-планувальник,
+чек, фото товару) — це і пояснює, чому повідомлення "з'являлось часто
+в різних розділах".
+
+ВИПРАВЛЕННЯ (застосовано у всіх функціях, що звертаються до AI):
+1. Якщо content порожній — робимо ОДИН автоматичний повторний запит
+   (з тими самими параметрами) ПЕРЕД тим, як здатися. Порожня відповідь
+   здебільшого не повторюється двічі поспіль.
+2. Логуємо finish_reason відповіді при порожньому content — це дає
+   реальну діагностику (напр. "length" означало б, що reasoning з'їв
+   увесь ліміт токенів і треба збільшувати max_tokens — тоді знатимемо
+   напевно, а не гадатимемо).
+3. Дублікатну логіку виклику chat.completions.create (з fallback без
+   response_format) винесено в один спільний хелпер _chat_completion(),
+   яким тепер користуються generate_json, extract_receipt та
+   analyze_product_photo — щоб цей самий фікс не довелось окремо
+   копіювати ще в два місця і не забути десь оновити в майбутньому.
+
+Публічні сигнатури функцій (generate_text/generate_json/chat/
+chat_with_tools/extract_receipt/transcribe_voice/analyze_product_photo)
+НЕ змінені — усі виклики по всьому проєкту працюють без правок.
+"""
+
 import json
 import logging
 import re
@@ -30,6 +69,10 @@ _SAFETY_LINE_RE = re.compile(
 # з різних ракурсів вже достатньо (services/olx_service.py й так обрізає
 # список раніше MAX_PHOTOS_FOR_AI=10, це друга лінія захисту).
 MAX_IMAGES_PER_REQUEST = 10
+
+# Скільки разів повторити запит, якщо AI повернув ПОРОЖНІЙ content
+# (див. докстрінг файлу вище) — 1 повторна спроба, без нескінченних циклів.
+MAX_EMPTY_RETRIES = 1
 
 
 def _strip_safety_noise(text: str) -> str:
@@ -125,34 +168,64 @@ def _build_content(prompt: str, images: list[str] | None):
     return content
 
 
-async def _complete(prompt: str, temperature: float, json_mode: bool, images: list[str] | None = None) -> str | None:
+async def _chat_completion(messages: list[dict], temperature: float, json_mode: bool, label: str = "request") -> str | None:
+    """
+    Спільний хелпер для одного виклику chat.completions.create з:
+    - fallback без response_format, якщо модель його не підтримує;
+    - автоматичним retry, якщо AI повернув ПОРОЖНІЙ content (див. докстрінг
+      файлу — типова поведінка reasoning-моделей через OpenRouter).
+
+    label — лише для логів (щоб було видно, з якої саме функції прийшла
+    порожня відповідь: generate_json / extract_receipt / analyze_product_photo).
+    """
     if not client:
         return None
-    content = _build_content(prompt, images)
-    try:
+
+    for attempt in range(MAX_EMPTY_RETRIES + 1):
         try:
-            kwargs = {"temperature": temperature}
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[{"role": "user", "content": content}],
-                **kwargs,
-            )
+            try:
+                kwargs = {"temperature": temperature}
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = await client.chat.completions.create(
+                    model=AI_MODEL,
+                    messages=messages,
+                    **kwargs,
+                )
+            except Exception:
+                if not json_mode:
+                    raise
+                logger.warning("Модель %s не підтримує response_format=json_object, повторюю без нього (%s)", AI_MODEL, label)
+                resp = await client.chat.completions.create(
+                    model=AI_MODEL,
+                    messages=messages,
+                    temperature=temperature,
+                )
         except Exception:
-            if not json_mode:
-                raise
-            logger.warning("Модель %s не підтримує response_format=json_object, повторюю без нього", AI_MODEL)
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[{"role": "user", "content": content}],
-                temperature=temperature,
-            )
-        raw = (resp.choices[0].message.content or "").strip()
-        return _strip_safety_noise(raw)
-    except Exception:
-        logger.exception("AI request failed (model=%s, images=%s)", AI_MODEL, len(images) if images else 0)
-        return None
+            logger.exception("AI request failed (model=%s, label=%s)", AI_MODEL, label)
+            return None
+
+        choice = resp.choices[0]
+        raw = (choice.message.content or "").strip()
+
+        if raw:
+            return _strip_safety_noise(raw)
+
+        finish_reason = getattr(choice, "finish_reason", None)
+        logger.warning(
+            "AI повернув ПОРОЖНІЙ content (model=%s, label=%s, finish_reason=%s, спроба=%s/%s)",
+            AI_MODEL, label, finish_reason, attempt + 1, MAX_EMPTY_RETRIES + 1,
+        )
+        if attempt < MAX_EMPTY_RETRIES:
+            continue  # ще одна спроба з тим самим запитом
+
+    return None
+
+
+async def _complete(prompt: str, temperature: float, json_mode: bool, images: list[str] | None = None) -> str | None:
+    content = _build_content(prompt, images)
+    messages = [{"role": "user", "content": content}]
+    return await _chat_completion(messages, temperature, json_mode, label="generate")
 
 
 async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
@@ -181,19 +254,7 @@ async def generate_json(prompt: str, temperature: float = 0.7, images: list[str]
 
 
 async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
-    if not client:
-        return None
-    try:
-        resp = await client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=temperature,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        return _strip_safety_noise(raw)
-    except Exception:
-        logger.exception("AI chat request failed (model=%s)", AI_MODEL)
-        return None
+    return await _chat_completion(messages, temperature, json_mode=False, label="chat")
 
 
 async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: float = 0.7):
@@ -245,24 +306,8 @@ async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
         ],
     }]
 
-    try:
-        try:
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            logger.warning("Модель %s без response_format для vision, повторюю без нього", AI_MODEL)
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                temperature=0.2,
-            )
-        raw = _strip_safety_noise((resp.choices[0].message.content or "").strip())
-    except Exception:
-        logger.exception("AI extract_receipt request failed (model=%s)", AI_MODEL)
+    raw = await _chat_completion(messages, temperature=0.2, json_mode=True, label="extract_receipt")
+    if raw is None:
         return None
 
     candidate = _extract_json_object(raw) or _strip_json_fence(raw)
@@ -328,24 +373,8 @@ async def analyze_product_photo(image_bytes: bytes, mime_type: str = "image/jpeg
         ],
     }]
 
-    try:
-        try:
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                temperature=0.4,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            logger.warning("Модель %s без response_format для фото товару, повторюю без нього", AI_MODEL)
-            resp = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                temperature=0.4,
-            )
-        raw = _strip_safety_noise((resp.choices[0].message.content or "").strip())
-    except Exception:
-        logger.exception("AI analyze_product_photo request failed (model=%s)", AI_MODEL)
+    raw = await _chat_completion(messages, temperature=0.4, json_mode=True, label="analyze_product_photo")
+    if raw is None:
         return None
 
     candidate = _extract_json_object(raw) or _strip_json_fence(raw)
