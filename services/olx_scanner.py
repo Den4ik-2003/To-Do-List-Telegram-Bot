@@ -87,10 +87,11 @@ async def scan_for_deals(
     оголошення, потім ранжує тим самим rank_top_deals, що вже
     використовується для 🏆 TOP Deals.
 
-    progress_cb: опціональний async callable(done: int, total: int),
+    progress_cb: опціональний async callable(done: int, total: int, found: int),
     викликається після кожного проаналізованого (або пропущеного) кандидата —
-    щоб виклик міг показати користувачу живий прогрес замість "тиші" на
-    кілька хвилин. Збій самого callback'а не перериває скан.
+    щоб виклик міг показати користувачу живий прогрес (скільки перевірено і
+    скільки вже знайдено вигідних) замість "тиші" на кілька хвилин. Збій
+    самого callback'а не перериває скан.
 
     Повертає (ranked, error). ranked — список словників {"listing":.., "analysis":..},
     відсортований від найцікавішого. error ("ai_unavailable"/"ai_limit"/"search_failed")
@@ -121,7 +122,7 @@ async def scan_for_deals(
     for done, (c, details) in enumerate(fetched, start=1):
         if not details or details.get("price") is None:
             if progress_cb:
-                await _safe_progress(progress_cb, done, total)
+                await _safe_progress(progress_cb, done, total, len(pseudo_trackers))
             continue
 
         remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
@@ -147,11 +148,11 @@ async def scan_for_deals(
         except Exception:
             logger.exception("scan_for_deals: resale_engine.analyze_listing упав для %s", c["url"])
             if progress_cb:
-                await _safe_progress(progress_cb, done, total)
+                await _safe_progress(progress_cb, done, total, len(pseudo_trackers))
             continue
         if not analysis:
             if progress_cb:
-                await _safe_progress(progress_cb, done, total)
+                await _safe_progress(progress_cb, done, total, len(pseudo_trackers))
             continue
 
         await ai_usage_db.increment_usage(uid)
@@ -168,7 +169,7 @@ async def scan_for_deals(
         })
 
         if progress_cb:
-            await _safe_progress(progress_cb, done, total)
+            await _safe_progress(progress_cb, done, total, len(pseudo_trackers))
 
     if not pseudo_trackers:
         return [], None
@@ -182,8 +183,8 @@ async def scan_for_deals(
     return ranked, None
 
 
-async def _safe_progress(progress_cb, done: int, total: int) -> None:
+async def _safe_progress(progress_cb, done: int, total: int, found: int) -> None:
     try:
-        await progress_cb(done, total)
+        await progress_cb(done, total, found)
     except Exception:
         logger.exception("scan_for_deals: progress_cb упав")

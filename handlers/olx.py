@@ -566,11 +566,11 @@ async def olx_similar_cb(cb: CallbackQuery):
         domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
         own_url = tracker.get("url")
 
-        async def _progress(done: int, total: int):
+        async def _progress(done: int, total: int, found: int):
             try:
                 await wait_msg.edit_text(
-                    f"🔎 Шукаю найдешевші схожі оголошення за «{query_text}»...\n"
-                    f"🤖 AI перевірив {done}/{total}"
+                    f"🔎 Шукаю схожі оголошення за «{query_text}»...\n"
+                    f"🤖 AI проаналізував {done}/{total}, знайшов вигідних: {found}"
                 )
             except Exception:
                 pass
@@ -589,7 +589,11 @@ async def olx_similar_cb(cb: CallbackQuery):
                 "заблокував запит або недоступний). Спробуй ще раз за хвилину."
             )
 
-        ranked = [r for r in (ranked or []) if r.get("url") != own_url]
+        def _item_url(r: dict) -> str | None:
+            listing = r.get("listing") or {}
+            return listing.get("url") or r.get("url") or (r.get("_listing") or {}).get("url")
+
+        ranked = [r for r in (ranked or []) if _item_url(r) != own_url]
 
         if not ranked:
             return await wait_msg.edit_text(
@@ -608,11 +612,27 @@ async def olx_similar_cb(cb: CallbackQuery):
 
         links_lines = ["", "🔗 Посилання на всі проаналізовані оголошення:"]
         for r in ranked:
-            price = r.get("last_price")
-            currency = r.get("currency", "UAH")
+            # scan_for_deals()/rank_top_deals() повертають елементи у вигляді
+            # {"listing": {...}, "analysis": {...}} (див. докстрінг
+            # olx_scanner.scan_for_deals), а НЕ пласким трекером — тому дані
+            # беремо з вкладеного "listing", інакше отримуємо порожні поля.
+            listing = r.get("listing") or {}
+            if listing:
+                price = listing.get("price")
+                currency = listing.get("currency", "UAH")
+                title = listing.get("title")
+                url = listing.get("url")
+            else:
+                # Захист про всяк випадок, якщо rank_top_deals віддасть іншу
+                # форму структури (пласку, без вкладеного "listing") — не
+                # хочемо знову ловити порожні "Без назви — ціна не вказана".
+                price = r.get("last_price") or r.get("price")
+                currency = r.get("currency", "UAH")
+                title = r.get("title")
+                url = r.get("url") or (r.get("_listing") or {}).get("url")
+
             price_text = f"{price:.0f} {currency}" if price is not None else "ціна не вказана"
-            title = r.get("title") or "Без назви"
-            url = r.get("url") or (r.get("_listing") or {}).get("url", "")
+            title = title or "Без назви"
             links_lines.append(f"• {title} — {price_text}")
             if url:
                 links_lines.append(f"  {url}")
