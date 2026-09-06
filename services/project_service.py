@@ -1,10 +1,44 @@
-import json
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/project_service.py
+
+Це фінальна версія, що замінює тимчасовий hotfix (hasattr-заглушку) і
+чужий чернетковий варіант з generate_stages_ai/ask_ai.
+
+Виправлено:
+1. get_project_progress() тепер реально працює — database/tasks.py вже
+   містить get_project_tasks(uid, project_id) (окремий файл, онови теж).
+   Заглушку hasattr(...) прибрано, вона більше не потрібна.
+2. AI-генерація етапів переписана на РЕАЛЬНИЙ клієнт бота
+   services/ai_service.py (той самий, що вже юзають ai_chat.py та
+   kitchen_service.py) — generate_json(prompt). Функції ask_ai у проєкті
+   НЕМАЄ і ніколи не було, тож попередній варіант (import ask_ai) завжди
+   падав би на ImportError і мовчки повертав [].
+
+Залишено обидві назви для стадій AI-генерації — generate_stages_ai() і
+save_ai_stages() — так, як вони вже названі у файлі, який ти кинув
+останнім, щоб не було розсинхрону з тим, що вже могло бути написано в
+handlers/projects.py під ці імена.
+"""
+
 import logging
 
 from database import projects as projects_db
 from database import tasks as tasks_db
+from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
+
+
+STAGE_STATUS_LABELS = {
+    "pending": "⏳ Очікує",
+    "in_progress": "🔵 В процесі",
+    "done": "✅ Завершено",
+}
+STAGE_STATUS_ICONS = {k: v.split()[0] for k, v in STAGE_STATUS_LABELS.items()}
+
+
+def stage_status_label(status: str) -> str:
+    return STAGE_STATUS_LABELS.get(status, STAGE_STATUS_LABELS["pending"])
 
 
 def budget_percent(project: dict) -> int:
@@ -51,55 +85,56 @@ async def remove_project(pid: str):
 
 
 # =========================================================
+# ЕТАПИ ПРОЄКТУ — CRUD
+# =========================================================
+
+async def move_stage(pid: str, stage_id: str, direction: str):
+    await projects_db.move_stage(pid, stage_id, direction)
+
+
+async def edit_stage(pid: str, stage_id: str, title: str, description: str):
+    await projects_db.update_stage(pid, stage_id, {"title": title, "description": description})
+
+
+async def set_stage_status(pid: str, stage_id: str, status: str):
+    await projects_db.update_stage(pid, stage_id, {"status": status})
+
+
+# =========================================================
 # ✨ AI-ГЕНЕРАЦІЯ ЕТАПІВ ПРОЄКТУ
 # =========================================================
-# УВАГА: `ask_ai` нижче — ЗАГЛУШКА-КОНТРАКТ. Я не бачив services/ai_service.py
-# (чи де саме у вас лежить клієнт до Gemini/OpenRouter, який уже юзає ai_planner),
-# тож імпорт може не збігтись 1-в-1. Функція зроблена так, щоб не валити бота,
-# якщо клієнта ще нема: просто поверне [] і залогує помилку.
-# Скинь мені ai_service.py (або ai_planner_service.py) — підправлю імпорт/сигнатуру за 1 рядок.
+# Використовує services/ai_service.generate_json — той самий AI-клієнт
+# (OpenAI-сумісний, AI_API_KEY/AI_BASE_URL/AI_MODEL з config/settings.py),
+# яким уже користуються ai_chat.py, ai_planner та kitchen_service.py.
+# Ніякого окремого/нового AI-клієнта тут не створюється.
 
 async def generate_stages_ai(title: str, description: str) -> list[dict]:
-    try:
-        from services.ai_service import ask_ai  # TODO: підтвердити реальний шлях і сигнатуру
-    except ImportError:
-        logger.error("generate_stages_ai: не знайдено services.ai_service.ask_ai — AI-клієнт не підключено")
+    if not ai_service.is_available():
+        logger.warning("generate_stages_ai: AI недоступний (немає AI_API_KEY)")
         return []
 
+    desc_part = f' Опис проєкту: "{description}".' if description else ""
     prompt = (
-        "Ти — асистент з планування проєктів. Ось проєкт користувача:\n"
-        f"Назва: {title}\n"
-        f"Опис: {description or '(без опису)'}\n\n"
-        "Запропонуй від 3 до 6 логічних послідовних етапів виконання цього проєкту.\n"
-        "Відповідай ЛИШЕ у форматі JSON-масиву, без жодного тексту навколо:\n"
-        '[{"title": "...", "description": "..."}, ...]\n'
-        "title — до 6 слів, description — 1-2 короткі речення."
+        f'Проєкт користувача: "{title}".{desc_part}\n'
+        "Запропонуй від 3 до 6 логічних послідовних етапів реалізації цього "
+        "проєкту. Кожен етап має мати коротку зрозумілу назву (до 6 слів) та "
+        "короткий опис (1-2 речення) того, що саме треба зробити. Етапи мають "
+        "йти в реалістичному хронологічному порядку від початку до завершення.\n"
+        'Поверни ЛИШЕ JSON: {"stages": [{"title": "назва етапу", "description": "опис"}]}'
     )
 
     try:
-        raw = await ask_ai(prompt)
+        data = await ai_service.generate_json(prompt, temperature=0.6)
     except Exception:
         logger.exception("generate_stages_ai: помилка виклику AI")
         return []
 
-    cleaned = (raw or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-    cleaned = cleaned.strip()
-
-    try:
-        stages = json.loads(cleaned)
-    except Exception:
-        logger.warning("generate_stages_ai: AI повернув невалідний JSON: %r", raw)
-        return []
-
-    if not isinstance(stages, list):
+    if not data or not isinstance(data.get("stages"), list):
+        logger.warning("generate_stages_ai: AI повернув порожній або невалідний результат: %r", data)
         return []
 
     result = []
-    for s in stages:
+    for s in data["stages"]:
         if not isinstance(s, dict) or not s.get("title"):
             continue
         result.append({
@@ -111,3 +146,9 @@ async def generate_stages_ai(title: str, description: str) -> list[dict]:
 
 async def save_ai_stages(pid: str, stages: list[dict]) -> None:
     await projects_db.add_stages_bulk(pid, stages)
+
+
+# Аліас на випадок, якщо десь у хендлерах уже викликається інша назва
+# з попередньої чернетки цього ж модуля — обидва імені ведуть до одного коду.
+confirm_ai_stages = save_ai_stages
+generate_stages_with_ai = generate_stages_ai
