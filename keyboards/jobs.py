@@ -17,8 +17,9 @@ def ikb_vacancy_card(idx: int, url: str, saved: bool = False) -> InlineKeyboardM
         callback_data=f"jb_save:{idx}",
     )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Відкрити", url=url)],
-        [InlineKeyboardButton(text="✉️ Cover Letter", callback_data=f"jb_cover:{idx}"), save_btn],
+        [InlineKeyboardButton(text="🔗 Відкрити вакансію", url=url)],
+        [InlineKeyboardButton(text="🤖 AI аналіз", callback_data=f"jb_analyze:{idx}"), save_btn],
+        [InlineKeyboardButton(text="✉️ Cover Letter", callback_data=f"jb_cover:{idx}")],
         [InlineKeyboardButton(text="❌ Не показувати такі", callback_data=f"jb_notint:{idx}")],
         [InlineKeyboardButton(text="➡️ Наступна", callback_data="jb_next")],
     ])
@@ -55,6 +56,14 @@ def ikb_filters_menu() -> InlineKeyboardMarkup:
 def ikb_search_result_header() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Показати найкращі", callback_data="jb_start_card")],
+    ])
+
+
+def ikb_empty_search() -> InlineKeyboardMarkup:
+    """Показується, коли пошук не дав жодного результату — дозволяє
+    зберегти критерії як автопошук (🔔) замість того, щоб просто здатися."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Зберегти пошук і чекати нових", callback_data="jb_watch_empty")],
     ])
 
 

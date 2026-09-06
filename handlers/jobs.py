@@ -2,6 +2,7 @@ import logging
 import re
 
 from aiogram import Router, F
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -13,7 +14,7 @@ from services import jobs_service
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.jobs import (
     ikb_vacancy_card, ikb_not_interested_reasons, ikb_filters_menu,
-    ikb_saved_item, ikb_watch_item,
+    ikb_saved_item, ikb_watch_item, ikb_empty_search,
 )
 from handlers.common import require_auth
 
@@ -29,15 +30,23 @@ class JobSearch(StatesGroup):
     waiting_query = State()
 
 
+_WORK_FORMAT_LABELS = {"remote": "Remote", "office": "Офіс", "hybrid": "Гібрид"}
+
+
 def _fmt_vacancy_card(v: dict, total_shown: int, position: int) -> str:
     score = v.get("_score", {})
     lines = [f"💼 *{v.get('title','')}*", ""]
     lines.append(f"🏢 {v.get('company') or '—'}")
-    if v.get("location") or v.get("work_format"):
-        loc = " / ".join(x for x in [v.get("location"), v.get("work_format")] if x)
-        lines.append(f"📍 {loc}")
     if v.get("salary"):
         lines.append(f"💰 {v['salary']}")
+
+    format_label = _WORK_FORMAT_LABELS.get(v.get("work_format"))
+    loc_bits = [x for x in [v.get("location"), format_label] if x]
+    if loc_bits:
+        lines.append(f"📍 {' / '.join(loc_bits)}")
+
+    if v.get("experience"):
+        lines.append(f"📊 {v['experience']}")
 
     if score.get("match_percent") is not None:
         lines.append(f"\n🎯 Match: *{score['match_percent']}%*\n")
@@ -47,7 +56,8 @@ def _fmt_vacancy_card(v: dict, total_shown: int, position: int) -> str:
             lines.append(f"🟡 {tag}")
 
     sources = v.get("sources") or [v.get("source", "")]
-    lines.append(f"\n🔗 Джерела: {' · '.join(s for s in sources if s)}")
+    lines.append(f"\n🌐 Джерело: {' · '.join(s for s in sources if s)}")
+    lines.append(f"🔗 {v.get('url','')}")
 
     if score.get("advice"):
         lines.append(f"\n💡 {score['advice']}")
@@ -60,15 +70,27 @@ async def _run_search(msg: Message, uid: int, query_text: str):
     profile = await job_profile_db.get_profile(uid)
     feedback = await jobs_db.get_recent_feedback(uid)
 
-    wait_msg = await msg.answer("🔎 Аналізую запит і шукаю вакансії...")
+    # reply_markup=kb_main() тут важливо: щойно запит відправлено, кнопка
+    # "❌ Скасувати" (яка була показана під час введення запиту) більше не
+    # має сенсу і має одразу зникнути з клавіатури — інакше вона лишається
+    # "мертвою" на екрані (стан уже очищено, тож натискання на неї нічого
+    # не робить).
+    wait_msg = await msg.answer("🔎 Аналізую запит і шукаю вакансії...", reply_markup=kb_main())
     criteria = await jobs_service.parse_job_query(query_text, profile, feedback)
     if not criteria:
         return await wait_msg.edit_text(AI_ERROR_TEXT)
 
+    _criteria_cache[uid] = criteria
+
     vacancies = await jobs_service.search_vacancies(criteria)
     if not vacancies:
+        _results_cache[uid] = []
+        _position_cache[uid] = 0
         return await wait_msg.edit_text(
-            "📭 Нічого не знайшов за цим запитом. Спробуй ширші критерії."
+            "📭 Нічого не знайшов за цим запитом на Djinni / Work.ua / Robota.ua.\n\n"
+            "Спробуй ширші критерії (менше уточнень одразу) — або збережи цей пошук, "
+            "і я сам повідомлю, щойно з'явиться щось підходяще.",
+            reply_markup=ikb_empty_search(),
         )
 
     await wait_msg.edit_text(f"✅ Знайдено {len(vacancies)} вакансій. Оцінюю відповідність...")
@@ -80,7 +102,6 @@ async def _run_search(msg: Message, uid: int, query_text: str):
     scored.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
 
     _results_cache[uid] = scored
-    _criteria_cache[uid] = criteria
     _position_cache[uid] = 0
 
     top3 = "\n".join(
@@ -134,6 +155,16 @@ async def jobs_search_query(msg: Message, state: FSMContext):
     await _run_search(msg, msg.from_user.id, msg.text.strip())
 
 
+@router.message(StateFilter(None), F.text == "❌ Скасувати")
+async def jobs_stray_cancel(msg: Message, state: FSMContext):
+    """Захист від "мертвої" кнопки Скасувати: якщо вона все ж лишилась на
+    клавіатурі (стан уже None), просто повертаємо в головне меню, замість
+    того щоб мовчки ігнорувати натискання. Спрацьовує лише коли НЕМАЄ
+    активного FSM-стану — тож не заважає Скасувати всередині інших флоу
+    (напр. OLX), які самі обробляють цю кнопку у своїх станах."""
+    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
+
+
 @router.message(F.text.regexp(r"^\s*шукаю\b", flags=re.IGNORECASE))
 async def jobs_natural_shukau(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
@@ -171,6 +202,33 @@ async def jobs_save_cb(cb: CallbackQuery):
     v["match_percent"] = v["_score"].get("match_percent")
     await jobs_db.save_vacancy(uid, v)
     await cb.answer("Збережено ⭐")
+
+
+@router.callback_query(F.data.startswith("jb_analyze:"))
+async def jobs_analyze_cb(cb: CallbackQuery):
+    """🤖 AI аналіз вакансії: розгорнутий розбір (окремо від короткого %
+    відповідності та cover letter) — вимоги, навички є/бракує, рівень,
+    плюси/мінуси, чи варто подаватись."""
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    results = _results_cache.get(uid) or []
+    if idx >= len(results):
+        return await cb.answer("Застаріло", show_alert=True)
+
+    if not jobs_service.ai_service.is_available():
+        await cb.answer()
+        return await cb.message.answer(AI_ERROR_TEXT)
+
+    await cb.answer("Аналізую вакансію...")
+    wait_msg = await cb.message.answer("🤖 Готую детальний AI-аналіз вакансії (вимоги, навички, рівень)...")
+
+    profile = await job_profile_db.get_profile(uid)
+    v = results[idx]
+    analysis = await jobs_service.analyze_vacancy_full(v, profile)
+    if not analysis:
+        return await wait_msg.edit_text(AI_ERROR_TEXT)
+
+    await wait_msg.edit_text(f"🤖 *AI аналіз вакансії*\n*{v.get('title','')}*\n\n{analysis}")
 
 
 @router.callback_query(F.data.startswith("jb_notint:"))
@@ -255,6 +313,23 @@ async def jobs_watch_cb(cb: CallbackQuery):
     seen_ids = [v["id"] for v in results]
     await jobs_db.add_search_watch(uid, criteria, seen_ids)
     await cb.answer("Додано до моніторингу 🔔", show_alert=True)
+
+
+@router.callback_query(F.data == "jb_watch_empty")
+async def jobs_watch_empty_cb(cb: CallbackQuery):
+    """Дозволяє зберегти пошук в автопошук навіть якщо зараз результатів
+    немає — раніше це було неможливо, бо критерії кешувались лише ПІСЛЯ
+    перевірки на порожній результат."""
+    uid = cb.from_user.id
+    criteria = _criteria_cache.get(uid)
+    if not criteria:
+        return await cb.answer("Спочатку зроби пошук.", show_alert=True)
+
+    await jobs_db.add_search_watch(uid, criteria, [])
+    await cb.answer(
+        "Додано до моніторингу 🔔 Повідомлю, щойно з'являться нові вакансії за цим запитом.",
+        show_alert=True,
+    )
 
 
 @router.message(F.text == "⭐ Збережені вакансії")
