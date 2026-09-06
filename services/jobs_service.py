@@ -11,18 +11,18 @@ from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
 
-DJINNI_RSS_URL = "https://djinni.co/jobs/rss/"
-DOU_SEARCH_URL = "https://jobs.dou.ua/vacancies/?search={query}"
+# DOU має офіційний RSS-фід за пошуком/категорією — надійніше за парсинг HTML
+# (XML-структура стандартна, не ламається при зміні верстки сайту).
+DOU_RSS_URL = "https://jobs.dou.ua/vacancies/feeds/?search={query}"
+# Djinni: підтверджений живий шаблон урла за ключовим словом + rss-версія.
+DJINNI_KEYWORD_RSS_URL = "https://djinni.co/jobs/keyword-{query}/rss/"
 WORKUA_SEARCH_URL = "https://www.work.ua/jobs-{query}/"
 ROBOTA_SEARCH_URL = "https://robota.ua/zapros/{query}/ukraine"
 
 CURL_HEADERS = {"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7"}
 IMPERSONATE = "chrome124"
+REQUEST_TIMEOUT = 15
 
-# Синоніми/побутові формулювання -> нормалізовані ключові слова.
-# AI вже вміє це розпізнавати сам через промпт нижче, цей словник — друга
-# лінія захисту для точкового replace перед пошуком (напр. коли AI поверне
-# щось надто буквальне).
 PROFESSION_SYNONYMS = {
     "фронтенд": "frontend developer",
     "бекенд": "backend developer",
@@ -72,14 +72,198 @@ async def parse_job_query(user_text: str, profile: dict | None, feedback: list[d
     return await ai_service.generate_json(prompt, temperature=0.3)
 
 
-def _matches_criteria(text: str, criteria: dict) -> bool:
-    text_l = text.lower()
+def _search_slug(criteria: dict) -> str:
     keywords = criteria.get("search_keywords") or [criteria.get("profession", "")]
-    return any(kw.lower() in text_l for kw in keywords if kw)
+    query = " ".join(k for k in keywords if k).strip() or criteria.get("profession", "")
+    for src, dst in PROFESSION_SYNONYMS.items():
+        query = query.replace(src, dst)
+    return query.strip()
 
 
-# ... fetch_djinni / fetch_dou / fetch_workua / fetch_robotaua БЕЗ ЗМІН,
-# залиш як у поточному файлі ...
+async def _fetch_rss_items(url: str, source_name: str) -> list[dict]:
+    """Спільна логіка для RSS-джерел (Djinni, DOU) — надійніша за парсинг
+    HTML, бо структура RSS (title/link/description) стандартна незалежно
+    від дизайну сайту."""
+    try:
+        async with aiohttp.ClientSession(headers=CURL_HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                if resp.status != 200:
+                    logger.warning("%s RSS status=%s for %s", source_name, resp.status, url)
+                    return []
+                xml = await resp.text()
+    except Exception:
+        logger.exception("%s RSS fetch failed for %s", source_name, url)
+        return []
+
+    try:
+        soup = BeautifulSoup(xml, "xml")
+        items = soup.find_all("item")
+    except Exception:
+        logger.exception("%s RSS parse failed", source_name)
+        return []
+
+    results = []
+    for item in items:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+
+        title = title_el.get_text(strip=True) if title_el else ""
+        link = link_el.get_text(strip=True) if link_el else ""
+        description = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+        if not title or not link:
+            continue
+
+        results.append({
+            "id": link,
+            "url": link,
+            "title": title,
+            "company": None,
+            "location": None,
+            "work_format": None,
+            "salary": None,
+            "requirements": description[:1000],
+            "source": source_name,
+        })
+
+    return results
+
+
+async def fetch_djinni(criteria: dict) -> list[dict]:
+    query = _search_slug(criteria)
+    if not query:
+        return []
+    slug = quote(query.replace(" ", "-").lower())
+    url = DJINNI_KEYWORD_RSS_URL.format(query=slug)
+    return await _fetch_rss_items(url, "Djinni")
+
+
+async def fetch_dou(criteria: dict) -> list[dict]:
+    query = _search_slug(criteria)
+    if not query:
+        return []
+    url = DOU_RSS_URL.format(query=quote(query))
+    return await _fetch_rss_items(url, "DOU")
+
+
+def _extract_first_link_text(soup: BeautifulSoup, href_pattern: str) -> list[tuple[str, str]]:
+    """Загальна допоміжна функція для сайтів без стабільної RSS-структури
+    (Work.ua, Robota.ua) — шукає посилання за патерном у href і повертає
+    (текст, href) пари. Менш точно, ніж прив'язка до конкретних CSS-класів,
+    але стійкіше до змін верстки сайту."""
+    pairs = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href_pattern not in href:
+            continue
+        text = a.get_text(strip=True)
+        if not text or href in seen:
+            continue
+        seen.add(href)
+        pairs.append((text, href))
+    return pairs
+
+
+async def fetch_workua(criteria: dict) -> list[dict]:
+    query = _search_slug(criteria)
+    if not query:
+        return []
+    slug = quote(query.replace(" ", "+").lower())
+    url = WORKUA_SEARCH_URL.format(query=slug)
+
+    try:
+        async with AsyncSession(impersonate=IMPERSONATE, headers=CURL_HEADERS) as session:
+            resp = await session.get(url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                logger.warning("Work.ua status=%s for %s", resp.status_code, url)
+                return []
+            html = resp.text
+    except Exception:
+        logger.exception("Work.ua fetch failed for %s", url)
+        return []
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        pairs = _extract_first_link_text(soup, "/jobs/")
+    except Exception:
+        logger.exception("Work.ua parse failed for %s", url)
+        return []
+
+    results = []
+    for title, href in pairs[:20]:
+        # Відкидаємо явно нерелевантні внутрішні посилання (пагінація,
+        # категорії тощо) — реальні вакансії мають довший, змістовний текст.
+        if len(title) < 8:
+            continue
+        full_url = href if href.startswith("http") else f"https://www.work.ua{href}"
+        results.append({
+            "id": full_url,
+            "url": full_url,
+            "title": title,
+            "company": None,
+            "location": None,
+            "work_format": None,
+            "salary": None,
+            "requirements": "",
+            "source": "Work.ua",
+        })
+
+    if not results:
+        logger.info("Work.ua: 0 результатів для запиту %r (можливо, потрібне оновлення парсера)", query)
+    return results
+
+
+async def fetch_robotaua(criteria: dict) -> list[dict]:
+    query = _search_slug(criteria)
+    if not query:
+        return []
+    slug = quote(query.replace(" ", "-").lower())
+    url = ROBOTA_SEARCH_URL.format(query=slug)
+
+    try:
+        async with AsyncSession(impersonate=IMPERSONATE, headers=CURL_HEADERS) as session:
+            resp = await session.get(url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                logger.warning("Robota.ua status=%s for %s", resp.status_code, url)
+                return []
+            html = resp.text
+    except Exception:
+        logger.exception("Robota.ua fetch failed for %s", url)
+        return []
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        pairs = _extract_first_link_text(soup, "/vacancy/")
+    except Exception:
+        logger.exception("Robota.ua parse failed for %s", url)
+        return []
+
+    results = []
+    for title, href in pairs[:20]:
+        if len(title) < 8:
+            continue
+        full_url = href if href.startswith("http") else f"https://robota.ua{href}"
+        results.append({
+            "id": full_url,
+            "url": full_url,
+            "title": title,
+            "company": None,
+            "location": None,
+            "work_format": None,
+            "salary": None,
+            "requirements": "",
+            "source": "Robota.ua",
+        })
+
+    if not results:
+        # Robota.ua — важкий React-сайт, що рендерить список вакансій через
+        # JavaScript; "сирий" HTML-фетч часто не бачить самих карток
+        # вакансій взагалі. Це не помилка коду — джерело просто не завжди
+        # доступне для простого HTTP-скрапінгу без headless-браузера.
+        logger.info("Robota.ua: 0 результатів для запиту %r (сайт може рендерити список через JS)", query)
+    return results
 
 
 def _normalize_for_dedup(v: dict) -> str:
