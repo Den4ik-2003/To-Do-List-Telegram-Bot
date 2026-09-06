@@ -36,6 +36,15 @@ CONDITION_PARAM_MAP = {"used": "used", "new": "new"}
 
 MAX_PHOTOS_FOR_AI = 10
 
+# OLX сам додає цей reason до картки, коли розширений пошук НЕ дав жодного
+# реального збігу і сайт підсовує випадкові оголошення з фіду, аби блок
+# "схожі"/список не був порожнім. Такі картки — НЕ результати пошуку і їх
+# треба відкидати, інакше видача виглядає як рандомний набір товарів
+# (диван, чоботи, молоток замість реально схожих оголошень).
+FALLBACK_REASON_MARKERS = (
+    "extendedsearchnoresultslastresort",
+)
+
 
 def _parse_price(text: str) -> tuple[float, str] | None:
     if not text:
@@ -54,6 +63,12 @@ def _parse_price(text: str) -> tuple[float, str] | None:
 def _domain_headers(domain: str) -> dict:
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
     return {**HEADERS, "Referer": cfg["referer"]}
+
+
+def _is_fallback_card(href: str) -> bool:
+    """True, якщо OLX сам позначив цю картку як "останній резерв"
+    (реального збігу за запитом немає)."""
+    return any(marker in href for marker in FALLBACK_REASON_MARKERS)
 
 
 def _best_srcset_url(srcset: str) -> str | None:
@@ -300,6 +315,7 @@ async def search_listings(
     logger.info("OLX search OK url=%s cards_found=%s", url, len(cards))
 
     results = []
+    fallback_skipped = 0
     for card in cards:
         link_el = card.select_one("a")
         href = link_el.get("href") if link_el else None
@@ -307,6 +323,15 @@ async def search_listings(
             continue
         if href.startswith("/"):
             href = f"https://www.{domain}" + href
+
+        # OLX сам позначає картку як "останній резерв" (реального збігу за
+        # запитом немає, показуємо будь-що з фіду, аби блок не був порожнім).
+        # Це НЕ результат пошуку за запитом — відкидаємо, інакше видача
+        # виглядає як рандомний набір товарів, що не мають нічого спільного
+        # із запитом користувача.
+        if _is_fallback_card(href):
+            fallback_skipped += 1
+            continue
 
         listing_id_match = re.search(r"-ID([a-zA-Z0-9]+)\.html", href)
         listing_id = listing_id_match.group(1) if listing_id_match else href
@@ -329,6 +354,13 @@ async def search_listings(
             "currency": parsed_price[1] if parsed_price else cfg["default_currency"],
             "location_text": location_text,
         })
+
+    if fallback_skipped:
+        logger.info(
+            "OLX search url=%s: відкинуто %s fallback-карток (extendedsearchnoresultslastresort) — "
+            "реальних збігів за запитом %r не знайдено",
+            url, fallback_skipped, title_query,
+        )
 
     return results
 

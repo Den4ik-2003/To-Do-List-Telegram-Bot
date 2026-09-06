@@ -474,12 +474,21 @@ async def olx_bought_cb(cb: CallbackQuery):
 _JUNK_CHARS_RE = re.compile(r"[\"'«»()\[\]{}]")
 _NULLISH = {"null", "none", "невідомо", "не вказано", ""}
 
+# Внутрішні артикули/SKU/ID товару типу "IG-1102110", "AB123456", "SKU-99"
+# тощо. Вони НІКОЛИ не збігаються з реальними назвами товарів на OLX і, якщо
+# потрапляють у пошуковий запит, змушують OLX повертати fallback-видачу
+# (випадкові оголошення замість дійсно схожих).
+_SKU_CODE_RE = re.compile(
+    r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
+)
+
 
 def _clean_query_text(text) -> str:
     if text is None:
         text = ""
     text = str(text)
     text = _JUNK_CHARS_RE.sub("", text)
+    text = _SKU_CODE_RE.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -499,11 +508,19 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     model = _first_nonempty(analysis.get("item_model"), analysis.get("model"))
     if brand and model:
         return f"{brand} {model}"
+    if brand:
+        return brand
 
-    name = _first_nonempty(
-        analysis.get("item_name"), analysis.get("name"), analysis.get("title"),
-        tracker.get("title"),
-    )
+    # item_name/name/title з AI-аналізу — пріоритетніші за "сирий" заголовок
+    # оголошення, бо AI зазвичай вже дає нормалізовану людську назву товару
+    # без внутрішніх артикулів продавця.
+    name = _first_nonempty(analysis.get("item_name"), analysis.get("name"), analysis.get("title"))
+    if not name:
+        # tracker["title"] — останній fallback: заголовок реального оголошення
+        # може містити артикул продавця (тому й проганяємо через ту саму
+        # очистку від SKU-кодів у _clean_query_text/_first_nonempty).
+        name = _first_nonempty(tracker.get("title"))
+
     words = name.split()
     return " ".join(words[:4])
 
@@ -524,8 +541,9 @@ async def olx_similar_cb(cb: CallbackQuery):
         query_text = _build_similar_query(analysis, tracker)
         if not query_text:
             return await cb.message.answer(
-                "⚠️ Не вдалося визначити назву товару для пошуку. Спробуй спершу зробити "
-                "AI-аналіз («🤖 AI Resale Hunter: оцінити»)."
+                "⚠️ Не вдалося визначити назву товару для пошуку (заголовок оголошення "
+                "містить лише артикул/код без назви). Спробуй спершу зробити AI-аналіз "
+                "(«🤖 AI Resale Hunter: оцінити»)."
             )
 
         domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
@@ -541,6 +559,11 @@ async def olx_similar_cb(cb: CallbackQuery):
         results = [r for r in results if r.get("url") != own_url][:5]
 
         if not results:
+            # Порожньо тут означає одне з двох: або справді немає активних
+            # оголошень за таким запитом, або OLX Х (внутрішньо) видав лише
+            # fallback-картки, які search_listings() уже відкинув — в обох
+            # випадках чесно кажемо, що реально схожого нічого не знайдено,
+            # а не показуємо випадкові товари.
             return await cb.message.answer(
                 f"📭 Схожих оголошень за «{query_text}» не знайдено. "
                 f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
