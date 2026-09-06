@@ -482,6 +482,17 @@ _SKU_CODE_RE = re.compile(
     r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
 )
 
+# Назви товарів приходять "сирими" з OLX і можуть містити символи, які
+# Telegram сприймає як (недопарну) Markdown-розмітку — *, _, [, ], ` — і тоді
+# ВСЕ повідомлення падає з "can't find end of the entity", навіть якщо ламає
+# формат лише один символ в одному товарі. Екрануємо їх перед вставкою в
+# markdown-форматоване повідомлення.
+_MD_SPECIAL_RE = re.compile(r"([_*\[\]`])")
+
+
+def _md_escape(text) -> str:
+    return _MD_SPECIAL_RE.sub(r"\\\1", str(text or ""))
+
 
 def _clean_query_text(text) -> str:
     if text is None:
@@ -569,10 +580,10 @@ async def olx_similar_cb(cb: CallbackQuery):
                 f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
             )
 
-        lines = [f"🔎 *Схожі оголошення* — «{query_text}»", ""]
+        lines = [f"🔎 *Схожі оголошення* — «{_md_escape(query_text)}»", ""]
         for r in results:
             price_text = f"{r['price']:.0f} {r['currency']}" if r.get("price") else "ціна не вказана"
-            lines.append(f"• {r['title']} — {price_text}")
+            lines.append(f"• {_md_escape(r['title'])} — {price_text}")
             lines.append(f"  {r['url']}")
         await cb.message.answer("\n".join(lines))
     except Exception:
