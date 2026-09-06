@@ -598,11 +598,32 @@ async def olx_similar_cb(cb: CallbackQuery):
             )
 
         header = f"🔎 Найкращі схожі оголошення для перепродажу — «{query_text}»\n\n"
+
+        # format_top_deals() за дизайном показує лише ТОП-3 (медалі), як і в
+        # 🏆 TOP Deals, і не додає URL (бо там юзер вже має посилання у своїх
+        # підписках). Тут юзер бачить ці оголошення вперше, тому окремо
+        # додаємо посилання на ВСІ проаналізовані варіанти (не лише топ-3),
+        # у тому ж форматі, що був у попередній версії "Схожих".
+        top_summary = resale_engine.format_top_deals(ranked).replace("*", "")
+
+        links_lines = ["", "🔗 Посилання на всі проаналізовані оголошення:"]
+        for r in ranked:
+            price = r.get("last_price")
+            currency = r.get("currency", "UAH")
+            price_text = f"{price:.0f} {currency}" if price is not None else "ціна не вказана"
+            title = r.get("title") or "Без назви"
+            url = r.get("url") or (r.get("_listing") or {}).get("url", "")
+            links_lines.append(f"• {title} — {price_text}")
+            if url:
+                links_lines.append(f"  {url}")
+
+        final_text = header + top_summary + "\n" + "\n".join(links_lines)
+
         # Назви й описи товарів приходять "сирими" з OLX і можуть містити
         # символи (*, _, [, ]), які ламають Markdown-парсинг Telegram —
         # надсилаємо без парсингу, щоб один "кривий" символ в одному
         # оголошенні не зривав усе повідомлення.
-        await wait_msg.edit_text(header + resale_engine.format_top_deals(ranked), parse_mode="")
+        await wait_msg.edit_text(final_text, parse_mode="")
     except Exception:
         logger.exception("olx_similar_cb failed for tracker=%s uid=%s", tid, uid)
         try:
