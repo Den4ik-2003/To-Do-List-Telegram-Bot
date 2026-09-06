@@ -475,10 +475,6 @@ async def olx_bought_cb(cb: CallbackQuery):
 _JUNK_CHARS_RE = re.compile(r"[\"'«»()\[\]{}]")
 _NULLISH = {"null", "none", "невідомо", "не вказано", ""}
 
-# Внутрішні артикули/SKU/ID товару типу "IG-1102110", "AB123456", "SKU-99"
-# тощо. Вони НІКОЛИ не збігаються з реальними назвами товарів на OLX і, якщо
-# потрапляють у пошуковий запит, змушують OLX повертати fallback-видачу
-# (випадкові оголошення замість дійсно схожих).
 _SKU_CODE_RE = re.compile(
     r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
 )
@@ -512,14 +508,8 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     if brand:
         return brand
 
-    # item_name/name/title з AI-аналізу — пріоритетніші за "сирий" заголовок
-    # оголошення, бо AI зазвичай вже дає нормалізовану людську назву товару
-    # без внутрішніх артикулів продавця.
     name = _first_nonempty(analysis.get("item_name"), analysis.get("name"), analysis.get("title"))
     if not name:
-        # tracker["title"] — останній fallback: заголовок реального оголошення
-        # може містити артикул продавця (тому й проганяємо через ту саму
-        # очистку від SKU-кодів у _clean_query_text/_first_nonempty).
         name = _first_nonempty(tracker.get("title"))
 
     words = name.split()
@@ -529,16 +519,16 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
     """
-    🔎 Схожі (AI): бере той самий пошуковий запит, що й раніше (назва/бренд/
-    модель товару з AI-аналізу або заголовка), але замість "сирого" списку
-    результатів прожовує найдешевші свіжі оголошення через ТОЙ САМИЙ AI
-    resale-аналіз, що й olx_scanner.scan_for_deals (🧲 Злови помилку), і
-    показує їх відсортованими від найвигіднішого — тобто одразу видно не
-    просто "схоже", а "схоже і вигідне для перепродажу".
+    🔎 Схожі (AI): той самий пошуковий запит (назва/бренд/модель товару з
+    AI-аналізу або заголовка), прожований через ТОЙ САМИЙ resale-аналіз,
+    що й 🧲 Злови помилку, показаний відсортованим від найвигіднішого.
 
-    ВАЖЛИВО: як і "Злови помилку", кожна перевірка тут списує денний AI-ліміт
-    користувача (по одному кредиту за кожне проаналізоване оголошення) — це
-    свідомо, щоб не "з'їсти" ліміт непомітно однією кнопкою.
+    ВАЖЛИВО: olx_scanner.scan_for_deals() -> resale_engine.rank_top_deals()
+    повертає елементи у форматі {"tracker": {...}, "analysis": {...},
+    "score": ...} — САМЕ ключ "tracker" містить title/last_price/currency/url
+    (не "listing"!). Раніше тут помилково читали неіснуючий ключ "listing",
+    через що завжди виходило "Без назви — ціна не вказана" і посилання
+    губились.
     """
     await cb.answer()
 
@@ -590,8 +580,7 @@ async def olx_similar_cb(cb: CallbackQuery):
             )
 
         def _item_url(r: dict) -> str | None:
-            listing = r.get("listing") or {}
-            return listing.get("url") or r.get("url") or (r.get("_listing") or {}).get("url")
+            return (r.get("tracker") or {}).get("url")
 
         ranked = [r for r in (ranked or []) if _item_url(r) != own_url]
 
@@ -603,33 +592,19 @@ async def olx_similar_cb(cb: CallbackQuery):
 
         header = f"🔎 Найкращі схожі оголошення для перепродажу — «{query_text}»\n\n"
 
-        # format_top_deals() за дизайном показує лише ТОП-3 (медалі), як і в
-        # 🏆 TOP Deals, і не додає URL (бо там юзер вже має посилання у своїх
-        # підписках). Тут юзер бачить ці оголошення вперше, тому окремо
-        # додаємо посилання на ВСІ проаналізовані варіанти (не лише топ-3),
-        # у тому ж форматі, що був у попередній версії "Схожих".
+        # format_top_deals() показує лише ТОП-3 (медалі) і не додає URL (бо
+        # там юзер вже має посилання у своїх підписках). Тут юзер бачить ці
+        # оголошення вперше, тому окремо додаємо посилання на ВСІ
+        # проаналізовані варіанти — беремо їх з правильного ключа "tracker".
         top_summary = resale_engine.format_top_deals(ranked).replace("*", "")
 
         links_lines = ["", "🔗 Посилання на всі проаналізовані оголошення:"]
         for r in ranked:
-            # scan_for_deals()/rank_top_deals() повертають елементи у вигляді
-            # {"listing": {...}, "analysis": {...}} (див. докстрінг
-            # olx_scanner.scan_for_deals), а НЕ пласким трекером — тому дані
-            # беремо з вкладеного "listing", інакше отримуємо порожні поля.
-            listing = r.get("listing") or {}
-            if listing:
-                price = listing.get("price")
-                currency = listing.get("currency", "UAH")
-                title = listing.get("title")
-                url = listing.get("url")
-            else:
-                # Захист про всяк випадок, якщо rank_top_deals віддасть іншу
-                # форму структури (пласку, без вкладеного "listing") — не
-                # хочемо знову ловити порожні "Без назви — ціна не вказана".
-                price = r.get("last_price") or r.get("price")
-                currency = r.get("currency", "UAH")
-                title = r.get("title")
-                url = r.get("url") or (r.get("_listing") or {}).get("url")
+            t = r.get("tracker") or {}
+            price = t.get("last_price")
+            currency = t.get("currency", "UAH")
+            title = t.get("title")
+            url = t.get("url")
 
             price_text = f"{price:.0f} {currency}" if price is not None else "ціна не вказана"
             title = title or "Без назви"
@@ -639,10 +614,6 @@ async def olx_similar_cb(cb: CallbackQuery):
 
         final_text = header + top_summary + "\n" + "\n".join(links_lines)
 
-        # Назви й описи товарів приходять "сирими" з OLX і можуть містити
-        # символи (*, _, [, ]), які ламають Markdown-парсинг Telegram —
-        # надсилаємо без парсингу, щоб один "кривий" символ в одному
-        # оголошенні не зривав усе повідомлення.
         await wait_msg.edit_text(final_text, parse_mode="")
     except Exception:
         logger.exception("olx_similar_cb failed for tracker=%s uid=%s", tid, uid)
