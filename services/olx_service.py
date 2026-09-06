@@ -7,12 +7,6 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("tasks_bot")
 
-# ВАЖЛИВО: aiohttp з "браузерними" заголовками все одно отримував 403 від OLX.
-# Причина — не заголовки, а TLS-відбиток з'єднання: захист розпізнає
-# non-браузерні HTTP-клієнти за тим, ЯК вони встановлюють TLS (порядок
-# cipher suites, ALPN, HTTP/2-параметри), а не лише за заголовками.
-# curl_cffi вміє відтворювати РЕАЛЬНИЙ TLS-відбиток конкретної версії Chrome
-# (impersonate="chrome124") — це і обходить цей тип 403.
 IMPERSONATE = "chrome124"
 
 HEADERS = {
@@ -38,17 +32,8 @@ DOMAIN_CONFIG = {
     "olx.pl": {"list_path": "/oferty/q-", "referer": "https://www.olx.pl/", "default_currency": "PLN"},
 }
 
-# OLX-параметр стану товару. ВАЖЛИВО: це best-effort за аналогією з уже
-# перевіреним синтаксисом filter_float_price/dist нижче (той самий bracket-
-# стиль search[filter_...]). Я не мав змоги емпірично протестувати цей
-# конкретний параметр проти живого сайту в рамках цієї відповіді. Якщо OLX
-# його ігнорує — гіршого не станеться: сайт просто поверне нефільтрований
-# результат (як і будь-який невідомий параметр), нічого не зламається.
-# Якщо після деплою побачиш, що фільтр не працює — скинь мені реальний URL
-# зі сторінки з застосованим фільтром "Стан: Вживане" з сайту, і я поправлю.
 CONDITION_PARAM_MAP = {"used": "used", "new": "new"}
 
-# Максимум фото, які передаємо в AI.
 MAX_PHOTOS_FOR_AI = 10
 
 
@@ -72,9 +57,6 @@ def _domain_headers(domain: str) -> dict:
 
 
 def _best_srcset_url(srcset: str) -> str | None:
-    """З атрибута srcset ("url1 400w, url2 800w, ...") бере URL із найбільшою
-    шириною — потрібне максимально якісне фото для розпізнавання дефектів/
-    напису на етикетках, а не мініатюра 100x100."""
     candidates = []
     for part in srcset.split(","):
         part = part.strip()
@@ -96,7 +78,6 @@ def _best_srcset_url(srcset: str) -> str | None:
 
 
 def _extract_photos(soup: BeautifulSoup) -> tuple[list[str], int]:
-    """Збирає URL усіх фото галереї оголошення. Повертає (фото_для_AI[:MAX], загальна_кількість)."""
     urls: list[str] = []
     seen: set[str] = set()
 
@@ -123,11 +104,6 @@ def _extract_photos(soup: BeautifulSoup) -> tuple[list[str], int]:
 
 
 def _parse_listing_html(html: str, default_currency: str) -> dict:
-    """
-    Витягує з HTML оголошення все, що потрібно для оцінки вигідності
-    перепродажу: ціну, назву, опис, локацію, перегляди, УСІ фото (URL, не
-    лише кількість) та список характеристик.
-    """
     soup = BeautifulSoup(html, "html.parser")
     result: dict = {
         "price": None, "currency": default_currency, "title": None,
@@ -204,10 +180,6 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
 
 
 async def fetch_listing_details(url: str) -> dict | None:
-    """
-    Повне зчитування оголошення: ціна, назва, опис, локація, перегляди,
-    фото (URL-и), характеристики.
-    """
     domain = "olx.pl" if "olx.pl" in url else "olx.ua"
     headers = _domain_headers(domain)
     default_currency = DOMAIN_CONFIG[domain]["default_currency"]
@@ -235,11 +207,45 @@ async def fetch_listing_details(url: str) -> dict | None:
 
 
 async def fetch_listing_price(url: str) -> tuple[float, str] | None:
-    """Легка версія для періодичної джоби перевірки ціни (без опису/фото/параметрів)."""
     details = await fetch_listing_details(url)
     if not details or details["price"] is None:
         return None
     return details["price"], details["currency"]
+
+
+def _guess_image_mime(url: str) -> str:
+    """НОВЕ: для 🔍 Аудит мого оголошення — грубе визначення MIME за розширенням
+    у URL, щоб коректно сформувати data:URI для vision-запиту. OLX CDN інколи
+    не віддає розширення в чистому вигляді (query-параметри після нього),
+    тому спочатку відрізаємо все після "?"."""
+    lower = url.split("?")[0].lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
+    """
+    НОВЕ: для 🔍 Аудит мого оголошення — завантажує сирі байти фото з OLX CDN
+    для подальшого vision-аналізу (кодування в base64 відбувається вже на
+    боці services/olx_audit.py). Повертає (bytes, mime) або None, якщо
+    завантажити не вдалося — це НЕ фатально для решти аудиту, просто те
+    конкретне фото пропускається з чесним попередженням користувачу.
+    """
+    try:
+        async with AsyncSession(impersonate=IMPERSONATE, timeout=15) as session:
+            resp = await session.get(url, timeout=15)
+            if resp.status_code != 200:
+                logger.warning("OLX image fetch status=%s for %s", resp.status_code, url)
+                return None
+            return resp.content, _guess_image_mime(url)
+    except Exception:
+        logger.exception("OLX image fetch failed for %s", url)
+        return None
 
 
 def _build_search_url(
@@ -251,10 +257,6 @@ def _build_search_url(
     condition: str | None = None,
 ) -> str:
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
-    # ЗМІНЕНО: раніше пробіли замінялись на "-" без URL-кодування — кириличні
-    # символи в такому вигляді інколи ламали запит або давали 0 результатів
-    # залежно від того, як curl_cffi/сервер трактує неекранований UTF-8 у
-    # шляху. quote() коректно кодує кожен сегмент, лишаючи "-" як є.
     slug = title_query.strip().replace(" ", "-")
     query = quote(slug, safe="-")
     base = f"https://www.{domain}{cfg['list_path']}{query}/"
@@ -264,7 +266,6 @@ def _build_search_url(
     if location:
         params.append(f"search[dist]={radius_km}")
     if condition and condition in CONDITION_PARAM_MAP:
-        # best-effort, див. коментар біля CONDITION_PARAM_MAP вище
         params.append(f"search[filter_enum_state][0]={CONDITION_PARAM_MAP[condition]}")
     if params:
         base += "?" + "&".join(params)
@@ -279,24 +280,6 @@ async def search_listings(
     domain: str = "olx.ua",
     condition: str | None = None,
 ) -> list[dict] | None:
-    """
-    ЗМІНЕНО: тепер розрізняє два різних випадки, які раніше обидва
-    поверталися як порожній список — через що користувач бачив "нічого не
-    знайдено" навіть тоді, коли насправді запит до OLX провалився
-    (403/timeout/мережева помилка):
-      - None  -> технічний збій запиту (сайт заблокував/недоступний),
-                 виклик мав би показати користувачу помилку, а не "0 знайдено";
-      - []    -> запит виконано успішно, але реальних карток товарів немає.
-
-    НОВЕ: `condition` ("used"/"new") — best-effort фільтр стану товару через
-    URL-параметр (див. CONDITION_PARAM_MAP). Категорія свідомо НЕ підтримується
-    як окремий параметр — OLX прив'язує категорію до дерева URL-шляхів, яке
-    треба або мапити вручну по кожній категорії, або отримувати з окремого
-    API категорій, якого зараз в інтеграції немає. Тому "категорія" з боку
-    користувача (аукціон навпаки, п.1 ТЗ) наразі приймається як додаткове
-    текстове уточнення до пошукового запиту, а не як справжній фільтр дерева
-    категорій — це чесно позначено в UI хендлера.
-    """
     cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
     url = _build_search_url(domain, title_query, max_price, location, radius_km, condition)
     headers = _domain_headers(domain)
@@ -351,7 +334,6 @@ async def search_listings(
 
 
 def sort_by_price(results: list[dict], ascending: bool = True) -> list[dict]:
-    """НОВЕ: допоміжна функція для 🔨 Аукціон навпаки — сортування карток з ціною, без ціни в кінець."""
     priced = [r for r in results if r.get("price") is not None]
     unpriced = [r for r in results if r.get("price") is None]
     priced.sort(key=lambda r: r["price"], reverse=not ascending)

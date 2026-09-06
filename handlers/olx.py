@@ -14,6 +14,7 @@ from database import ai_usage as ai_usage_db
 from services import olx_service
 from services import ai_service
 from services import resale_engine
+from services import olx_audit
 from keyboards.main_menu import kb_main, kb_cancel
 from handlers.common import require_auth
 
@@ -46,6 +47,10 @@ class OlxBudget(StatesGroup):
     waiting_amount = State()
 
 
+class OlxAudit(StatesGroup):
+    waiting_url = State()
+
+
 def _ikb_olx_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Стежити за оголошенням", callback_data="olx_add_listing")],
@@ -56,6 +61,7 @@ def _ikb_olx_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏆 TOP Deals", callback_data="olx_top_deals"),
             InlineKeyboardButton(text="💰 Мій бюджет", callback_data="olx_budget_start"),
         ],
+        [InlineKeyboardButton(text="🔍 Аудит мого оголошення", callback_data="olx_audit_start")],
     ])
 
 
@@ -83,15 +89,27 @@ def _ikb_after_analysis(tracker_id: str, status: str = "watching") -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _ikb_audit_actions(tracker_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Переписати опис", callback_data=f"olx_audit_desc:{tracker_id}"),
+            InlineKeyboardButton(text="📸 Як перезняти фото", callback_data=f"olx_audit_photos:{tracker_id}"),
+        ],
+        [InlineKeyboardButton(text="💰 Оптимальна ціна", callback_data=f"olx_audit_price:{tracker_id}")],
+        [InlineKeyboardButton(text="🚀 Покращити все", callback_data=f"olx_audit_all:{tracker_id}")],
+        [InlineKeyboardButton(text="🔄 Оновити аудит", callback_data=f"olx_audit_redo:{tracker_id}")],
+    ])
+
+
 @router.message(F.text == "📉 OLX Ціни")
 async def olx_menu(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
     await msg.answer(
         "📉 *OLX — AI Resale Hunter*\n\n"
-        "Стеж за оголошенням і отримуй повний AI-аналіз вигідності перепродажу: "
-        "ринкова ціна, прибуток, ROI, готова стратегія торгу і ризики. "
-        "Або задай критерії й отримуй нові оголошення автоматично.",
+        "Стеж за оголошенням і отримуй повний AI-аналіз вигідності перепродажу, "
+        "перевіряй нові оголошення автоматично, або зроби аудит власного "
+        "оголошення перед публікацією.",
         reply_markup=_ikb_olx_menu(),
     )
 
@@ -458,8 +476,6 @@ _NULLISH = {"null", "none", "невідомо", "не вказано", ""}
 
 
 def _clean_query_text(text) -> str:
-    """Приймає будь-що (str, None, число тощо) і завжди повертає безпечний рядок —
-    ніколи не кидає виняток, скільки б несподіваним не був вхідний тип/значення."""
     if text is None:
         text = ""
     text = str(text)
@@ -476,16 +492,6 @@ def _first_nonempty(*values) -> str:
 
 
 def _build_similar_query(analysis: dict, tracker: dict) -> str:
-    """
-    ВИПРАВЛЕНО: раніше функція покладалась на конкретні ключі AI-відповіді
-    ("item_brand"/"item_model"/"item_name"), яких могло просто не бути в
-    реальній структурі resale_analysis (залежно від того, що саме повертає
-    resale_engine.analyze_listing) — тоді query_text міг вийти порожнім,
-    і подальша логіка ламалась мовчки. Тепер функція перебирає кілька
-    можливих варіантів назв полів (з різних можливих версій AI-відповіді)
-    і завжди має надійний fallback на назву самого оголошення (tracker
-    title), яка точно є в БД незалежно від того, чи вдався AI-аналіз.
-    """
     if not isinstance(analysis, dict):
         analysis = {}
 
@@ -504,14 +510,6 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
 
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
-    # ВИПРАВЛЕНО: раніше cb.answer() викликався лише в кінці функції, після
-    # звернень до БД і побудови запиту. Якщо будь-де посередині траплявся
-    # виняток — виконання обривалось ДО cb.answer(), і кнопка в Telegram
-    # просто зависала у стані "завантаження" назавжди (це і виглядало як
-    # "взагалі нічого не відбувається"). Тепер відповідаємо одразу на вході,
-    # а всю подальшу логіку загортаємо в try/except з логуванням, щоб
-    # будь-яка несподівана помилка показувала користувачу повідомлення
-    # замість мовчазного зависання.
     await cb.answer("Шукаю схожі оголошення...")
 
     tid = cb.data.split(":", 1)[1]
@@ -769,3 +767,140 @@ async def olx_calc_sell_price(msg: Message, state: FSMContext):
         sell_price=sell_price,
     )
     await msg.answer(resale_engine.format_calculation(calc), reply_markup=kb_main())
+
+
+# =========================================================
+# 🔍 АУДИТ МОГО ОГОЛОШЕННЯ
+# =========================================================
+
+@router.callback_query(F.data == "olx_audit_start")
+async def olx_audit_start_cb(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OlxAudit.waiting_url)
+    await cb.answer()
+    await cb.message.answer(
+        "🔍 *Аудит мого оголошення*\n\n"
+        "Встав посилання на СВОЄ оголошення на OLX — проаналізую фото, заголовок, "
+        "опис, ціну і дам конкретні поради, як покращити.",
+        reply_markup=kb_cancel(),
+    )
+
+
+async def _run_audit_flow(target_msg: Message, uid: int, url: str, force: bool = False):
+    """Спільна логіка для першого аудиту і для «🔄 Оновити аудит»."""
+    if not ai_service.is_available():
+        return await target_msg.answer(AI_ERROR_TEXT)
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        return await target_msg.answer(AI_LIMIT_TEXT)
+
+    wait_msg = await target_msg.answer("🔎 Читаю оголошення...")
+    details = await olx_service.fetch_listing_details(url)
+    if not details or details.get("price") is None:
+        return await wait_msg.edit_text(
+            "🤔 Не вдалося зчитати оголошення (можливо, немає видимої ціни або воно "
+            "видалене). Перевір посилання й спробуй ще раз."
+        )
+
+    tracker_id = await olx_db.upsert_own_listing(uid, url, details)
+    tracker = await olx_db.get_tracker(tracker_id)
+    current_hash = olx_db.compute_content_hash(tracker)
+
+    if not force and tracker.get("audit_result") and tracker.get("content_hash") == current_hash:
+        audit = tracker["audit_result"]
+    else:
+        await wait_msg.edit_text("🤖 Аналізую фото, заголовок, опис і ціну (може зайняти хвилину)...")
+        audit = await olx_audit.audit_listing(details)
+        if not audit:
+            return await wait_msg.edit_text(AI_ERROR_TEXT)
+        await ai_usage_db.increment_usage(uid)
+        await olx_db.save_audit_result(tracker_id, audit, current_hash)
+
+    report = olx_audit.format_audit_report(audit, details)
+    await wait_msg.edit_text(report, reply_markup=_ikb_audit_actions(tracker_id))
+
+
+@router.message(OlxAudit.waiting_url)
+async def olx_audit_url_msg(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+
+    url = msg.text.strip()
+    if "olx." not in url:
+        return await msg.answer("⚠️ Схоже, це не посилання на OLX. Спробуй ще раз:")
+
+    await state.clear()
+    await _run_audit_flow(msg, msg.from_user.id, url, force=False)
+    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
+
+
+@router.callback_query(F.data.startswith("olx_audit_redo:"))
+async def olx_audit_redo_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    await cb.answer("Оновлюю аудит...")
+    await _run_audit_flow(cb.message, uid, tracker["url"], force=True)
+
+
+@router.callback_query(F.data.startswith("olx_audit_desc:"))
+async def olx_audit_desc_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+    audit = tracker.get("audit_result")
+    if not audit:
+        await cb.answer()
+        return await cb.message.answer("⚠️ Спочатку зроби аудит цього оголошення.")
+    await cb.answer()
+    await cb.message.answer(olx_audit.format_description(audit))
+
+
+@router.callback_query(F.data.startswith("olx_audit_photos:"))
+async def olx_audit_photos_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+    audit = tracker.get("audit_result")
+    if not audit:
+        await cb.answer()
+        return await cb.message.answer("⚠️ Спочатку зроби аудит цього оголошення.")
+    await cb.answer()
+    await cb.message.answer(olx_audit.format_photo_advice(audit))
+
+
+@router.callback_query(F.data.startswith("olx_audit_price:"))
+async def olx_audit_price_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+    audit = tracker.get("audit_result")
+    if not audit:
+        await cb.answer()
+        return await cb.message.answer("⚠️ Спочатку зроби аудит цього оголошення.")
+    await cb.answer()
+    await cb.message.answer(olx_audit.format_price_advice(audit, _listing_payload(tracker)))
+
+
+@router.callback_query(F.data.startswith("olx_audit_all:"))
+async def olx_audit_all_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+    audit = tracker.get("audit_result")
+    if not audit:
+        await cb.answer()
+        return await cb.message.answer("⚠️ Спочатку зроби аудит цього оголошення.")
+    await cb.answer()
+    await cb.message.answer(olx_audit.format_full_improvement(audit, _listing_payload(tracker)))
