@@ -1,18 +1,26 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: database/mongo.py
 
-Відносно оригіналу додано 3 нові колекції для розширення фічі OLX:
-  olx_deals_col          — Resale History (вже був safe-guard в database/olx.py,
-                            тепер підключаємо по-справжньому)
-  olx_user_settings_col  — теж вже очікувався database/olx.py через safe-guard
-  olx_search_stats_col   — знімки статистики автопошуків (кількість/середня ціна
-                            на момент кожної перевірки) — база для 🔥 OLX Тренди
+Це злиття двох попередніх змін:
+1. Нові колекції для розширення фічі OLX (з твоєї останньої версії):
+     olx_deals_col          — Resale History
+     olx_user_settings_col  — налаштування користувача OLX
+     olx_search_stats_col   — знімки статистики автопошуків → база для 🔥 OLX Тренди
+   + колекції фічі 🍳 Кухня (favorite_recipes_col і т.д.) — без змін.
 
-Колекції фічі 🍳 Кухня (favorite_recipes_col і т.д.) залишені без змін.
-Усе інше — без змін.
+2. КРИТИЧНЕ ВИПРАВЛЕННЯ db_call(), яке в цій версії файлу знову містило
+   стару помилку: цикл retry намагався await-нути один і той самий
+   coroutine-об'єкт кілька разів. Coroutine у Python можна виконати
+   (await) лише ОДИН раз — друга спроба кидає
+   RuntimeError("cannot reuse already awaited coroutine"), який НЕ є
+   PyMongoError і тому не ловиться в except PyMongoError, а летить далі
+   необробленим і зрештою показується користувачу як загальна помилка
+   "Тимчасова проблема з базою даних" — навіть коли Mongo вже давно
+   відповідає нормально. Тепер — один виклик, без хибного retry.
+   Сигнатура db_call(coro, default=None, retries=2, raise_on_fail=True)
+   НЕ змінена — усі існуючі виклики по всьому проєкту працюють без правок.
 """
 
-import asyncio
 import logging
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -46,11 +54,11 @@ job_feedback_col = None
 creative_generations_col = None
 autoria_saved_col = None
 
-# ---- НОВЕ: Resale History / налаштування користувача OLX ----
+# ---- Resale History / налаштування користувача OLX ----
 olx_deals_col = None
 olx_user_settings_col = None
 
-# ---- НОВЕ: знімки статистики автопошуків -> база для 🔥 OLX Тренди ----
+# ---- знімки статистики автопошуків -> база для 🔥 OLX Тренди ----
 olx_search_stats_col = None
 
 # ---- колекції фічі 🍳 Кухня ----
@@ -109,12 +117,10 @@ async def init_mongo(mongo_uri: str):
 
     autoria_saved_col = db["autoria_saved"]
 
-    # ---- НОВЕ ----
     olx_deals_col = db["olx_deals"]
     olx_user_settings_col = db["olx_user_settings"]
     olx_search_stats_col = db["olx_search_stats"]
 
-    # ---- колекції фічі 🍳 Кухня ----
     favorite_recipes_col = db["favorite_recipes"]
     recipe_history_col = db["recipe_history"]
     shopping_items_col = db["shopping_items"]
@@ -145,16 +151,18 @@ class DBUnavailable(Exception):
 
 
 async def db_call(coro, default=None, retries=2, raise_on_fail=True):
-    last_exc = None
-    for attempt in range(retries + 1):
-        try:
-            return await coro
-        except PyMongoError as e:
-            last_exc = e
-            if attempt < retries:
-                await asyncio.sleep(0.5)
-                continue
-    logger.exception("MongoDB error: %s", last_exc)
-    if raise_on_fail:
-        raise DBUnavailable(str(last_exc)) from last_exc
-    return default
+    """
+    ВИПРАВЛЕНО (див. докстрінг файлу): один await, без хибного повторного
+    await того самого coroutine-об'єкта. retries лишений у сигнатурі для
+    сумісності з будь-якими викликами, що передають його явно, але
+    фактичного повторного виклику більше не робить — coroutine-об'єкт
+    неможливо виконати вдруге, справжній retry вимагав би фабрики
+    coroutine (лямбди) в кожному з сотень місць виклику по проєкту.
+    """
+    try:
+        return await coro
+    except PyMongoError as e:
+        logger.exception("MongoDB error: %s", e)
+        if raise_on_fail:
+            raise DBUnavailable(str(e)) from e
+        return default
