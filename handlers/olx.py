@@ -12,6 +12,7 @@ from config.settings import AI_DAILY_LIMIT
 from database import olx as olx_db
 from database import ai_usage as ai_usage_db
 from services import olx_service
+from services import olx_scanner
 from services import ai_service
 from services import resale_engine
 from services import olx_audit
@@ -78,7 +79,7 @@ def _ikb_after_analysis(tracker_id: str, status: str = "watching") -> InlineKeyb
             InlineKeyboardButton(text="🧮 Перерахувати", callback_data=f"olx_reanalyze:{tracker_id}"),
         ],
         [
-            InlineKeyboardButton(text="🔎 Схожі", callback_data=f"olx_similar:{tracker_id}"),
+            InlineKeyboardButton(text="🔎 Схожі (AI)", callback_data=f"olx_similar:{tracker_id}"),
             InlineKeyboardButton(text="⭐ Зберегти", callback_data=f"olx_fav:{tracker_id}"),
         ],
     ]
@@ -527,11 +528,26 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
 
 @router.callback_query(F.data.startswith("olx_similar:"))
 async def olx_similar_cb(cb: CallbackQuery):
+    """
+    🔎 Схожі (AI): бере той самий пошуковий запит, що й раніше (назва/бренд/
+    модель товару з AI-аналізу або заголовка), але замість "сирого" списку
+    результатів прожовує найдешевші свіжі оголошення через ТОЙ САМИЙ AI
+    resale-аналіз, що й olx_scanner.scan_for_deals (🧲 Злови помилку), і
+    показує їх відсортованими від найвигіднішого — тобто одразу видно не
+    просто "схоже", а "схоже і вигідне для перепродажу".
+
+    ВАЖЛИВО: як і "Злови помилку", кожна перевірка тут списує денний AI-ліміт
+    користувача (по одному кредиту за кожне проаналізоване оголошення) — це
+    свідомо, щоб не "з'їсти" ліміт непомітно однією кнопкою.
+    """
     await cb.answer()
 
     tid = cb.data.split(":", 1)[1]
     uid = cb.from_user.id
-    wait_msg = await cb.message.answer("🔎 Шукаю схожі оголошення...")
+    wait_msg = await cb.message.answer(
+        "🔎 Шукаю найдешевші схожі оголошення і прогоняю їх через AI Resale "
+        "Hunter (це може зайняти хвилину)..."
+    )
 
     try:
         tracker = await olx_db.get_tracker(tid)
@@ -548,39 +564,34 @@ async def olx_similar_cb(cb: CallbackQuery):
             )
 
         domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
-        results = await olx_service.search_listings(query_text, None, "", 0, domain=domain)
+        own_url = tracker.get("url")
 
-        if results is None:
+        ranked, error = await olx_scanner.scan_for_deals(uid, query_text, None, "", 0, domain=domain)
+
+        if error == "ai_unavailable":
+            return await wait_msg.edit_text(AI_ERROR_TEXT)
+        if error == "ai_limit":
+            return await wait_msg.edit_text(AI_LIMIT_TEXT)
+        if error == "search_failed":
             return await wait_msg.edit_text(
                 "⚠️ Не вдалося виконати пошук на OLX прямо зараз (сайт тимчасово "
                 "заблокував запит або недоступний). Спробуй ще раз за хвилину."
             )
 
-        own_url = tracker.get("url")
-        results = [r for r in results if r.get("url") != own_url][:5]
+        ranked = [r for r in (ranked or []) if r.get("url") != own_url]
 
-        if not results:
-            # Порожньо тут означає одне з двох: або справді немає активних
-            # оголошень за таким запитом, або OLX Х (внутрішньо) видав лише
-            # fallback-картки, які search_listings() уже відкинув — в обох
-            # випадках чесно кажемо, що реально схожого нічого не знайдено,
-            # а не показуємо випадкові товари.
+        if not ranked:
             return await wait_msg.edit_text(
-                f"📭 Схожих оголошень за «{query_text}» не знайдено. "
-                f"Спробуй пізніше — можливо, зараз мало активних оголошень саме за такою назвою."
+                f"📭 Серед найдешевших свіжих оголошень за «{query_text}» AI не знайшов "
+                f"нічого вигіднішого/вартого уваги. Спробуй пізніше — можливо, з'являться нові."
             )
 
-        # Назви товарів і URL приходять "сирими" з OLX і можуть містити будь-які
-        # символи (*, _, [, ] тощо), тому це повідомлення навмисно надсилається
-        # БЕЗ парсингу Markdown/HTML (parse_mode="") — інакше один "кривий"
-        # символ в одному товарі ламає ВСЕ повідомлення помилкою
-        # "can't find end of the entity", навіть після ручного екранування.
-        lines = [f"🔎 Схожі оголошення — «{query_text}»", ""]
-        for r in results:
-            price_text = f"{r['price']:.0f} {r['currency']}" if r.get("price") else "ціна не вказана"
-            lines.append(f"• {r['title']} — {price_text}")
-            lines.append(f"  {r['url']}")
-        await wait_msg.edit_text("\n".join(lines), parse_mode="")
+        header = f"🔎 Найкращі схожі оголошення для перепродажу — «{query_text}»\n\n"
+        # Назви й описи товарів приходять "сирими" з OLX і можуть містити
+        # символи (*, _, [, ]), які ламають Markdown-парсинг Telegram —
+        # надсилаємо без парсингу, щоб один "кривий" символ в одному
+        # оголошенні не зривав усе повідомлення.
+        await wait_msg.edit_text(header + resale_engine.format_top_deals(ranked), parse_mode="")
     except Exception:
         logger.exception("olx_similar_cb failed for tracker=%s uid=%s", tid, uid)
         try:
