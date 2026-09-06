@@ -566,7 +566,18 @@ async def olx_similar_cb(cb: CallbackQuery):
         domain = "olx.pl" if "olx.pl" in (tracker.get("url") or "") else "olx.ua"
         own_url = tracker.get("url")
 
-        ranked, error = await olx_scanner.scan_for_deals(uid, query_text, None, "", 0, domain=domain)
+        async def _progress(done: int, total: int):
+            try:
+                await wait_msg.edit_text(
+                    f"🔎 Шукаю найдешевші схожі оголошення за «{query_text}»...\n"
+                    f"🤖 AI перевірив {done}/{total}"
+                )
+            except Exception:
+                pass
+
+        ranked, error = await olx_scanner.scan_for_deals(
+            uid, query_text, None, "", 0, domain=domain, progress_cb=_progress
+        )
 
         if error == "ai_unavailable":
             return await wait_msg.edit_text(AI_ERROR_TEXT)
