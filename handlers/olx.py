@@ -479,6 +479,20 @@ _SKU_CODE_RE = re.compile(
     r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
 )
 
+# Загальні маркетингові слова, які часто друкують на упаковці/в описі і які
+# AI іноді помилково приймає за назву бренду товару (напр. "Professional",
+# "Premium" на коробці з фішками для покеру). Використання ТАКОГО слова як
+# єдиного пошукового запиту призводить до абсолютно нерелевантної видачі
+# (будь-який товар з написом "Professional" на упаковці). Тому такі слова
+# ніколи не приймаються як самостійний бренд/модель для пошуку "Схожих" —
+# у такому разі код одразу переходить до пошуку за назвою товару.
+_GENERIC_MARKETING_WORDS = {
+    "professional", "premium", "original", "classic", "standard", "deluxe",
+    "super", "mega", "new", "quality", "pro", "elite", "extra",
+    "професійний", "преміум", "оригінал", "класик", "стандарт", "делюкс",
+    "супер", "мега", "новий", "якісний", "еліт",
+}
+
 
 def _clean_query_text(text) -> str:
     if text is None:
@@ -489,11 +503,18 @@ def _clean_query_text(text) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _first_nonempty(*values) -> str:
+def _is_generic_marketing_word(text: str) -> bool:
+    return text.strip().lower() in _GENERIC_MARKETING_WORDS
+
+
+def _first_nonempty(*values, reject_generic: bool = False) -> str:
     for v in values:
         cleaned = _clean_query_text(v)
-        if cleaned and cleaned.lower() not in _NULLISH:
-            return cleaned
+        if not cleaned or cleaned.lower() in _NULLISH:
+            continue
+        if reject_generic and _is_generic_marketing_word(cleaned):
+            continue
+        return cleaned
     return ""
 
 
@@ -501,8 +522,10 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     if not isinstance(analysis, dict):
         analysis = {}
 
-    brand = _first_nonempty(analysis.get("item_brand"), analysis.get("brand"))
-    model = _first_nonempty(analysis.get("item_model"), analysis.get("model"))
+    # reject_generic=True — бренд/модель ігноруються, якщо це загальне
+    # маркетингове слово (типу "Professional"), а не справжня назва бренду.
+    brand = _first_nonempty(analysis.get("item_brand"), analysis.get("brand"), reject_generic=True)
+    model = _first_nonempty(analysis.get("item_model"), analysis.get("model"), reject_generic=True)
     if brand and model:
         return f"{brand} {model}"
     if brand:
@@ -512,7 +535,11 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     if not name:
         name = _first_nonempty(tracker.get("title"))
 
-    words = name.split()
+    # З назви товару теж прибираємо загальні маркетингові слова, щоб вони
+    # не "з'їдали" одне з обмежених 4 слів запиту і не тягнули видачу вбік.
+    words = [w for w in name.split() if not _is_generic_marketing_word(w)]
+    if not words:
+        words = name.split()
     return " ".join(words[:4])
 
 
@@ -522,13 +549,6 @@ async def olx_similar_cb(cb: CallbackQuery):
     🔎 Схожі (AI): той самий пошуковий запит (назва/бренд/модель товару з
     AI-аналізу або заголовка), прожований через ТОЙ САМИЙ resale-аналіз,
     що й 🧲 Злови помилку, показаний відсортованим від найвигіднішого.
-
-    ВАЖЛИВО: olx_scanner.scan_for_deals() -> resale_engine.rank_top_deals()
-    повертає елементи у форматі {"tracker": {...}, "analysis": {...},
-    "score": ...} — САМЕ ключ "tracker" містить title/last_price/currency/url
-    (не "listing"!). Раніше тут помилково читали неіснуючий ключ "listing",
-    через що завжди виходило "Без назви — ціна не вказана" і посилання
-    губились.
     """
     await cb.answer()
 
@@ -592,10 +612,6 @@ async def olx_similar_cb(cb: CallbackQuery):
 
         header = f"🔎 Найкращі схожі оголошення для перепродажу — «{query_text}»\n\n"
 
-        # format_top_deals() показує лише ТОП-3 (медалі) і не додає URL (бо
-        # там юзер вже має посилання у своїх підписках). Тут юзер бачить ці
-        # оголошення вперше, тому окремо додаємо посилання на ВСІ
-        # проаналізовані варіанти — беремо їх з правильного ключа "tracker".
         top_summary = resale_engine.format_top_deals(ranked).replace("*", "")
 
         links_lines = ["", "🔗 Посилання на всі проаналізовані оголошення:"]
