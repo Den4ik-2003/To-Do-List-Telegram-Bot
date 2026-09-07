@@ -2,6 +2,7 @@ import logging
 import re
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -66,19 +67,36 @@ def _fmt_vacancy_card(v: dict, total_shown: int, position: int) -> str:
     return "\n".join(lines)
 
 
+async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
+    try:
+        return await target.edit_text(text, **kwargs)
+    except TelegramBadRequest:
+        logger.warning("edit_text failed for message_id=%s, sending new message instead", target.message_id)
+        return await target.answer(text, **kwargs)
+
+
 async def _run_search(msg: Message, uid: int, query_text: str):
+    try:
+        await _run_search_inner(msg, uid, query_text)
+    except Exception:
+        logger.exception("Job search crashed for uid=%s query=%r", uid, query_text)
+        try:
+            await msg.answer(
+                "⚠️ Сталася помилка під час пошуку вакансій. Спробуй ще раз трохи пізніше.",
+                reply_markup=kb_main(),
+            )
+        except Exception:
+            logger.exception("Failed to notify uid=%s about job search crash", uid)
+
+
+async def _run_search_inner(msg: Message, uid: int, query_text: str):
     profile = await job_profile_db.get_profile(uid)
     feedback = await jobs_db.get_recent_feedback(uid)
 
-    # reply_markup=kb_main() тут важливо: щойно запит відправлено, кнопка
-    # "❌ Скасувати" (яка була показана під час введення запиту) більше не
-    # має сенсу і має одразу зникнути з клавіатури — інакше вона лишається
-    # "мертвою" на екрані (стан уже очищено, тож натискання на неї нічого
-    # не робить).
     wait_msg = await msg.answer("🔎 Аналізую запит і шукаю вакансії...", reply_markup=kb_main())
     criteria = await jobs_service.parse_job_query(query_text, profile, feedback)
     if not criteria:
-        return await wait_msg.edit_text(AI_ERROR_TEXT)
+        return await _safe_edit(wait_msg, AI_ERROR_TEXT)
 
     _criteria_cache[uid] = criteria
 
@@ -86,14 +104,15 @@ async def _run_search(msg: Message, uid: int, query_text: str):
     if not vacancies:
         _results_cache[uid] = []
         _position_cache[uid] = 0
-        return await wait_msg.edit_text(
+        return await _safe_edit(
+            wait_msg,
             "📭 Нічого не знайшов за цим запитом на Djinni / Work.ua / Robota.ua.\n\n"
             "Спробуй ширші критерії (менше уточнень одразу) — або збережи цей пошук, "
             "і я сам повідомлю, щойно з'явиться щось підходяще.",
             reply_markup=ikb_empty_search(),
         )
 
-    await wait_msg.edit_text(f"✅ Знайдено {len(vacancies)} вакансій. Оцінюю відповідність...")
+    await _safe_edit(wait_msg, f"✅ Знайдено {len(vacancies)} вакансій. Оцінюю відповідність...")
 
     scored = []
     for v in vacancies[:15]:
@@ -157,11 +176,6 @@ async def jobs_search_query(msg: Message, state: FSMContext):
 
 @router.message(StateFilter(None), F.text == "❌ Скасувати")
 async def jobs_stray_cancel(msg: Message, state: FSMContext):
-    """Захист від "мертвої" кнопки Скасувати: якщо вона все ж лишилась на
-    клавіатурі (стан уже None), просто повертаємо в головне меню, замість
-    того щоб мовчки ігнорувати натискання. Спрацьовує лише коли НЕМАЄ
-    активного FSM-стану — тож не заважає Скасувати всередині інших флоу
-    (напр. OLX), які самі обробляють цю кнопку у своїх станах."""
     await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
 
 
@@ -206,9 +220,6 @@ async def jobs_save_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("jb_analyze:"))
 async def jobs_analyze_cb(cb: CallbackQuery):
-    """🤖 AI аналіз вакансії: розгорнутий розбір (окремо від короткого %
-    відповідності та cover letter) — вимоги, навички є/бракує, рівень,
-    плюси/мінуси, чи варто подаватись."""
     uid = cb.from_user.id
     idx = int(cb.data.split(":", 1)[1])
     results = _results_cache.get(uid) or []
@@ -222,13 +233,17 @@ async def jobs_analyze_cb(cb: CallbackQuery):
     await cb.answer("Аналізую вакансію...")
     wait_msg = await cb.message.answer("🤖 Готую детальний AI-аналіз вакансії (вимоги, навички, рівень)...")
 
-    profile = await job_profile_db.get_profile(uid)
-    v = results[idx]
-    analysis = await jobs_service.analyze_vacancy_full(v, profile)
-    if not analysis:
-        return await wait_msg.edit_text(AI_ERROR_TEXT)
+    try:
+        profile = await job_profile_db.get_profile(uid)
+        v = results[idx]
+        analysis = await jobs_service.analyze_vacancy_full(v, profile)
+        if not analysis:
+            return await _safe_edit(wait_msg, AI_ERROR_TEXT)
 
-    await wait_msg.edit_text(f"🤖 *AI аналіз вакансії*\n*{v.get('title','')}*\n\n{analysis}")
+        await _safe_edit(wait_msg, f"🤖 *AI аналіз вакансії*\n*{v.get('title','')}*\n\n{analysis}")
+    except Exception:
+        logger.exception("Vacancy analysis crashed for uid=%s idx=%s", uid, idx)
+        await _safe_edit(wait_msg, AI_ERROR_TEXT)
 
 
 @router.callback_query(F.data.startswith("jb_notint:"))
@@ -268,7 +283,13 @@ async def jobs_cover_cb(cb: CallbackQuery):
 
     await cb.answer("Пишу cover letter...")
     v = results[idx]
-    letter = await jobs_service.generate_cover_letter(v, profile)
+
+    try:
+        letter = await jobs_service.generate_cover_letter(v, profile)
+    except Exception:
+        logger.exception("Cover letter generation crashed for uid=%s idx=%s", uid, idx)
+        letter = None
+
     if not letter:
         return await cb.message.answer(AI_ERROR_TEXT)
 
@@ -317,9 +338,6 @@ async def jobs_watch_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "jb_watch_empty")
 async def jobs_watch_empty_cb(cb: CallbackQuery):
-    """Дозволяє зберегти пошук в автопошук навіть якщо зараз результатів
-    немає — раніше це було неможливо, бо критерії кешувались лише ПІСЛЯ
-    перевірки на порожній результат."""
     uid = cb.from_user.id
     criteria = _criteria_cache.get(uid)
     if not criteria:

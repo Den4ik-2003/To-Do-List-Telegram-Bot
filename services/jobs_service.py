@@ -1,7 +1,7 @@
-import asyncio
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from urllib.parse import quote
 
@@ -13,10 +13,7 @@ from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
 
-# DOU має офіційний RSS-фід за пошуком/категорією — надійніше за парсинг HTML
-# (XML-структура стандартна, не ламається при зміні верстки сайту).
 DOU_RSS_URL = "https://jobs.dou.ua/vacancies/feeds/?search={query}"
-# Djinni: підтверджений живий шаблон урла за ключовим словом + rss-версія.
 DJINNI_KEYWORD_RSS_URL = "https://djinni.co/jobs/keyword-{query}/rss/"
 WORKUA_SEARCH_URL = "https://www.work.ua/jobs-{query}/"
 WORKUA_SEARCH_CITY_URL = "https://www.work.ua/jobs-{city}-{query}/"
@@ -35,10 +32,6 @@ PROFESSION_SYNONYMS = {
     "без досвіду": "no experience",
 }
 
-# Слаги міст, які реально використовує Work.ua у своїх URL (перевірено на
-# живому сайті: розділ "These jobs by city" на сторінці результатів пошуку).
-# Якщо місто користувача не входить у цей список — просто шукаємо по всій
-# Україні (краще ширший пошук, ніж побудова неробочого URL).
 WORKUA_CITY_SLUGS = {
     "київ": "kyiv", "kyiv": "kyiv", "киев": "kyiv",
     "дніпро": "dnipro", "днепр": "dnipro", "dnipro": "dnipro",
@@ -164,10 +157,6 @@ def _search_slug(criteria: dict) -> str:
 
 
 def _enrich_from_text(item: dict, text: str) -> dict:
-    """Дописує salary/experience/work_format у вже сформований словник
-    вакансії, якщо там ще None, шукаючи ці дані прямо в наданому тексті
-    (опис RSS-запису тощо). Нічого не вигадує — лише витягує те, що
-    буквально написано в тексті джерела."""
     if not text:
         return item
     if item.get("salary") is None:
@@ -187,46 +176,53 @@ def _enrich_from_text(item: dict, text: str) -> dict:
 
 
 def _extract_company_prefix(text: str) -> str | None:
-    """Djinni RSS часто починає опис із "Назва компанії — ...". Витягуємо
-    це, якщо збігається патерн; інакше чесно повертаємо None замість
-    вигадування назви компанії."""
     if not text:
         return None
     m = _COMPANY_PREFIX_RE.match(text.strip())
     return m.group(1).strip() if m else None
 
 
+def _strip_rss_html(raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        return BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        return raw
+
+
+def _rss_findtext(item: ET.Element, tag: str) -> str:
+    for child in item:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local.lower() == tag:
+            return (child.text or "").strip()
+    return ""
+
+
 async def _fetch_rss_items(url: str, source_name: str) -> list[dict]:
-    """Спільна логіка для RSS-джерел (Djinni, DOU) — надійніша за парсинг
-    HTML, бо структура RSS (title/link/description) стандартна незалежно
-    від дизайну сайту."""
     try:
         async with aiohttp.ClientSession(headers=CURL_HEADERS) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                 if resp.status != 200:
                     logger.warning("%s RSS status=%s for %s", source_name, resp.status, url)
                     return []
-                xml = await resp.text()
+                xml_text = await resp.text()
     except Exception:
         logger.exception("%s RSS fetch failed for %s", source_name, url)
         return []
 
     try:
-        soup = BeautifulSoup(xml, "xml")
-        items = soup.find_all("item")
-    except Exception:
+        root = ET.fromstring(xml_text)
+        items = root.findall(".//item")
+    except ET.ParseError:
         logger.exception("%s RSS parse failed", source_name)
         return []
 
     results = []
     for item in items:
-        title_el = item.find("title")
-        link_el = item.find("link")
-        desc_el = item.find("description")
-
-        title = title_el.get_text(strip=True) if title_el else ""
-        link = link_el.get_text(strip=True) if link_el else ""
-        description = desc_el.get_text(" ", strip=True) if desc_el else ""
+        title = _rss_findtext(item, "title")
+        link = _rss_findtext(item, "link")
+        description = _strip_rss_html(_rss_findtext(item, "description"))
 
         if not title or not link:
             continue
@@ -267,9 +263,6 @@ async def fetch_dou(criteria: dict) -> list[dict]:
 
 
 def _extract_first_link_text(soup: BeautifulSoup, href_pattern: str) -> list[tuple[str, str]]:
-    """Загальна допоміжна функція для сайтів без стабільної RSS-структури
-    (Robota.ua fallback) — шукає посилання за патерном у href і повертає
-    (текст, href) пари."""
     pairs = []
     seen = set()
     for a in soup.find_all("a", href=True):
@@ -297,11 +290,6 @@ def _workua_url(criteria: dict) -> str | None:
 
 
 def _find_card_container(a_tag, title: str):
-    """Піднімається від посилання на вакансію вгору по DOM, доки не
-    знайде найменшого предка, що: (а) містить текст заголовка, (б) має
-    рівно ОДНЕ посилання на вакансію всередині (щоб не захопити весь
-    список результатів), і (в) має розумний за розміром текст (одна
-    картка, а не вся сторінка)."""
     node = a_tag
     for _ in range(6):
         parent = node.parent
@@ -330,11 +318,6 @@ def _looks_like_city(line: str) -> bool:
 
 
 def _parse_workua_card_lines(lines: list[str], title: str) -> dict:
-    """Розбирає текстові рядки картки вакансії Work.ua. Кожне поле
-    заповнюється, лише якщо на сторінці буквально знайдено відповідний
-    текст (ціна/досвід/локація за regex, місто — за списком назв міст) —
-    нічого не вигадується. Якщо якесь поле не вдалось надійно розпізнати,
-    воно лишається None замість вгадування."""
     result = {"company": None, "location": None, "work_format": None,
               "salary": None, "experience": None, "description": ""}
     desc_parts = []
@@ -425,12 +408,6 @@ async def fetch_workua(criteria: dict) -> list[dict]:
 
 
 def _extract_robotaua_from_embedded_json(html: str) -> list[dict]:
-    """Деякі SPA віддають ботам/пошуковим краулерам SSR-знімок стану у
-    вигляді <script type="application/json">/__NEXT_DATA__. Якщо Robota.ua
-    робить так само — чесно дістаємо вакансії звідти без headless-браузера.
-    Якщо такого блоку немає (найімовірніший випадок — сайт client-side
-    React), тихо повертаємо порожній список: це НЕ помилка, просто цей
-    шлях тут недоступний."""
     scripts = re.findall(r'<script[^>]+type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
     scripts += re.findall(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
 
@@ -531,12 +508,6 @@ async def fetch_robotaua(criteria: dict) -> list[dict]:
         })
 
     if not results:
-        # Robota.ua — важкий React SPA: список вакансій рендериться на клієнті
-        # через JS, а їхній публічний API без ключа (api.robota.ua) віддає
-        # ЛИШЕ опубліковані вакансії конкретної відомої компанії
-        # (/companies/{id}/published-vacancies), а не довільний пошук за
-        # ключовим словом. Це підтверджене технічне обмеження джерела, а не
-        # помилка бота — тому просто чесно повертаємо порожній результат.
         logger.info(
             "Robota.ua: 0 результатів для запиту %r — сайт рендерить список вакансій "
             "через JS і не має публічного keyword-search API (лише per-company endpoint).",
@@ -552,11 +523,6 @@ def _normalize_for_dedup(v: dict) -> str:
 
 
 def dedupe_vacancies(vacancies: list[dict], threshold: float = 0.82) -> list[dict]:
-    """
-    Об'єднує вакансії, які схожі за назвою+компанією навіть якщо URL різні
-    (та сама вакансія на Work.ua і Robota.ua). Для кожної групи лишає перший
-    запис, але додає поле "sources" зі списком усіх джерел, де вона знайдена.
-    """
     unique: list[dict] = []
     keys: list[str] = []
 
@@ -569,8 +535,6 @@ def dedupe_vacancies(vacancies: list[dict], threshold: float = 0.82) -> list[dic
                 sources = set(existing.get("sources", [existing.get("source", "")]))
                 sources.add(v.get("source", ""))
                 existing["sources"] = sorted(s for s in sources if s)
-                # Якщо в дублікаті є поле, якого не було в оригіналі
-                # (напр. Djinni не дав зарплату, а Work.ua дав) — доповнюємо.
                 for field in ("company", "salary", "location", "work_format", "experience"):
                     if not existing.get(field) and v.get(field):
                         existing[field] = v[field]
@@ -627,10 +591,6 @@ async def search_vacancies(criteria: dict) -> list[dict]:
     if vacancies:
         return vacancies
 
-    # Автоматично пробуємо ширший запит: лише перше ключове слово, без
-    # прив'язки до міста — це рятує реальні випадки, коли AI видав занадто
-    # вузький/специфічний запит (кілька слів одразу + місто), під який
-    # жодне джерело нічого не має.
     keywords = criteria.get("search_keywords") or []
     if len(keywords) > 1 or criteria.get("city"):
         broadened = dict(criteria)
@@ -668,9 +628,6 @@ async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
 
 
 async def analyze_vacancy_full(vacancy: dict, profile: dict | None) -> str | None:
-    """🤖 AI аналіз вакансії: розгорнутий якісний розбір (не просто %
-    відповідності) — що вимагають, які навички є/бракує, рівень вакансії,
-    плюси/мінуси, чи варто подаватись."""
     if not ai_service.is_available():
         return None
 
