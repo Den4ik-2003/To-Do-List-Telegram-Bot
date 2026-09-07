@@ -1,9 +1,13 @@
+import hashlib
 import logging
+import re
 import time
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
 
@@ -111,7 +115,6 @@ def _analyze_forms(html: str) -> dict:
     issues = []
     for i, form in enumerate(forms, start=1):
         action = form.get("action", "").strip()
-        method = (form.get("method") or "get").strip().lower()
         inputs = form.find_all(["input", "textarea", "select"])
         submit_btn = form.find(["button"]) or form.find("input", {"type": "submit"})
 
@@ -141,14 +144,6 @@ def _find_broken_images(base_url: str, html: str, limit: int = 10) -> list[str]:
 
 
 async def run_qa_scan(base_url: str, max_pages: int = 8) -> dict:
-    """
-    Проводить QA-скан рівня HTTP/HTML: доступність головної та внутрішніх
-    сторінок, биті посилання/зображення, наявність форм і базові проблеми
-    в них, час відповіді кожної сторінки.
-
-    НЕ виконує JS і не клікає по кнопках буквально — для цього потрібен
-    headless-браузер (Playwright), якого зараз немає в стеку.
-    """
     report = {
         "base_url": base_url,
         "critical_error": None,
@@ -254,3 +249,205 @@ def format_qa_report(report: dict) -> str:
         lines.append("\n💡 Кнопки й JS-поведінку цей скан не перевіряє — тільки HTTP/HTML рівень.")
 
     return "\n".join(lines)
+
+
+# ============================================================
+# НОВЕ: Моніторинг сторінок (контент-діф + AI-аналіз)
+# ============================================================
+
+PAGE_CONTENT_SNAPSHOT_CHARS = 6000   # скільки символів зберігати як знімок
+PAGE_CONTENT_PROMPT_CHARS = 3000     # скільки символів старого/нового тексту слати в AI-промпт
+_NOISE_TAGS = ["script", "style", "noscript", "svg", "iframe"]
+
+IMPORTANCE_ICON = {"low": "🟢", "none": "🟢", "medium": "🟡", "high": "🔴"}
+FREQ_LABELS = {15: "15 хв", 30: "30 хв", 60: "1 год", 180: "3 год", 360: "6 год", 720: "12 год", 1440: "24 год"}
+FREQ_OPTIONS = [15, 30, 60, 180, 360, 720, 1440]
+
+
+def format_interval(minutes: int) -> str:
+    return FREQ_LABELS.get(minutes, f"{minutes} хв")
+
+
+def _extract_visible_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(_NOISE_TAGS):
+        tag.decompose()
+    text = soup.get_text(separator=" ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+async def fetch_page_content_text(url: str, timeout_seconds: int = 12) -> dict | None:
+    """
+    Повертає {"text": str} при успіху або {"error": str} якщо сторінку
+    неможливо коректно завантажити/проаналізувати — щоб хендлер/scheduler
+    чесно повідомили користувачу, а не вигадували зміни на порожніх даних.
+    """
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=timeout_seconds), allow_redirects=True
+            ) as resp:
+                if resp.status in (403, 429):
+                    return {"error": f"сайт заблокував доступ (статус {resp.status})"}
+                if resp.status >= 400:
+                    return {"error": f"сторінка повернула помилку (статус {resp.status})"}
+                html = await resp.text(errors="ignore")
+    except Exception:
+        logger.warning("Page content fetch failed for %s", url)
+        return {"error": "сторінка недоступна або перевищено час очікування"}
+
+    text = _extract_visible_text(html)
+    if not text or len(text) < 20:
+        return {"error": "не вдалося розпізнати текстовий вміст (можливо, потрібен JS для рендеру)"}
+
+    return {"text": text[:PAGE_CONTENT_SNAPSHOT_CHARS]}
+
+
+def hash_content(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def should_notify(watch: dict, importance: str) -> bool:
+    if not watch.get("notifications_enabled", True):
+        return False
+    if importance == "high":
+        return True
+    if importance == "medium":
+        return watch.get("notify_moderate", False)
+    return False
+
+
+async def analyze_page_change(url: str, old_text: str, new_text: str) -> dict | None:
+    """Викликається ЛИШЕ коли хеш контенту вже змінився (перевіряється в
+    scheduler/хендлері до виклику) — щоб не палити AI-запити на сторінках
+    без змін."""
+    if not ai_service.is_available():
+        return None
+
+    old_snip = old_text[:PAGE_CONTENT_PROMPT_CHARS]
+    new_snip = new_text[:PAGE_CONTENT_PROMPT_CHARS]
+
+    prompt = (
+        "Ти аналізуєш зміни на веб-сторінці для системи моніторингу. "
+        "Порівняй старий і новий вміст та визнач, чи це РЕАЛЬНА змістовна зміна, "
+        "чи технічний шум (лічильник переглядів, поточна дата/час, id сесії, "
+        "реклама, порядок елементів без зміни змісту тощо).\n\n"
+        f"URL: {url}\n\n"
+        f"БУЛО:\n{old_snip}\n\n"
+        f"СТАЛО:\n{new_snip}\n\n"
+        "Поверни ЛИШЕ JSON без пояснень:\n"
+        '{"is_real_change": true/false, '
+        '"importance": "low"/"medium"/"high", '
+        '"change_type": "price"/"availability"/"content"/"design"/"other", '
+        '"summary": "коротко одним реченням українською що змінилося", '
+        '"before": "стисло що було українською", '
+        '"after": "стисло що стало українською", '
+        '"why_important": "чому ця зміна важлива користувачу (або чому неважлива), українською"}\n'
+        'Якщо це шум — постав is_real_change: false, importance: "low".'
+    )
+    return await ai_service.generate_json(prompt, temperature=0.3)
+
+
+async def build_ai_trend_report(url: str, history: list[dict]) -> dict | None:
+    if not ai_service.is_available():
+        return None
+
+    entries = []
+    for h in history[:30]:
+        date = (h.get("checked_at") or "")[:10]
+        entries.append(f"- {date} [{h.get('change_type', 'other')}/{h.get('importance', '')}]: {h.get('summary', '')}")
+    history_text = "\n".join(entries)
+
+    prompt = (
+        "Ти аналізуєш накопичену історію змін веб-сторінки, яку моніторить користувач.\n\n"
+        f"URL: {url}\n\nІсторія змін (від новіших до старіших):\n{history_text}\n\n"
+        "На основі цієї історії зроби аналітичний висновок. Поверни ЛИШЕ JSON:\n"
+        '{"trends": "які зміни відбуваються найчастіше, українською", '
+        '"price_trend": "як змінюється ціна, або null якщо не стосується", '
+        '"availability_pattern": "чи часто з’являються/зникають товари, або null", '
+        '"content_pattern": "як змінюється контент сторінки, українською", '
+        '"prediction": "що ймовірно зміниться найближчим часом на основі патерну, українською"}'
+    )
+    return await ai_service.generate_json(prompt, temperature=0.5)
+
+
+def format_change_notification(url: str, label: str, importance: str, analysis: dict) -> str:
+    icon = IMPORTANCE_ICON.get(importance, "🟡")
+    return (
+        f"{icon} *Зміна на сторінці* — {label}\n"
+        f"🌐 {url}\n\n"
+        f"*Було:*\n{analysis.get('before', '—')}\n\n"
+        f"*Стало:*\n{analysis.get('after', '—')}\n\n"
+        f"🤖 {analysis.get('summary', '')}\n{analysis.get('why_important', '')}"
+    )
+
+
+def format_history(label: str, history: list[dict]) -> str:
+    if not history:
+        return f"📭 Історія змін для «{label}» поки порожня."
+    lines = [f"📜 *Історія змін* — {label}\n"]
+    for h in history:
+        icon = IMPORTANCE_ICON.get(h.get("importance"), "🟡")
+        date = (h.get("checked_at") or "")[:16].replace("T", " ")
+        lines.append(f"{icon} {date} — {h.get('summary', '')}")
+    return "\n".join(lines)
+
+
+def format_ai_report(label: str, report: dict) -> str:
+    lines = [f"🤖 *AI-звіт* — {label}\n", f"📊 {report.get('trends', '—')}"]
+    if report.get("price_trend"):
+        lines.append(f"\n💰 Ціна: {report['price_trend']}")
+    if report.get("availability_pattern"):
+        lines.append(f"\n📦 Наявність: {report['availability_pattern']}")
+    if report.get("content_pattern"):
+        lines.append(f"\n📝 Контент: {report['content_pattern']}")
+    if report.get("prediction"):
+        lines.append(f"\n🔮 Прогноз: {report['prediction']}")
+    return "\n".join(lines)
+
+
+def format_global_stats(watches: list[dict]) -> str:
+    total = len(watches)
+    uptime_n = sum(1 for w in watches if w.get("kind", "uptime") == "uptime")
+    page_n = total - uptime_n
+    checks = sum(w.get("checks_count", 0) for w in watches)
+    changes = sum(w.get("changes_count", 0) for w in watches)
+    important = sum(w.get("important_changes_count", 0) for w in watches)
+
+    last_change_dates = [w["last_change_at"] for w in watches if w.get("last_change_at")]
+    last_change = max(last_change_dates)[:16].replace("T", " ") if last_change_dates else "ще не було"
+
+    return (
+        "📈 *Загальна статистика моніторингу*\n\n"
+        f"🌐 Uptime-моніторингів: {uptime_n}\n"
+        f"📄 Сторінок під наглядом: {page_n}\n"
+        f"🔎 Всього перевірок: {checks}\n"
+        f"🔄 Всього змін: {changes} (важливих: {important})\n"
+        f"🕐 Остання зміна: {last_change}"
+    )
+
+
+def build_page_card_text(w: dict) -> str:
+    label = w.get("label") or w["url"]
+    checks = w.get("checks_count", 0)
+    changes = w.get("changes_count", 0)
+    important = w.get("important_changes_count", 0)
+    last_change = w.get("last_change_at")
+    last_change_text = last_change[:16].replace("T", " ") if last_change else "ще не було"
+    notif_on = w.get("notifications_enabled", True)
+    moderate_on = w.get("notify_moderate", False)
+    freq = format_interval(w.get("check_interval_minutes", 60))
+    unreachable = w.get("last_fetch_ok") is False
+
+    text = (
+        f"📄 *{label}*\n🌐 {w['url']}\n\n"
+        f"🔎 Перевірок: {checks} | 🔄 Змін: {changes} (важливих: {important})\n"
+        f"🕐 Остання зміна: {last_change_text}\n"
+        f"⏱ Частота: {freq}\n"
+        f"🔔 Сповіщення: {'увімкнено' if notif_on else 'вимкнено'}"
+        + (f" (🟡 помірні: {'так' if moderate_on else 'ні'})" if notif_on else "")
+    )
+    if unreachable:
+        text += "\n\n⚠️ Наразі сторінка недоступна для аналізу."
+    return text

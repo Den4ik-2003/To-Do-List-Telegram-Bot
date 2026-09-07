@@ -19,6 +19,8 @@
    відповідає нормально. Тепер — один виклик, без хибного retry.
    Сигнатура db_call(coro, default=None, retries=2, raise_on_fail=True)
    НЕ змінена — усі існуючі виклики по всьому проєкту працюють без правок.
+
+3. Додано site_watch_history_col — історія для фічі site_watch.
 """
 
 import logging
@@ -46,6 +48,7 @@ olx_tracked_col = None
 resale_saved_col = None
 business_ideas_col = None
 site_watch_col = None
+site_watch_history_col = None
 qa_results_col = None
 job_profiles_col = None
 job_searches_col = None
@@ -73,6 +76,7 @@ async def init_mongo(mongo_uri: str):
     global goals_col, projects_col, rates_col, events_col
     global transactions_col, budgets_col, ai_usage_col, ai_conversations_col
     global olx_tracked_col, resale_saved_col, business_ideas_col, site_watch_col
+    global site_watch_history_col
     global qa_results_col
     global job_profiles_col, job_searches_col, job_saved_col, job_feedback_col
     global creative_generations_col
@@ -106,6 +110,7 @@ async def init_mongo(mongo_uri: str):
     resale_saved_col = db["resale_saved"]
     business_ideas_col = db["business_ideas"]
     site_watch_col = db["site_watch"]
+    site_watch_history_col = db["site_watch_history"]
     qa_results_col = db["qa_results"]
 
     job_profiles_col = db["job_profiles"]

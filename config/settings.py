@@ -54,4 +54,13 @@ CREATIVE_DAILY_LIMIT = int(os.environ.get("CREATIVE_DAILY_LIMIT", "15"))
 # таймаут одного запиту до image API (генерація важча за текст)
 IMAGE_REQUEST_TIMEOUT = int(os.environ.get("IMAGE_REQUEST_TIMEOUT", "120"))
 
+# --- Моніторинг сторінок (контент-діф + AI-аналіз) ---
+PAGE_CHECK_INTERVAL_MINUTES = int(os.environ.get("PAGE_CHECK_INTERVAL_MINUTES", "60"))
+PAGE_HISTORY_DISPLAY_LIMIT = int(os.environ.get("PAGE_HISTORY_DISPLAY_LIMIT", "10"))
+
+AI_WEEKLY_DIGEST_ENABLED = os.environ.get("AI_WEEKLY_DIGEST_ENABLED", "true").strip().lower() == "true"
+AI_WEEKLY_DIGEST_DAY = os.environ.get("AI_WEEKLY_DIGEST_DAY", "mon")
+AI_WEEKLY_DIGEST_HOUR = int(os.environ.get("AI_WEEKLY_DIGEST_HOUR", "9"))
+AI_WEEKLY_DIGEST_MINUTE = int(os.environ.get("AI_WEEKLY_DIGEST_MINUTE", "30"))
+
 PORT = int(os.environ.get("PORT", "8080"))
