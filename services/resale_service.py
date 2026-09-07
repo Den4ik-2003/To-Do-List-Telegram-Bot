@@ -1,173 +1,288 @@
 """
-Сервіс пошуку можливостей для перепродажу на OLX.
+services/resale_service.py
 
-Відповідає за одну дію: за критеріями користувача (бюджет, категорія,
-мін. прибуток, мін. маржа, к-сть результатів) знайти оголошення на OLX
-і прогнати їх через AI resale-аналіз (services/resale_engine.py),
-повернувши handler'у (handlers/resale.py) готовий список словників
-у форматі, який очікує _fmt_item():
-
-{
-    "title": str,
-    "purchase_price": float,
-    "currency": str,
-    "market_price": float,
-    "resale_price": float,
-    "profit": float,
-    "margin": float,          # у %
-    "url": str,
-    "perspective": int | None,  # 0-10, з AI-аналізу resale_score/10
-    "risk": str,               # "низький"/"середній"/"високий"
-    "reasoning": str,
-}
-
-ВИПРАВЛЕНО (find_opportunities): раніше виклик
-olx_service.search_listings(query=..., max_price=..., limit=...) завжди
-падав з TypeError — реальна сигнатура функції в olx_service.py:
-    search_listings(title_query, max_price, location, radius_km, domain=..., condition=...)
-Немає ані "query", ані "limit"; "location"/"radius_km" — обов'язкові
-позиційні аргументи. Через try/except TypeError мовчки ковтався і функція
-завжди повертала [] — тому розділ "Знайти перепродаж" завжди відповідав
-"Нічого не знайшов за цими критеріями" незалежно від введених даних.
-Тепер виклик відповідає реальній сигнатурі; location="" і radius_km=0
-дають "широкий пошук без прив'язки до локації" — саме так, як і було
-задумано для цієї фічі (search[dist] додається в URL лише якщо location
-непорожній — див. _build_search_url в olx_service.py).
+Ядро "🔥 Знайти перепродаж". НЕ дублює AI resale-аналіз — увесь пошук на
+OLX і резонансна оцінка вигідності беруться з уже робочого
+services/olx_scanner.scan_for_deals(), яке саме по собі викликає
+services/resale_engine.analyze_listing() (той самий AI resale hunter, що
+й у "📉 OLX Ціни"). Тут лишається тільки специфічна для моніторингу
+логіка: фільтри за критеріями користувача, захист від сміття, навчання
+AI на виборі користувача, форматування сповіщення й pending-кеш для
+кнопок під сповіщенням.
 """
 
-import asyncio
 import logging
+import re
+import secrets
+from collections import OrderedDict
 
-from services import olx_service
-from services import resale_engine
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from services import olx_scanner
 
 logger = logging.getLogger("tasks_bot")
 
-# Скільки оголошень максимум прогнати через AI за один пошук
-# (щоб не влетіти в ліміти/час очікування користувача)
-MAX_CANDIDATES = 15
+# Скільки найдешевших кандидатів прогонати через AI за один цикл моніторингу.
+MAX_CANDIDATES_PER_SCAN = 10
 
-# Скільки AI-аналізів виконувати паралельно одночасно
-_ANALYSIS_CONCURRENCY = 3
+_RISK_EMOJI = {"низький": "🟢", "середній": "🟡", "високий": "🔴"}
+_DEMAND_EMOJI = {"висока": "🔥", "середня": "🟡", "низька": "🔻"}
 
-_SPEED_ORDER = {"швидко": 0, "середньо": 1, "довго": 2}
-_RISK_ORDER = {"низький": 0, "середній": 1, "високий": 2}
+# Явні ознаки сміття/непридатного товару (п.13 ТЗ). Свідомо консервативний
+# список — краще пропустити спірний варіант, ніж відкинути хороший.
+_JUNK_TITLE_RE = re.compile(
+    r"запчастин|на запчаст|не працю[єе]|розбит[аоий]|нероб[оа]ч",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------
+# Pending-кеш: короткоживучі дані знахідки для кнопок під сповіщенням
+# (Telegram callback_data обмежений 64 байтами — не влізе повний listing).
+# ---------------------------------------------------------
+_MAX_PENDING = 2000
+_pending: "OrderedDict[str, dict]" = OrderedDict()
 
 
-async def _analyze_one(listing: dict, min_margin_percent: float | None, sem: asyncio.Semaphore) -> dict | None:
-    async with sem:
-        try:
-            analysis = await resale_engine.analyze_listing(listing, min_margin_percent)
-        except Exception:
-            logger.exception("resale_service: analyze_listing failed for %s", listing.get("url"))
-            return None
+def register_pending(monitor_id, opp: dict) -> str:
+    pid = secrets.token_hex(6)
+    _pending[pid] = {"monitor_id": str(monitor_id), **opp}
+    if len(_pending) > _MAX_PENDING:
+        _pending.popitem(last=False)
+    return pid
 
-    if not analysis:
-        return None
 
-    price = listing.get("price") or 0
+def get_pending(pid: str) -> dict | None:
+    return _pending.get(pid)
+
+
+def _is_junk(listing: dict, analysis: dict) -> bool:
+    title = (listing.get("title") or "").lower()
+    if _JUNK_TITLE_RE.search(title):
+        return True
+    if not listing.get("description") and not listing.get("photos"):
+        return True
+    if analysis.get("resale_score") is None:
+        return True
+    return False
+
+
+def _is_blocked(analysis: dict, monitor: dict) -> bool:
+    blocked = [b.lower() for b in (monitor.get("blocked_similar") or [])]
+    if not blocked:
+        return False
+    text = f"{(analysis.get('item_name') or '').lower()} {(analysis.get('item_brand') or '').lower()}"
+    return any(b in text for b in blocked)
+
+
+def _margin_percent(analysis: dict, listing: dict) -> float:
     resale_min = analysis.get("resale_price_min")
     resale_max = analysis.get("resale_price_max")
+    price = listing.get("price") or 0
     if resale_min is None or resale_max is None:
-        return None
-
-    market_price = (resale_min + resale_max) / 2
+        return 0.0
+    market = (resale_min + resale_max) / 2
     profit = analysis.get("expected_profit")
     if profit is None:
-        profit = market_price - price
+        profit = market - price
+    return round((profit / market * 100) if market else 0, 1)
 
-    margin = (profit / market_price * 100) if market_price else 0
-    score = analysis.get("resale_score")
-    perspective = round(score / 10) if isinstance(score, (int, float)) else None
-    risk_level = (analysis.get("risks") or {}).get("level", "середній")
 
-    reasoning_parts = []
-    if analysis.get("verdict"):
-        reasoning_parts.append(analysis["verdict"].capitalize())
+def _adjust_score(base_score: float, analysis: dict, monitor: dict) -> float:
+    """🎯 AI навчається на виборі користувача — м'яке коригування рейтингу
+    на основі раніше збережених/відхилених знахідок ЦЬОГО моніторингу."""
+    text = f"{(analysis.get('item_name') or '').lower()} {(analysis.get('item_brand') or '').lower()}"
+    score = base_score
+    for kw in monitor.get("liked_keywords") or []:
+        if kw and kw in text:
+            score += 5
+    for kw in monitor.get("disliked_keywords") or []:
+        if kw and kw in text:
+            score -= 10
+    return max(0, min(100, score))
+
+
+def _build_query(monitor: dict) -> str:
+    parts = [monitor.get("category") or "", monitor.get("keywords") or "", monitor.get("brand_model") or ""]
+    return " ".join(p.strip() for p in parts if p and p.strip()).strip()
+
+
+async def scan_monitor(monitor: dict) -> tuple[list[dict], str | None]:
+    """
+    Повертає (opportunities, error). opportunities — список словників
+    {"listing":.., "analysis":.., "score":.., "margin":.., "profit":..},
+    відсортований від найкращого. error ("ai_unavailable"/"ai_limit"/
+    "search_failed") — якщо перевірку взагалі не вдалось виконати.
+    """
+    query = _build_query(monitor)
+    if not query:
+        return [], "no_query"
+
+    ranked, error = await olx_scanner.scan_for_deals(
+        monitor["uid"], query, monitor.get("max_price"),
+        monitor.get("location", ""), monitor.get("radius_km", 0),
+        domain=monitor.get("domain", "olx.ua"),
+        limit=MAX_CANDIDATES_PER_SCAN,
+    )
+    if error:
+        return [], error
+    if not ranked:
+        return [], None
+
+    seen_urls = {e["url"] for e in (monitor.get("seen") or [])}
+
+    opportunities = []
+    for item in ranked:
+        listing = (item.get("tracker") or {}).get("_listing") or {}
+        analysis = item.get("analysis") or {}
+        url = listing.get("url")
+        if not url or url in seen_urls:
+            continue
+        if _is_junk(listing, analysis):
+            continue
+        if _is_blocked(analysis, monitor):
+            continue
+
+        price = listing.get("price")
+        if monitor.get("min_price") is not None and price is not None and price < monitor["min_price"]:
+            continue
+
+        margin = _margin_percent(analysis, listing)
+        profit = analysis.get("expected_profit")
+        if profit is None:
+            resale_min, resale_max = analysis.get("resale_price_min"), analysis.get("resale_price_max")
+            profit = ((resale_min + resale_max) / 2 - (price or 0)) if resale_min is not None and resale_max is not None else None
+
+        if monitor.get("min_profit") is not None and (profit is None or profit < monitor["min_profit"]):
+            continue
+        if monitor.get("min_margin_percent") is not None and margin < monitor["min_margin_percent"]:
+            continue
+
+        score = _adjust_score(analysis.get("resale_score", 0), analysis, monitor)
+        opportunities.append({
+            "listing": listing, "analysis": analysis,
+            "score": score, "margin": margin, "profit": profit,
+        })
+
+    opportunities.sort(key=lambda o: o["score"], reverse=True)
+    return opportunities, None
+
+
+# =========================================================
+# Форматування сповіщення (п.9 ТЗ)
+# =========================================================
+
+def format_notification(opp: dict) -> str:
+    listing, analysis = opp["listing"], opp["analysis"]
+    currency = listing.get("currency", "UAH")
+    price = listing.get("price")
+    resale_min, resale_max = analysis.get("resale_price_min"), analysis.get("resale_price_max")
+    market = (resale_min + resale_max) / 2 if resale_min is not None and resale_max is not None else None
+    profit, margin, score = opp.get("profit"), opp.get("margin"), opp.get("score")
+    risk = (analysis.get("risks") or {}).get("level", "невідомо")
+    demand = analysis.get("liquidity")
+    speed = analysis.get("sale_speed")
+    verdict = analysis.get("verdict") or ""
     args = (analysis.get("negotiation") or {}).get("arguments") or []
+    missing = analysis.get("missing_data") or []
+
+    lines = [
+        "🔥 *ЗНАЙДЕНО МОЖЛИВІСТЬ ДЛЯ ПЕРЕПРОДАЖУ*", "",
+        f"📦 {analysis.get('item_name') or listing.get('title') or '—'}",
+        f"💰 Купівля: {price:.0f} {currency}" if price is not None else "💰 Купівля: невідомо",
+    ]
+    if market is not None:
+        lines.append(f"📊 Ринок: ~{market:.0f} {currency}")
+    if resale_max is not None:
+        lines.append(f"🔄 Перепродаж: ~{resale_max:.0f} {currency}")
+    if profit is not None:
+        lines.append(f"💵 Потенційний прибуток: ~{profit:.0f} {currency}")
+    if margin is not None:
+        lines.append(f"📈 Маржа: ~{margin:.0f}%")
+
+    lines.append("")
+    lines.append(f"🔥 *Оцінка можливості: {score}/100*")
+    lines.append(f"{_RISK_EMOJI.get(risk, '⚪️')} Ризик: {risk}")
+    if demand:
+        lines.append(f"{_DEMAND_EMOJI.get(demand, '')} Попит: {demand}".strip())
+    if speed:
+        lines.append(f"⚡ Швидкість продажу: {speed}")
+
+    why = verdict.capitalize()
     if args:
-        reasoning_parts.append(args[0])
-    reasoning = ". ".join(reasoning_parts)
+        why = (why + ". " if why else "") + args[0]
+    if why:
+        lines.append("")
+        lines.append("*Чому цікаво:*")
+        lines.append(why)
 
-    return {
-        "title": analysis.get("item_name") or listing.get("title") or "—",
-        "purchase_price": price,
-        "currency": listing.get("currency", "UAH"),
-        "market_price": market_price,
-        "resale_price": market_price,
-        "profit": profit,
-        "margin": margin,
-        "url": listing.get("url") or listing.get("id") or "",
-        "perspective": perspective,
-        "risk": risk_level,
-        "reasoning": reasoning,
-        "_speed": analysis.get("sale_speed", "середньо"),
-    }
+    check = "; ".join(missing[:3]) if missing else "серійний номер/IMEI, реальний стан, комплектацію особисто перед покупкою"
+    lines.append("")
+    lines.append("*Перевірити:*")
+    lines.append(check)
 
+    if listing.get("url"):
+        lines.append("")
+        lines.append(f"🔗 {listing['url']}")
 
-async def find_opportunities(
-    budget: float | None,
-    category: str | None,
-    min_profit: float | None,
-    min_margin: float | None,
-    count: int,
-) -> list[dict]:
-    """
-    Головна точка входу для кнопки "🔎 Знайти перепродаж".
-
-    1. Шукає кандидатів на OLX за бюджетом/категорією.
-    2. Прогонає до MAX_CANDIDATES з них через AI resale-аналіз паралельно.
-    3. Фільтрує за min_profit / min_margin.
-    4. Сортує за маржею (дефолтне сортування) і повертає top `count`.
-    """
-    try:
-        listings = await olx_service.search_listings(
-            title_query=category or "",
-            max_price=budget,
-            location="",
-            radius_km=0,
-        )
-    except Exception:
-        logger.exception("resale_service: OLX search failed (budget=%s, category=%s)", budget, category)
-        return []
-
-    if listings is None:
-        # Технічний збій запиту до OLX (403/timeout/мережева помилка) —
-        # відрізняємо від "результатів справді немає" (порожній список).
-        logger.warning("resale_service: OLX search returned None (technical failure) budget=%s category=%s", budget, category)
-        return []
-
-    if not listings:
-        return []
-
-    listings = listings[:MAX_CANDIDATES]
-
-    sem = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
-    tasks = [_analyze_one(listing, min_margin, sem) for listing in listings]
-    analyzed = await asyncio.gather(*tasks)
-
-    results = [r for r in analyzed if r is not None]
-
-    if min_profit is not None:
-        results = [r for r in results if r["profit"] >= min_profit]
-    if min_margin is not None:
-        results = [r for r in results if r["margin"] >= min_margin]
-
-    results.sort(key=lambda r: r["margin"], reverse=True)
-
-    return results[:count] if count else results
+    lines.append(
+        "\n_Витрати на доставку/ремонт враховані лише якщо очевидні з оголошення; "
+        "інше AI не вигадує і позначає як невраховане._"
+    )
+    return "\n".join(lines).strip()
 
 
-def sort_opportunities(results: list[dict], sort_key: str) -> list[dict]:
-    """Пересортовує вже знайдені результати за вибором користувача (rs_sort:*)."""
-    if sort_key == "profit":
-        return sorted(results, key=lambda r: r.get("profit", 0), reverse=True)
-    if sort_key == "margin":
-        return sorted(results, key=lambda r: r.get("margin", 0), reverse=True)
-    if sort_key == "perspective":
-        return sorted(results, key=lambda r: (r.get("perspective") or 0), reverse=True)
-    if sort_key == "risk":
-        return sorted(results, key=lambda r: _RISK_ORDER.get(r.get("risk"), 1))
-    if sort_key == "speed":
-        return sorted(results, key=lambda r: _SPEED_ORDER.get(r.get("_speed"), 1))
-    return results
+def ikb_notification(pending_id: str, url: str | None) -> InlineKeyboardMarkup:
+    rows = []
+    if url:
+        rows.append([InlineKeyboardButton(text="🔗 Відкрити", url=url)])
+    rows.append([InlineKeyboardButton(text="🤖 Детальний аналіз", callback_data=f"rso_analyze:{pending_id}")])
+    rows.append([
+        InlineKeyboardButton(text="⭐ Зберегти", callback_data=f"rso_save:{pending_id}"),
+        InlineKeyboardButton(text="❌ Не цікавить", callback_data=f"rso_skip:{pending_id}"),
+    ])
+    rows.append([InlineKeyboardButton(text="🔕 Не шукати подібне", callback_data=f"rso_block:{pending_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# =========================================================
+# Статистика (п.11 ТЗ)
+# =========================================================
+
+def build_statistics_text(monitors: list[dict], saved: list[dict]) -> str:
+    found = sum((m.get("stats") or {}).get("found", 0) for m in monitors)
+    saved_n = len(saved)
+    bought = sum(1 for s in saved if s.get("status") == "bought")
+    sold = sum(1 for s in saved if s.get("status") == "sold")
+    potential_profit = sum(s.get("profit") or 0 for s in saved if s.get("status") in ("interest", "bought"))
+    actual_profit = sum(s.get("profit") or 0 for s in saved if s.get("status") == "sold")
+    margins = [s.get("margin") for s in saved if s.get("margin") is not None]
+    avg_margin = round(sum(margins) / len(margins), 1) if margins else None
+
+    best_category = None
+    if monitors:
+        by_cat = {}
+        for m in monitors:
+            cat = m.get("category") or "—"
+            profit = (m.get("stats") or {}).get("actual_profit", 0)
+            by_cat[cat] = by_cat.get(cat, 0) + profit
+        if any(by_cat.values()):
+            best_category = max(by_cat, key=by_cat.get)
+
+    lines = [
+        "📈 *Статистика перепродажу*", "",
+        f"🔎 Знайдено можливостей: {found}",
+        f"⭐ Збережено: {saved_n}",
+        f"🛒 Куплено: {bought}",
+        f"💰 Перепродано: {sold}",
+        f"💵 Потенційний прибуток: ~{potential_profit:.0f} грн",
+        f"✅ Фактичний прибуток: ~{actual_profit:.0f} грн",
+    ]
+    if avg_margin is not None:
+        lines.append(f"📊 Середня маржа збережених: ~{avg_margin}%")
+    if best_category:
+        lines.append(f"🏆 Найвигідніша категорія: {best_category}")
+    lines.append(
+        "\n_Примітка: скільки разів відкрито «🔗 Відкрити» Telegram не повідомляє "
+        "боту (це звичайна URL-кнопка), тому ця метрика не відстежується._"
+    )
+    return "\n".join(lines)

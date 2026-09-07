@@ -64,3 +64,8 @@ AI_WEEKLY_DIGEST_HOUR = int(os.environ.get("AI_WEEKLY_DIGEST_HOUR", "9"))
 AI_WEEKLY_DIGEST_MINUTE = int(os.environ.get("AI_WEEKLY_DIGEST_MINUTE", "30"))
 
 PORT = int(os.environ.get("PORT", "8080"))
+
+# --- 🔥 Знайти перепродаж: AI-моніторинг ---
+RESALE_MIN_SCORE_THRESHOLD = int(os.environ.get("RESALE_MIN_SCORE_THRESHOLD", "70"))
+RESALE_MAX_NOTIFY_PER_CYCLE = int(os.environ.get("RESALE_MAX_NOTIFY_PER_CYCLE", "3"))
+RESALE_DEFAULT_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_DEFAULT_CHECK_INTERVAL_MINUTES", "180"))

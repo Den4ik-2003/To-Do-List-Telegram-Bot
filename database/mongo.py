@@ -21,6 +21,9 @@
    НЕ змінена — усі існуючі виклики по всьому проєкту працюють без правок.
 
 3. Додано site_watch_history_col — історія для фічі site_watch.
+
+4. Додано resale_monitors_col — колекція для фонових AI-моніторів
+   "🔥 Знайти перепродаж" (services/olx_scanner.py + AI Scanner).
 """
 
 import logging
@@ -46,6 +49,7 @@ ai_usage_col = None
 ai_conversations_col = None
 olx_tracked_col = None
 resale_saved_col = None
+resale_monitors_col = None
 business_ideas_col = None
 site_watch_col = None
 site_watch_history_col = None
@@ -75,7 +79,7 @@ async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
     global goals_col, projects_col, rates_col, events_col
     global transactions_col, budgets_col, ai_usage_col, ai_conversations_col
-    global olx_tracked_col, resale_saved_col, business_ideas_col, site_watch_col
+    global olx_tracked_col, resale_saved_col, resale_monitors_col, business_ideas_col, site_watch_col
     global site_watch_history_col
     global qa_results_col
     global job_profiles_col, job_searches_col, job_saved_col, job_feedback_col
@@ -108,6 +112,7 @@ async def init_mongo(mongo_uri: str):
     ai_conversations_col = db["ai_conversations"]
     olx_tracked_col = db["olx_tracked"]
     resale_saved_col = db["resale_saved"]
+    resale_monitors_col = db["resale_monitors"]
     business_ideas_col = db["business_ideas"]
     site_watch_col = db["site_watch"]
     site_watch_history_col = db["site_watch_history"]

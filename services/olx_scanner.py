@@ -78,6 +78,7 @@ async def scan_for_deals(
     radius_km: int,
     domain: str = "olx.ua",
     progress_cb=None,
+    limit: int = 3,
 ):
     """
     Ядро 🧲 Злови помилку, 🧠 AI Scanner та 🔎 Схожі (AI): бере найдешевші
@@ -92,6 +93,9 @@ async def scan_for_deals(
     щоб виклик міг показати користувачу живий прогрес (скільки перевірено і
     скільки вже знайдено вигідних) замість "тиші" на кілька хвилин. Збій
     самого callback'а не перериває скан.
+
+    limit: скільки найкращих результатів повернути після ранжування —
+    передається напряму в resale_engine.rank_top_deals.
 
     Повертає (ranked, error). ranked — список словників {"listing":.., "analysis":..},
     відсортований від найцікавішого. error ("ai_unavailable"/"ai_limit"/"search_failed")
@@ -175,7 +179,7 @@ async def scan_for_deals(
         return [], None
 
     try:
-        ranked = resale_engine.rank_top_deals(pseudo_trackers)
+        ranked = resale_engine.rank_top_deals(pseudo_trackers, limit=limit)
     except Exception:
         logger.exception("scan_for_deals: resale_engine.rank_top_deals упав")
         return [], None
