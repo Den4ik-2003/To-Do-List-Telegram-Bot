@@ -1,28 +1,3 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: твій головний файл запуску бота (той, що містить main(),
-register_routers(), Bot(...), dp.start_polling(...)).
-
-ВИПРАВЛЕНО (фікс бага "не генерує рецепт" / "AI-планувальник тимчасово
-недоступний" при спробі отримати рецепт): у aiogram повідомлення проходить
-через роутери СУВОРО в порядку їх реєстрації, і як тільки якийсь хендлер
-підходить під подію — обробка зупиняється, до наступних роутерів подія вже
-не доходить. kitchen.router реєструвався ОСТАННІМ (після ai_planner.router
-і ai_chat.router), тому текстове повідомлення користувача (наприклад
-"Сирники"), надіслане у відповідь на запит kitchen.py в стані
-KitchenStates.waiting_dish, могло перехоплюватись більш широким текстовим
-хендлером у ai_planner.py чи ai_chat.py раніше, ніж доходило до kitchen.py
-— звідси й повідомлення "AI-планувальник тимчасово недоступний" (текст,
-який видає саме ai_planner.py, а не kitchen.py).
-
-Фікс: kitchen.router тепер реєструється РАНІШЕ за ai_planner.router і
-ai_chat.router — одразу після tasks.router. Це не єдиний можливий фікс
-(альтернатива — звузити фільтр хендлера в ai_planner.py до конкретного
-стану FSM), але це найбезпечніша зміна, яка нічого не ламає в інших
-роутерах і гарантовано віддає пріоритет kitchen.router.
-
-Все інше в файлі — 1:1 як було.
-"""
-
 import asyncio
 import logging
 import sys
@@ -74,11 +49,10 @@ def register_routers(dp: Dispatcher) -> None:
         start,
         menu,
         tasks,
-        kitchen,       # ЗМІНЕНО: 🍳 Кухня піднята вище — реєструється до
-                       # ai_planner/ai_chat, щоб ті не перехоплювали
-                       # текстові повідомлення, призначені для kitchen.py
-                       # (напр. назву страви в стані waiting_dish)
+        kitchen,
+        worktime,
         ai_planner,
+        morning_plan,
         ai_chat,
         voice,
         translator,
@@ -107,8 +81,10 @@ def register_routers(dp: Dispatcher) -> None:
 
     dp.include_router(start.router)
     dp.include_router(tasks.router)
-    dp.include_router(kitchen.router)  # ЗМІНЕНО: реєструється до ai_planner/ai_chat
+    dp.include_router(kitchen.router)
+    dp.include_router(worktime.router)
     dp.include_router(ai_planner.router)
+    dp.include_router(morning_plan.router)
     dp.include_router(ai_chat.router)
     dp.include_router(voice.router)
     dp.include_router(translator.router)

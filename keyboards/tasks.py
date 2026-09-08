@@ -52,6 +52,24 @@ def category_from_text(text: str) -> str | None:
     return mapping.get(text)
 
 
+def kb_project_select(projects: list) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text="📋 Без проекту")]]
+    for p in projects:
+        rows.append([KeyboardButton(text=f"📁 {p.get('title','')}"[:64])])
+    rows.append([KeyboardButton(text="❌ Скасувати")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def project_from_text(text: str, projects: list) -> dict | None:
+    if not text or not text.startswith("📁 "):
+        return None
+    title = text[2:].strip()
+    for p in projects:
+        if p.get("title", "")[:64] == title:
+            return p
+    return None
+
+
 def kb_date() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📅 Сьогодні"), KeyboardButton(text="📅 Завтра")],

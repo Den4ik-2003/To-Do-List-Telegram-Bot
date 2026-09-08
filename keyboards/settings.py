@@ -5,11 +5,20 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+from config.constants import LABELS, CATEGORIES, STATUS_DONE
+from utils.dates import is_missed
 
-def ikb_settings_menu(morning_enabled: bool, evening_enabled: bool, notifications_enabled: bool) -> InlineKeyboardMarkup:
+
+def ikb_settings_menu(
+    morning_enabled: bool,
+    evening_enabled: bool,
+    notifications_enabled: bool,
+    worktime_enabled: bool = True,
+) -> InlineKeyboardMarkup:
     morning_label = "🔔 Ранковий план: Увімкнено" if morning_enabled else "🔕 Ранковий план: Вимкнено"
     evening_label = "🌙 Вечірній аналіз: Увімкнено" if evening_enabled else "🌙 Вечірній аналіз: Вимкнено"
     notif_label = "🔔 Сповіщення: Увімкнено" if notifications_enabled else "🔕 Сповіщення: Вимкнено"
+    worktime_label = "🕐 Облік часу: Увімкнено" if worktime_enabled else "🕐 Облік часу: Вимкнено"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=morning_label, callback_data="settings_toggle_morning")],
         [InlineKeyboardButton(text="⏰ Час ранкового плану", callback_data="settings_morning_time")],
@@ -18,6 +27,8 @@ def ikb_settings_menu(morning_enabled: bool, evening_enabled: bool, notification
         [InlineKeyboardButton(text="📊 Ліміт AI-запитів", callback_data="settings_ai_limit")],
         [InlineKeyboardButton(text="💰 Валюта", callback_data="settings_currency")],
         [InlineKeyboardButton(text=notif_label, callback_data="settings_toggle_notifications")],
+        [InlineKeyboardButton(text=worktime_label, callback_data="settings_toggle_worktime")],
+        [InlineKeyboardButton(text="⏰ Час нагадування про облік часу", callback_data="settings_worktime_time")],
         [InlineKeyboardButton(text="◀️ Головне меню", callback_data="settings_close")],
     ])
 

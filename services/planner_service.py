@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 
 from config.constants import LABELS, CATEGORIES, DEFAULT_CURRENCY
@@ -16,6 +17,45 @@ logger = logging.getLogger("tasks_bot")
 STATUS_PENDING = "pending"
 STATUS_DONE = "done"
 
+TIME_RANGE_RE = re.compile(r"(\d{1,2}):(\d{2})\s*(?:-|–|—|до)\s*(\d{1,2}):(\d{2})")
+HOURS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:год(?:ин(?:и|)?)?|час(?:ів|а)?|h)\b", re.IGNORECASE)
+
+
+def parse_available_time(text: str) -> dict | None:
+    if not text:
+        return None
+    raw = text.strip()
+    windows = []
+    total_minutes = 0
+
+    for m in TIME_RANGE_RE.finditer(raw):
+        h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if not (0 <= h1 < 24 and 0 <= m1 < 60 and 0 <= h2 < 24 and 0 <= m2 < 60):
+            continue
+        start = h1 * 60 + m1
+        end = h2 * 60 + m2
+        if end <= start:
+            end += 24 * 60
+        duration = end - start
+        if 0 < duration <= 16 * 60:
+            windows.append(f"{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}")
+            total_minutes += duration
+
+    if not windows:
+        hm = HOURS_RE.search(raw)
+        if hm:
+            try:
+                hours = float(hm.group(1).replace(",", "."))
+            except ValueError:
+                hours = 0
+            if 0 < hours <= 16:
+                total_minutes = int(round(hours * 60))
+
+    if total_minutes <= 0:
+        return None
+
+    return {"total_minutes": total_minutes, "windows": windows, "raw": raw}
+
 
 def _parse_due(due_str: str):
     try:
@@ -32,11 +72,6 @@ def _is_missed(t: dict) -> bool:
 
 
 def _project_stage_line(p: dict) -> str:
-    """
-    Додає до опису проєкту інформацію про поточний етап (перший ще не
-    завершений), щоб AI генерував задачі, які просувають саме цей етап,
-    а не абстрактні задачі по проєкту в цілому.
-    """
     stages = p.get("stages") or []
     if not stages:
         return ""
@@ -102,7 +137,7 @@ async def _build_context(uid: int) -> dict:
     }
 
 
-async def generate_daily_plan(uid: int) -> dict | None:
+async def generate_daily_plan(uid: int, available: dict | None = None) -> dict | None:
     if not ai_service.is_available():
         return None
     allowed, _ = await check_ai_limit(uid)
@@ -112,11 +147,26 @@ async def generate_daily_plan(uid: int) -> dict | None:
     ctx = await _build_context(uid)
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
 
+    available_line = ""
+    time_rule = ""
+    if available:
+        hh, mm = divmod(available["total_minutes"], 60)
+        parts = ([f"{hh} год"] if hh else []) + ([f"{mm} хв"] if mm else [])
+        available_str = " ".join(parts) or "0 хв"
+        windows_str = ", ".join(available["windows"]) if available["windows"] else "конкретний час не вказано"
+        available_line = f"\nДоступний час користувача сьогодні: {available_str}\nЧасові проміжки: {windows_str}\n"
+        time_rule = (
+            "- Сумарна тривалість (estimated_minutes) усіх запропонованих задач НЕ повинна перевищувати "
+            "доступний час користувача, залиш невеликий запас (10-15%). Якщо доступного часу мало — "
+            "запропонуй МЕНШЕ задач, а не занижуй реалістичну тривалість кожної.\n"
+            "- Став задачі в межах вказаних часових проміжків, якщо вони вказані.\n"
+        )
+
     prompt = f"""Ти — персональний AI-планувальник задач. Відповідай виключно українською.
 
 Поточний час: {now_str}
 Робочий графік користувача (основна робота): {WORK_HOURS_TEXT}
-
+{available_line}
 Активні задачі користувача:
 {ctx['active_text']}
 
@@ -137,7 +187,7 @@ XP: {ctx['state'].get('xp', 0)}
 описом), а не абстрактні задачі по проєкту в цілому:
 {ctx['projects_text']}
 
-Запропонуй 3-6 НОВИХ конкретних задач на сьогодні, реалістичних для виконання за день.
+Запропонуй НОВІ конкретні задачі на сьогодні, реалістичні для виконання за доступний час.
 Правила:
 - Не дублюй активні задачі.
 - Задачі мають бути конкретними, а не абстрактними.
@@ -146,7 +196,7 @@ XP: {ctx['state'].get('xp', 0)}
 - Не став дві задачі на однаковий час і не став задачу поверх уже запланованої активної задачі.
 - Балансуй між напрямками (проєкти, робота, фінанси, особисте) — не роби весь план лише про одне.
 - Якщо є фінансова ціль або бюджет проєкту — врахуй це при виборі фокуса дня.
-
+{time_rule}
 Поверни ВИКЛЮЧНО валідний JSON без жодного тексту навколо, без коментарів, без markdown-розмітки (без ```), у форматі:
 {{
   "focus": "короткий головний фокус дня",
@@ -187,6 +237,19 @@ XP: {ctx['state'].get('xp', 0)}
 
     if not tasks_out:
         return None
+
+    if available:
+        budget = int(available["total_minutes"] * 0.9)
+        trimmed = []
+        total = 0
+        for t in tasks_out:
+            if trimmed and total + t["estimated_minutes"] > budget:
+                continue
+            trimmed.append(t)
+            total += t["estimated_minutes"]
+            if total >= budget:
+                break
+        tasks_out = trimmed or tasks_out[:1]
 
     await ai_usage_db.increment_usage(uid)
 

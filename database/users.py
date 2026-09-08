@@ -5,7 +5,6 @@ from database.mongo import db_call
 
 logger = logging.getLogger("tasks_bot")
 
-# Кеш авторизованих user_id, щоб не ходити в Mongo на кожне повідомлення
 authorized_uids: set[int] = set()
 
 
@@ -49,6 +48,7 @@ async def get_user_state(uid: int) -> dict:
             "archive_prompt_month": "", "xp": 0,
             "total_completed": 0, "total_missed": 0, "total_postponed": 0,
             "last_ai_plan_date": "", "ai_morning_enabled": True,
+            "awaiting_morning_time": False, "awaiting_morning_date": "",
         }
     doc.setdefault("xp", 0)
     doc.setdefault("total_completed", 0)
@@ -56,6 +56,8 @@ async def get_user_state(uid: int) -> dict:
     doc.setdefault("total_postponed", 0)
     doc.setdefault("last_ai_plan_date", "")
     doc.setdefault("ai_morning_enabled", True)
+    doc.setdefault("awaiting_morning_time", False)
+    doc.setdefault("awaiting_morning_date", "")
     return doc
 
 
@@ -64,11 +66,6 @@ async def save_user_state(uid: int, fields: dict):
 
 
 async def update_streak(uid: int, missed_count: int) -> int:
-    """
-    Оновлює денну серію (streak) користувача. Викликається раз на день
-    (у вечірньому звіті) — якщо за день не було жодної пропущеної задачі,
-    серія зростає, інакше скидається в 0.
-    """
     from datetime import datetime as _dt
 
     state = await get_user_state(uid)

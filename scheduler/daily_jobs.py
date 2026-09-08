@@ -22,11 +22,11 @@ from database.users import get_user_state, save_user_state, get_all_uids, update
 from services import ai_service
 from services import currency_service
 from services import weather_service
-from services.planner_service import generate_daily_plan, generate_daily_analysis
+from services.planner_service import generate_daily_analysis
 from services.insights_service import detect_stalled_goal, generate_insight_text
 from utils.dates import parse_due
-from utils.formatting import build_daily_summary_text, fmt_ai_plan_preview
-from keyboards.ai import ikb_ai_plan_preview, ikb_insight_actions
+from utils.formatting import build_daily_summary_text
+from keyboards.ai import ikb_insight_actions
 from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
 from handlers.common import compute_daily_stats
@@ -37,6 +37,24 @@ logger = logging.getLogger("scheduler.daily_jobs")
 
 INSIGHT_CHECK_INTERVAL_DAYS = 7
 INSIGHT_CHECK_TIME = "12:00"
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error("Фонова задача планувальника впала: %r", exc, exc_info=exc)
+
+
+def _spawn(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_log_task_exception)
+    return task
 
 
 async def reminder_task(bot: Bot):
@@ -154,10 +172,11 @@ async def daily_job_task(bot: Bot):
 
 
 async def ai_morning_plan_task(bot: Bot):
-    if not AI_DAILY_PLAN_ENABLED or not ai_service.is_available():
-        logger.info("Автоматичний AI ранковий план вимкнено (немає ключа або AI_DAILY_PLAN_ENABLED=false)")
-        return
     while True:
+        if not AI_DAILY_PLAN_ENABLED or not ai_service.is_available():
+            logger.warning("ai_morning_plan_task: AI недоступний (ключ/фіча вимкнені), перевірю знову через 30 хв")
+            await asyncio.sleep(1800)
+            continue
         try:
             hh, mm = map(int, AI_DAILY_PLAN_TIME.split(":"))
         except ValueError:
@@ -166,10 +185,13 @@ async def ai_morning_plan_task(bot: Bot):
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
+        logger.info("ai_morning_plan_task: сплю до %s (локальний час сервера)", target.isoformat())
         await asyncio.sleep((target - now).total_seconds())
         try:
             uids = await get_all_uids()
             today_str = datetime.now().strftime("%Y-%m-%d")
+            logger.info("ai_morning_plan_task: старт розсилки для %d користувачів", len(uids))
+            sent = 0
             for uid in uids:
                 try:
                     state = await get_user_state(uid)
@@ -177,29 +199,31 @@ async def ai_morning_plan_task(bot: Bot):
                         continue
                     if state.get("last_ai_plan_date") == today_str:
                         continue
-                    await save_user_state(uid, {"last_ai_plan_date": today_str})
-
-                    plan = await generate_daily_plan(uid)
-                    if not plan or not plan.get("tasks"):
-                        continue
-                    selected = set(range(len(plan["tasks"])))
-                    ai_suggestions_cache[uid] = {"plan": plan, "selected": selected}
-                    intro = "☀️ *Доброго ранку!*\n\n" + fmt_ai_plan_preview(plan, selected)
+                    await save_user_state(uid, {
+                        "last_ai_plan_date": today_str,
+                        "awaiting_morning_time": True,
+                        "awaiting_morning_date": today_str,
+                    })
                     await bot.send_message(
-                        uid, intro,
-                        reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
+                        uid,
+                        "🌅 *Доброго ранку! Плануємо сьогодні?*\n\n"
+                        "Скільки часу ти сьогодні маєш для виконання задач?\n\n"
+                        "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`",
                     )
+                    sent += 1
                 except Exception:
                     logger.exception("ai_morning_plan_task failed for uid %s", uid)
+            logger.info("ai_morning_plan_task: розіслано ранкове питання %d користувачам", sent)
         except Exception:
             logger.exception("ai_morning_plan_task outer loop failed")
 
 
 async def proactive_insights_task(bot: Bot):
-    if not ai_service.is_available():
-        logger.info("Проактивні AI-інсайти вимкнено (немає AI ключа)")
-        return
     while True:
+        if not ai_service.is_available():
+            logger.info("Проактивні AI-інсайти чекають — немає AI ключа, перевірю через 30 хв")
+            await asyncio.sleep(1800)
+            continue
         try:
             hh, mm = map(int, INSIGHT_CHECK_TIME.split(":"))
         except ValueError:
@@ -268,7 +292,6 @@ async def currency_update_task():
 
 
 async def weather_morning_task(bot: Bot):
-    """Щоранку о WEATHER_MORNING_TIME шле погоду + пораду щодо одягу тим, у кого задано місто."""
     while True:
         try:
             hh, mm = map(int, WEATHER_MORNING_TIME.split(":"))
@@ -299,11 +322,13 @@ async def weather_morning_task(bot: Bot):
         except Exception:
             logger.exception("weather_morning_task outer loop failed")
 
+
 def register_scheduler_jobs(bot: Bot):
-    asyncio.create_task(reminder_task(bot))
-    asyncio.create_task(midnight_rollover_task(bot))
-    asyncio.create_task(daily_job_task(bot))
-    asyncio.create_task(ai_morning_plan_task(bot))
-    asyncio.create_task(proactive_insights_task(bot))
-    asyncio.create_task(currency_update_task())
-    asyncio.create_task(weather_morning_task(bot))
+    _spawn(reminder_task(bot), "reminder_task")
+    _spawn(midnight_rollover_task(bot), "midnight_rollover_task")
+    _spawn(daily_job_task(bot), "daily_job_task")
+    _spawn(ai_morning_plan_task(bot), "ai_morning_plan_task")
+    _spawn(proactive_insights_task(bot), "proactive_insights_task")
+    _spawn(currency_update_task(), "currency_update_task")
+    _spawn(weather_morning_task(bot), "weather_morning_task")
+    logger.info("Зареєстровано %d фонових задач планувальника, посилання збережено (захист від GC)", len(_background_tasks))

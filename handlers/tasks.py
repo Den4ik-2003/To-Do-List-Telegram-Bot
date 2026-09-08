@@ -16,10 +16,12 @@ from config.constants import (
 from database.mongo import DBUnavailable
 from database import tasks as tasks_db
 from database import users as users_db
+from database import projects as projects_db
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.tasks import (
     kb_tasks_menu, kb_label, label_from_text, kb_category, category_from_text,
-    kb_date, ikb_task_actions, ikb_edit_fields, ikb_tasks_list, ikb_categories,
+    kb_date, kb_project_select, project_from_text,
+    ikb_task_actions, ikb_edit_fields, ikb_tasks_list, ikb_categories,
 )
 from handlers.common import (
     require_auth, user_list_cache, fmt_task, fmt_due, parse_due,
@@ -31,12 +33,14 @@ router = Router(name="tasks")
 
 CANCEL_TEXT = "❌ Скасувати"
 NO_DUE_TEXT = "⏭ Без терміну"
+NO_PROJECT_TEXT = "📋 Без проекту"
 
 
 class AddTask(StatesGroup):
     text = State()
     label = State()
     category = State()
+    project = State()
     date = State()
     date_manual = State()
     time = State()
@@ -53,6 +57,21 @@ def is_cancel(text: str | None) -> bool:
 async def _cancel(msg: Message, state: FSMContext, kb=None) -> None:
     await state.clear()
     await msg.answer("Скасовано.", reply_markup=kb or kb_tasks_menu())
+
+
+async def _project_title(project_id: str | None) -> str | None:
+    if not project_id:
+        return None
+    p = await projects_db.get_project(project_id)
+    return p.get("title") if p else None
+
+
+async def _fmt_task_full(t: dict) -> str:
+    text = fmt_task(t)
+    title = await _project_title(t.get("project_id"))
+    if title:
+        text += f"\n📁 Проєкт: {title}"
+    return text
 
 
 # =========================================================
@@ -119,6 +138,26 @@ async def at_category(msg: Message, state: FSMContext):
     if not category:
         return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_category())
     await state.update_data(category=category)
+    projects = await projects_db.get_active_projects(msg.from_user.id)
+    project_options = [{"id": str(p["_id"]), "title": p.get("title", "")} for p in projects]
+    await state.update_data(available_projects=project_options)
+    await state.set_state(AddTask.project)
+    await msg.answer("📋 Оберіть *проєкт* (або «Без проекту»):", reply_markup=kb_project_select(project_options))
+
+
+@router.message(StateFilter(AddTask.project))
+async def at_project(msg: Message, state: FSMContext):
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    fd = await state.get_data()
+    projects = fd.get("available_projects") or []
+    if msg.text == NO_PROJECT_TEXT:
+        await state.update_data(project_id=None)
+    else:
+        project = project_from_text(msg.text, projects)
+        if not project:
+            return await msg.answer("⚠️ Оберіть один із варіантів на клавіатурі:", reply_markup=kb_project_select(projects))
+        await state.update_data(project_id=project["id"])
     await state.set_state(AddTask.date)
     await msg.answer("📅 Коли треба це зробити? Оберіть дату, або обери «без терміну»:", reply_markup=kb_date())
 
@@ -210,7 +249,7 @@ async def _save_task(msg: Message, state: FSMContext, due: str):
         "postponed_count": 0,
         "postponed_today": False,
         "source": "manual",
-        "project_id": None,
+        "project_id": fd.get("project_id"),
         "estimated_minutes": None,
     }
     try:
@@ -223,7 +262,7 @@ async def _save_task(msg: Message, state: FSMContext, due: str):
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_tasks_menu())
 
     note = "" if due else " (без терміну)"
-    await msg.answer(f"✅ *Завдання додано{note}!*\n\n{fmt_task(saved)}", reply_markup=kb_tasks_menu())
+    await msg.answer(f"✅ *Завдання додано{note}!*\n\n{await _fmt_task_full(saved)}", reply_markup=kb_tasks_menu())
 
 
 # =========================================================
@@ -369,7 +408,7 @@ async def view_task(cb: CallbackQuery):
         t = await tasks_db.get_task(tid)
         if not t:
             return await cb.answer("Не знайдено!", show_alert=True)
-        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
+        await cb.message.edit_text(await _fmt_task_full(t), reply_markup=ikb_task_actions(tid, t))
         await cb.answer()
     except Exception:
         logger.exception("view_task failed")
@@ -407,9 +446,9 @@ async def task_done(cb: CallbackQuery):
             extra += f"\n🏆 Новий рівень: *{new_level}*!"
 
         try:
-            await cb.message.edit_text(f"✅ *Виконано!*\n\n{fmt_task(t)}{extra}")
+            await cb.message.edit_text(f"✅ *Виконано!*\n\n{await _fmt_task_full(t)}{extra}")
         except TelegramAPIError:
-            await cb.message.answer(f"✅ *Виконано!*\n\n{fmt_task(t)}{extra}")
+            await cb.message.answer(f"✅ *Виконано!*\n\n{await _fmt_task_full(t)}{extra}")
         await cb.answer("✅ Виконано!")
     except Exception:
         logger.exception("task_done failed")
@@ -431,10 +470,11 @@ async def _postpone(cb: CallbackQuery, tid: int, new_due: datetime):
     state = await users_db.get_user_state(t["uid"])
     await users_db.save_user_state(t["uid"], {"total_postponed": state.get("total_postponed", 0) + 1})
     t = await tasks_db.get_task(tid)
+    text = f"🔁 *Перенесено!*\n\n{await _fmt_task_full(t)}"
     try:
-        await cb.message.edit_text(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid, t))
+        await cb.message.edit_text(text, reply_markup=ikb_task_actions(tid, t))
     except TelegramAPIError:
-        await cb.message.answer(f"🔁 *Перенесено!*\n\n{fmt_task(t)}", reply_markup=ikb_task_actions(tid, t))
+        await cb.message.answer(text, reply_markup=ikb_task_actions(tid, t))
     await cb.answer("🔁 Перенесено")
 
 
@@ -486,7 +526,7 @@ async def pin_task(cb: CallbackQuery):
         tid = int(cb.data.split(":")[1])
         await tasks_db.update_task(tid, {"pinned": True})
         t = await tasks_db.get_task(tid)
-        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
+        await cb.message.edit_text(await _fmt_task_full(t), reply_markup=ikb_task_actions(tid, t))
         await cb.answer("⭐ Закріплено!")
     except Exception:
         logger.exception("pin_task failed")
@@ -499,7 +539,7 @@ async def unpin_task(cb: CallbackQuery):
         tid = int(cb.data.split(":")[1])
         await tasks_db.update_task(tid, {"pinned": False})
         t = await tasks_db.get_task(tid)
-        await cb.message.edit_text(fmt_task(t), reply_markup=ikb_task_actions(tid, t))
+        await cb.message.edit_text(await _fmt_task_full(t), reply_markup=ikb_task_actions(tid, t))
         await cb.answer("📌 Відкріплено")
     except Exception:
         logger.exception("unpin_task failed")
@@ -675,7 +715,7 @@ async def edit_field_save(msg: Message, state: FSMContext):
     await state.clear()
     t = await tasks_db.get_task(tid)
     if t:
-        await msg.answer(f"✅ Оновлено!\n\n{fmt_task(t)}", reply_markup=kb_tasks_menu())
+        await msg.answer(f"✅ Оновлено!\n\n{await _fmt_task_full(t)}", reply_markup=kb_tasks_menu())
     else:
         await msg.answer("Завдання не знайдено.", reply_markup=kb_tasks_menu())
 

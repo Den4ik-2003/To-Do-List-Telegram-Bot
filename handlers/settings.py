@@ -20,6 +20,7 @@ class SettingsInput(StatesGroup):
     morning_time = State()
     ai_limit = State()
     currency = State()
+    worktime_time = State()
 
 
 def _settings_text() -> str:
@@ -35,6 +36,7 @@ async def _render_settings(uid: int):
         morning_enabled=state.get("ai_morning_enabled", True),
         evening_enabled=state.get("ai_evening_enabled", True),
         notifications_enabled=state.get("notifications_enabled", True),
+        worktime_enabled=state.get("worktime_reminder_enabled", True),
     )
     return _settings_text(), kb
 
@@ -89,6 +91,51 @@ async def toggle_notifications(cb: CallbackQuery):
     text, kb = await _render_settings(uid)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer("🔔 Увімкнено" if new_val else "🔕 Вимкнено")
+
+
+@router.callback_query(F.data == "settings_toggle_worktime")
+async def toggle_worktime(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        current = await users_db.get_user_state(uid)
+        new_val = not current.get("worktime_reminder_enabled", True)
+        await users_db.save_user_state(uid, {"worktime_reminder_enabled": new_val})
+    except DBUnavailable:
+        return await cb.answer(DB_ERROR_TEXT, show_alert=True)
+    text, kb = await _render_settings(uid)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("🔔 Увімкнено" if new_val else "🔕 Вимкнено")
+
+
+@router.callback_query(F.data == "settings_worktime_time")
+async def ask_worktime_time(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SettingsInput.worktime_time)
+    await cb.message.answer(
+        "⏰ Введи час нагадування про облік часу у форматі ГГ:ХХ (наприклад, 22:00):",
+        reply_markup=kb_cancel(),
+    )
+    await cb.answer()
+
+
+@router.message(SettingsInput.worktime_time)
+async def save_worktime_time(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+    text = msg.text.strip()
+    parts = text.split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return await msg.answer("⚠️ Невірний формат. Введи час як ГГ:ХХ, наприклад 22:00.")
+    h, m = int(parts[0]), int(parts[1])
+    if not (0 <= h < 24 and 0 <= m < 60):
+        return await msg.answer("⚠️ Невірний час. Введи час як ГГ:ХХ, наприклад 22:00.")
+    try:
+        await users_db.save_user_state(msg.from_user.id, {"worktime_reminder_time": f"{h:02d}:{m:02d}"})
+    except DBUnavailable:
+        await state.clear()
+        return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+    await state.clear()
+    await msg.answer(f"✅ Час нагадування про облік часу встановлено: {h:02d}:{m:02d}", reply_markup=kb_main())
 
 
 @router.callback_query(F.data == "settings_morning_time")

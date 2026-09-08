@@ -23,12 +23,8 @@ from handlers.common import require_auth, ai_suggestions_cache, compute_daily_st
 logger = logging.getLogger("tasks_bot")
 router = Router(name="ai_planner")
 
-# Скільки секунд чекаємо на відповідь AI, перш ніж вважати запит завислим.
 AI_PLAN_TIMEOUT_SECONDS = 45
 
-# Активні задачі генерації плану, per uid — щоб кнопка "❌ Скасувати"
-# могла реально перервати запит, а не просто показати відмову користувачу,
-# лишивши AI-запит висіти у фоні.
 _generation_tasks: dict[int, asyncio.Task] = {}
 
 
@@ -38,6 +34,10 @@ class AiSettings(StatesGroup):
 
 class AiEditTask(StatesGroup):
     text = State()
+
+
+class AvailableTimeInput(StatesGroup):
+    answer = State()
 
 
 def _fmt_plan_preview(plan: dict, selected: set) -> str:
@@ -96,52 +96,40 @@ async def ai_menu_back_cb(cb: CallbackQuery):
     await cb.answer()
 
 
-async def _generate_and_show_plan(cb: CallbackQuery):
-    uid = cb.from_user.id
+async def generate_and_show_plan_for_message(msg: Message, available: dict):
+    uid = msg.from_user.id
     allowed, remaining = await planner_service.check_ai_limit(uid)
     if not allowed:
-        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_ai_menu())
+        return await msg.answer(AI_LIMIT_TEXT, reply_markup=ikb_ai_menu())
 
-    # Кнопка "❌ Скасувати" з'являється ОДРАЗУ, поки чекаємо відповідь AI —
-    # раніше тут не було жодної клавіатури, і якщо запит зависав, зробити
-    # було нічого не можна.
-    await cb.message.edit_text(
+    status_msg = await msg.answer(
         "☀️ Аналізую твої задачі, цілі, проєкти та фінанси, зачекай кілька секунд...",
         reply_markup=ikb_ai_generating(),
     )
 
-    task = asyncio.create_task(planner_service.generate_daily_plan(uid))
+    task = asyncio.create_task(planner_service.generate_daily_plan(uid, available=available))
     _generation_tasks[uid] = task
     try:
         plan = await asyncio.wait_for(task, timeout=AI_PLAN_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
-        # Користувач натиснув "❌ Скасувати" — той хендлер вже оновив повідомлення.
         return
     except asyncio.TimeoutError:
         task.cancel()
-        return await cb.message.edit_text(
+        return await status_msg.edit_text(
             "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
             reply_markup=ikb_ai_menu(),
         )
     except Exception:
-        # ВАЖЛИВО: раніше тут ловились ЛИШЕ CancelledError і TimeoutError.
-        # Будь-яка інша помилка (проблема з БД, некоректна JSON-відповідь AI,
-        # мережевий збій тощо) летіла далі й гасилась загальним except у
-        # ai_plan_cb/ai_regenerate_cb — але екран з кнопкою "❌ Скасувати"
-        # на цей момент уже показував застарілий стан, тому натискання на
-        # неї не давало ефекту (задача з _generation_tasks вже видалена
-        # нижче у finally, і хендлер ai_gen_cancel_cb не знаходив що скасовувати).
-        # Тепер помилка одразу перемальовує екран у робочий стан з меню.
         logger.exception("Помилка генерації AI-плану для uid=%s", uid)
-        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
+        return await status_msg.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
     finally:
         _generation_tasks.pop(uid, None)
 
     if not plan or not plan.get("tasks"):
-        return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
+        return await status_msg.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
     selected = set(range(len(plan["tasks"])))
     ai_suggestions_cache[uid] = {"plan": plan, "selected": selected}
-    await cb.message.edit_text(
+    await status_msg.edit_text(
         _fmt_plan_preview(plan, selected),
         reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
     )
@@ -149,12 +137,6 @@ async def _generate_and_show_plan(cb: CallbackQuery):
 
 @router.callback_query(F.data == "ai_gen_cancel")
 async def ai_gen_cancel_cb(cb: CallbackQuery):
-    # ВАЖЛИВО: відповідаємо на callback ОДРАЗУ, ще до edit_text. Раніше
-    # cb.answer() викликався лише в кінці, тому якщо edit_text падав з
-    # помилкою (напр. "message is not modified" — коли повідомлення вже
-    # було в такому ж стані через race condition) або просто затримувався,
-    # кнопка в Telegram лишалась у стані "завантаження" й виглядала так,
-    # ніби натискання взагалі не спрацювало.
     await cb.answer("Скасовую...")
     uid = cb.from_user.id
     task = _generation_tasks.pop(uid, None)
@@ -167,23 +149,46 @@ async def ai_gen_cancel_cb(cb: CallbackQuery):
 
 
 @router.callback_query(F.data == "ai_plan")
-async def ai_plan_cb(cb: CallbackQuery):
+async def ai_plan_cb(cb: CallbackQuery, state: FSMContext):
     try:
-        await cb.answer("Генерую...")
-        await _generate_and_show_plan(cb)
+        await cb.answer()
+        await state.set_state(AvailableTimeInput.answer)
+        await cb.message.edit_text(
+            "🌅 *План на сьогодні*\n\nСкільки часу ти сьогодні маєш для виконання задач?\n\n"
+            "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`"
+        )
     except Exception:
         logger.exception("ai_plan_cb failed")
         await _safe_edit(cb, AI_ERROR_TEXT)
 
 
 @router.callback_query(F.data == "ai_regenerate")
-async def ai_regenerate_cb(cb: CallbackQuery):
+async def ai_regenerate_cb(cb: CallbackQuery, state: FSMContext):
     try:
-        await cb.answer("Перегенеровую...")
-        await _generate_and_show_plan(cb)
+        await cb.answer()
+        await state.set_state(AvailableTimeInput.answer)
+        await cb.message.edit_text(
+            "🔄 *Перегенерувати план*\n\nСкільки часу ти сьогодні маєш для виконання задач?\n\n"
+            "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`"
+        )
     except Exception:
         logger.exception("ai_regenerate_cb failed")
         await _safe_edit(cb, AI_ERROR_TEXT)
+
+
+@router.message(AvailableTimeInput.answer)
+async def available_time_input(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+    available = planner_service.parse_available_time(msg.text or "")
+    if not available:
+        return await msg.answer(
+            "⚠️ Не зрозумів. Напиши кількість годин або часовий проміжок, наприклад:\n"
+            "`3 години` або `2 години, з 19:00 до 21:00`"
+        )
+    await state.clear()
+    await generate_and_show_plan_for_message(msg, available)
 
 
 @router.callback_query(F.data == "ai_current_plan")
@@ -228,10 +233,6 @@ async def aip_select_all_cb(cb: CallbackQuery):
     await cb.answer()
 
 
-# =========================================================
-# РЕДАГУВАННЯ ЗАДАЧІ В ПЛАНІ (перед додаванням)
-# =========================================================
-
 @router.callback_query(F.data.startswith("aipedit:"))
 async def aipedit_cb(cb: CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
@@ -257,8 +258,6 @@ async def aipedit_cb(cb: CallbackQuery, state: FSMContext):
 async def aipedit_save(msg: Message, state: FSMContext):
     uid = msg.from_user.id
     if msg.text == "❌ Скасувати":
-        # Скасовуємо лише редагування конкретної задачі — план і сесія лишаються,
-        # повертаємось до прев'ю без змін.
         await state.clear()
         data = ai_suggestions_cache.get(uid)
         if not data:
@@ -365,8 +364,6 @@ async def ai_analysis_cb(cb: CallbackQuery):
                 reply_markup=ikb_ai_menu(),
             )
         except Exception:
-            # Той самий фікс, що й у _generate_and_show_plan: будь-яка інша
-            # помилка тепер теж коректно перемальовує екран замість "зависання".
             logger.exception("Помилка AI-аналізу для uid=%s", uid)
             return await cb.message.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
         finally:
@@ -379,10 +376,6 @@ async def ai_analysis_cb(cb: CallbackQuery):
         logger.exception("ai_analysis_cb failed")
         await _safe_edit(cb, AI_ERROR_TEXT)
 
-
-# =========================================================
-# НАЛАШТУВАННЯ AI ПЛАНЕРА
-# =========================================================
 
 @router.callback_query(F.data == "ai_settings")
 async def ai_settings_cb(cb: CallbackQuery):
