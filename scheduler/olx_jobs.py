@@ -3,8 +3,9 @@ from datetime import datetime
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import OLX_CHECK_INTERVAL_MINUTES
+from config.settings import OLX_CHECK_INTERVAL_MINUTES, OLX_CHECK_TIME
 from database import olx as olx_db
 from services import olx_service
 from services import olx_scanner
@@ -34,8 +35,6 @@ async def _check_listing(bot: Bot, tracker: dict):
 
     if new_price < old_price:
         diff = new_price - old_price
-        # НОВЕ: якщо вже накопичилась історія — одразу показуємо загальний
-        # % падіння з моменту додавання в моніторинг, а не лише останній крок.
         summary = olx_db.price_drop_summary(tracker)
         drop_line = ""
         if summary:
@@ -64,15 +63,11 @@ async def _check_search(bot: Bot, tracker: dict):
         domain=domain,
     )
     if results is None:
-        # Технічний збій запиту — НЕ пишемо знімок статистики (п.4 Тренди):
-        # якщо це зробити, "0 результатів" від збою виглядатиме як реальне
-        # падіння пропозицій і спотворить тренд неправдивими даними.
         return
 
     seen_ids = set(tracker.get("seen_ids", []))
     new_items = [r for r in results if r["id"] not in seen_ids]
 
-    # НОВЕ: знімок для 🔥 OLX Тренди — тільки реальні дані з цього запиту.
     priced = [r["price"] for r in results if r.get("price") is not None]
     avg_price = round(sum(priced) / len(priced), 2) if priced else None
     currency = results[0]["currency"] if results else "UAH"
@@ -136,7 +131,6 @@ async def _check_scanner(bot: Bot, tracker: dict):
     if not fresh:
         return
 
-    # Не більше 2 знахідок за цикл — щоб не перетворити AI Scanner на спам.
     for item in fresh[:2]:
         listing = item.get("_listing") or {}
         analysis = item.get("resale_analysis")
@@ -167,10 +161,10 @@ async def check_all_olx_trackers(bot: Bot):
 
 
 def register_olx_jobs(scheduler: AsyncIOScheduler, bot: Bot):
+    hour, minute = (int(x) for x in OLX_CHECK_TIME.split(":"))
     scheduler.add_job(
         check_all_olx_trackers,
-        "interval",
-        minutes=OLX_CHECK_INTERVAL_MINUTES,
+        CronTrigger(hour=hour, minute=minute),
         args=[bot],
         id="olx_check",
         replace_existing=True,

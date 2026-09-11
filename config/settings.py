@@ -76,3 +76,7 @@ def _parse_model_list(raw: str) -> list[str]:
 # Через кому, напр.: AI_FALLBACK_MODELS=meta-llama/llama-3.1-8b-instruct:free,mistralai/mistral-7b-instruct:free
 # Якщо не задано — fallback просто немає (поведінка як раніше, але без storm повторів).
 AI_FALLBACK_MODELS = _parse_model_list(os.environ.get("AI_FALLBACK_MODELS", ""))
+
+# Раз на добу "в обід" замість інтервалу — для OLX-трекерів та resale-моніторингу
+OLX_CHECK_TIME = os.environ.get("OLX_CHECK_TIME", "13:00")
+RESALE_CHECK_TIME = os.environ.get("RESALE_CHECK_TIME", "13:00")

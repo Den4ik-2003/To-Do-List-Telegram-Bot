@@ -2,10 +2,9 @@
 scheduler/resale_jobs.py
 
 Фонова перевірка активних AI-моніторингів "🔥 Знайти перепродаж".
-Джоба тікає часто (раз на кілька хвилин), але кожен конкретний моніторинг
-реально сканується лише коли з моменту last_checked_at пройшло не менше
-його власної check_interval_minutes — так кожен користувач керує
-частотою свого моніторингу незалежно від інших.
+Джоба тепер тікає раз на добу (о RESALE_CHECK_TIME) для всіх активних
+моніторингів одразу, замість частого interval-тіку з власним
+check_interval_minutes у кожного моніторингу.
 """
 
 import logging
@@ -13,16 +12,17 @@ from datetime import datetime
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import RESALE_MIN_SCORE_THRESHOLD, RESALE_MAX_NOTIFY_PER_CYCLE
+from config.settings import (
+    RESALE_MIN_SCORE_THRESHOLD,
+    RESALE_MAX_NOTIFY_PER_CYCLE,
+    RESALE_CHECK_TIME,
+)
 from database import resale as resale_db
 from services import resale_service
 
 logger = logging.getLogger("tasks_bot")
-
-# Як часто тікає сама джоба (перевірка "чи не час сканувати" для кожного
-# моніторингу) — не плутати з check_interval_minutes конкретного моніторингу.
-JOB_TICK_MINUTES = 10
 
 
 def _is_due(monitor: dict) -> bool:
@@ -87,10 +87,10 @@ async def check_all_resale_monitors(bot: Bot):
 
 
 def register_resale_jobs(scheduler: AsyncIOScheduler, bot: Bot):
+    hour, minute = (int(x) for x in RESALE_CHECK_TIME.split(":"))
     scheduler.add_job(
         check_all_resale_monitors,
-        "interval",
-        minutes=JOB_TICK_MINUTES,
+        CronTrigger(hour=hour, minute=minute),
         args=[bot],
         id="resale_check",
         replace_existing=True,
