@@ -171,27 +171,46 @@ def level_progress(xp: int):
 
 
 async def compute_daily_stats(uid: int, tasks_db) -> dict:
-    today_str = datetime.now().strftime("%d.%m.%Y")
+    now = datetime.now()
+    today_date = now.date()
+    today_str = now.strftime("%d.%m.%Y")
+
     tasks = await tasks_db.get_user_tasks(uid)
     done_today, missed_today, postponed_today = [], [], 0
     longest = None
+
     for t in tasks:
-        due = t.get("due", "")
-        if not due.startswith(today_str):
-            continue
+        # --- ВИКОНАНІ: рахуємо по completed_at (дата ФАКТИЧНОГО виконання),
+        # а не по due (дедлайну). Раніше фільтр був по due.startswith(today_str),
+        # тому задачі, виконані сьогодні з учорашнім/пустим дедлайном, губились.
         if t.get("status") == STATUS_DONE:
+            completed = t.get("completed_at")
+            if not completed:
+                continue
+            try:
+                completed_dt = datetime.fromisoformat(completed)
+            except ValueError:
+                continue
+            if completed_dt.date() != today_date:
+                continue
+
             done_today.append(t)
             created = t.get("created_at")
-            completed = t.get("completed_at")
-            if created and completed:
+            if created:
                 try:
-                    delta = (datetime.fromisoformat(completed) - datetime.fromisoformat(created)).total_seconds()
+                    delta = (completed_dt - datetime.fromisoformat(created)).total_seconds()
                     if longest is None or delta > longest[0]:
                         longest = (delta, t.get("text", ""))
                 except ValueError:
                     pass
-        elif is_missed(t):
+            continue
+
+        # --- ПРОСТРОЧЕНІ: тут логіка лишається прив'язаною до due,
+        # бо "прострочено сьогодні" стосується саме дедлайну, а не виконання.
+        due = t.get("due", "")
+        if due.startswith(today_str) and is_missed(t):
             missed_today.append(t)
+
         if t.get("postponed_today"):
             postponed_today += 1
 

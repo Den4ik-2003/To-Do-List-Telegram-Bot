@@ -69,3 +69,10 @@ PORT = int(os.environ.get("PORT", "8080"))
 RESALE_MIN_SCORE_THRESHOLD = int(os.environ.get("RESALE_MIN_SCORE_THRESHOLD", "70"))
 RESALE_MAX_NOTIFY_PER_CYCLE = int(os.environ.get("RESALE_MAX_NOTIFY_PER_CYCLE", "3"))
 RESALE_DEFAULT_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_DEFAULT_CHECK_INTERVAL_MINUTES", "180"))
+
+def _parse_model_list(raw: str) -> list[str]:
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+# Через кому, напр.: AI_FALLBACK_MODELS=meta-llama/llama-3.1-8b-instruct:free,mistralai/mistral-7b-instruct:free
+# Якщо не задано — fallback просто немає (поведінка як раніше, але без storm повторів).
+AI_FALLBACK_MODELS = _parse_model_list(os.environ.get("AI_FALLBACK_MODELS", ""))

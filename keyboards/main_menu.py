@@ -11,6 +11,7 @@ CATEGORY_GOALS = "🎯 Цілі та проєкти"
 CATEGORY_LIFE = "🌍 Побут"
 CATEGORY_BUSINESS = "💼 Бізнес"
 CATEGORY_JOBS = "💼 Вакансії"
+CATEGORY_SHOPS = "🏪 Магазини"
 
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
@@ -42,6 +43,10 @@ MAIN_CATEGORIES = {
     CATEGORY_JOBS: [
         "🔎 Знайти вакансії", "👤 Мої дані для пошуку",
         "⭐ Збережені вакансії", "🔔 Мої монітори вакансій",
+    ],
+    CATEGORY_SHOPS: [
+        "🏪 Мої магазини", "📢 Створити пост",
+        "⚡ Швидкий пост",
     ],
 }
 

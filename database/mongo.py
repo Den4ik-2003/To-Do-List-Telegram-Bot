@@ -44,6 +44,13 @@ recipe_history_col = None
 shopping_items_col = None
 cooking_sessions_col = None
 
+shops_col = None
+shop_templates_col = None
+shop_examples_col = None
+shop_stickers_col = None
+shop_drafts_col = None
+shop_published_posts_col = None
+
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
@@ -58,6 +65,8 @@ async def init_mongo(mongo_uri: str):
     global olx_deals_col, olx_user_settings_col, olx_search_stats_col
     global favorite_recipes_col, recipe_history_col, shopping_items_col, cooking_sessions_col
     global worktime_col
+    global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
+    global shop_drafts_col, shop_published_posts_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -108,6 +117,13 @@ async def init_mongo(mongo_uri: str):
     cooking_sessions_col = db["active_cooking_sessions"]
 
     worktime_col = db["worktime_entries"]
+
+    shops_col = db["shops"]
+    shop_templates_col = db["shop_templates"]
+    shop_examples_col = db["shop_examples"]
+    shop_stickers_col = db["shop_stickers"]
+    shop_drafts_col = db["shop_drafts"]
+    shop_published_posts_col = db["shop_published_posts"]
 
     await ping()
     return db
