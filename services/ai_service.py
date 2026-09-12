@@ -1,3 +1,35 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/ai_service.py
+
+КОРІНЬ ПРОБЛЕМИ "⚠️ AI не відповів вчасно": зовнішній тайм-аут у
+handlers/ai_planner.py (AI_PLAN_TIMEOUT_SECONDS=45) МЕНШИЙ, ніж
+найгірший сценарій усередині цього файлу. Один логічний виклик
+generate_json() міг займати:
+  - json_mode: до (MAX_TRANSIENT_RETRIES+1)=2 спроби × 45с = 90с
+  - якщо JSON не розпарсився — ЩЕ текстовий fallback-прохід:
+    знову до 2 спроб × 45с = 90с
+  = до ~180с у найгіршому разі, тоді як ai_planner.py чекав лише 45с.
+Тобто зовнішній тайм-аут спрацьовував ЗАДОВГО до того, як AI взагалі
+встигав відповісти, навіть якщо відповідь була б успішною.
+
+ЗМІНИ:
+1. AI_REQUEST_TIMEOUT_SECONDS: 45 → 30 (все ще з запасом для звичайної
+   відповіді моделі; більшість реальних відповідей у логах приходили за
+   1-27с).
+2. Доданий параметр allow_retry у _chat_completion()/_complete() —
+   текстовий fallback-прохід у generate_json() тепер робить ЛИШЕ ОДНУ
+   спробу на модель (allow_retry=False), а не дві. Основний json_mode-
+   прохід і далі має свій один retry (allow_retry=True за замовчуванням) —
+   там повтор виправдовує себе найбільше (порожні відповіді в json-режимі
+   найчастіші).
+3. Найгірший сценарій тепер: 2×30с (json_mode) + 1×30с (fallback) = ~90с
+   для ОДНІЄЇ моделі. Якщо в AI_FALLBACK_MODELS налаштовано ще моделі —
+   час пропорційно зростає на кожну; про це є коментар нижче.
+
+Публічні сигнатури (generate_text/generate_json/chat/chat_with_tools/
+extract_receipt/transcribe_voice/analyze_product_photo) НЕ змінені.
+"""
+
 import asyncio
 import json
 import logging
@@ -15,7 +47,10 @@ from config.settings import (
 
 logger = logging.getLogger("tasks_bot")
 
-AI_REQUEST_TIMEOUT_SECONDS = 45
+# ЗМІНЕНО: 45 → 30. Один запит до ОДНІЄЇ моделі тепер обмежений 30с
+# замість 45с — це звужує найгірший сумарний час і дозволяє зовнішньому
+# тайм-ауту (ai_planner.py) реалістично його покривати.
+AI_REQUEST_TIMEOUT_SECONDS = 30
 AI_CLIENT_TIMEOUT_SECONDS = 40
 
 # Скільки разів повторювати ОДНУ Й ТУ Ж модель при ТИМЧАСОВІЙ помилці
@@ -63,7 +98,13 @@ _no_json_support: set[str] = set()
 def _model_list() -> list[str]:
     """AI_MODEL завжди першим, далі — унікальні fallback-моделі з .env
     (AI_FALLBACK_MODELS), у порядку зазначення. Немає жорсткої прив'язки
-    коду до конкретної назви моделі — все конфігурується через .env."""
+    коду до конкретної назви моделі — все конфігурується через .env.
+
+    ⚠️ ВАЖЛИВО ПРО ТАЙМ-АУТИ: кожна додаткова fallback-модель у цьому
+    списку пропорційно збільшує найгірший сценарій часу відповіді
+    (кожна модель — це ще один цикл спроб). Якщо задаси AI_FALLBACK_MODELS
+    з кількома моделями, можливо, доведеться ще підняти
+    AI_PLAN_TIMEOUT_SECONDS у handlers/ai_planner.py."""
     models = [AI_MODEL] if AI_MODEL else []
     for m in AI_FALLBACK_MODELS:
         if m and m not in models:
@@ -207,7 +248,20 @@ async def _call_once(model: str, messages: list[dict], temperature: float, json_
     )
 
 
-async def _chat_completion(messages: list[dict], temperature: float, json_mode: bool, label: str = "request") -> str | None:
+async def _chat_completion(
+    messages: list[dict],
+    temperature: float,
+    json_mode: bool,
+    label: str = "request",
+    allow_retry: bool = True,
+) -> str | None:
+    """
+    ЗМІНЕНО: новий параметр allow_retry (за замовчуванням True — поведінка
+    як і раніше). Якщо False — на кожну модель робиться ЛИШЕ ОДНА спроба
+    замість MAX_TRANSIENT_RETRIES+1. Використовується для текстового
+    fallback-проходу в generate_json(), щоб не подвоювати й так уже
+    повторний запит ще одним внутрішнім retry-циклом.
+    """
     if not client:
         return None
 
@@ -216,20 +270,22 @@ async def _chat_completion(messages: list[dict], temperature: float, json_mode: 
         logger.error("Немає жодної налаштованої AI-моделі (AI_MODEL порожній) — label=%s", label)
         return None
 
+    max_retries = MAX_TRANSIENT_RETRIES if allow_retry else 0
+
     for model in models:
         if _is_unavailable(model):
             logger.info("Модель %s на паузі після 429, пропускаю (label=%s)", model, label)
             continue
 
-        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+        for attempt in range(max_retries + 1):
             try:
                 resp = await _call_once(model, messages, temperature, json_mode)
             except asyncio.TimeoutError:
                 logger.warning(
                     "AI timeout (model=%s, label=%s, спроба=%s/%s)",
-                    model, label, attempt + 1, MAX_TRANSIENT_RETRIES + 1,
+                    model, label, attempt + 1, max_retries + 1,
                 )
-                if attempt < MAX_TRANSIENT_RETRIES:
+                if attempt < max_retries:
                     continue
                 break  # переходимо до наступної моделі
             except openai.RateLimitError as e:
@@ -264,9 +320,9 @@ async def _chat_completion(messages: list[dict], temperature: float, json_mode: 
             finish_reason = getattr(choice, "finish_reason", None)
             logger.warning(
                 "AI повернув ПОРОЖНІЙ content (model=%s, label=%s, finish_reason=%s, спроба=%s/%s)",
-                model, label, finish_reason, attempt + 1, MAX_TRANSIENT_RETRIES + 1,
+                model, label, finish_reason, attempt + 1, max_retries + 1,
             )
-            if attempt < MAX_TRANSIENT_RETRIES:
+            if attempt < max_retries:
                 continue
             break  # наступна модель
 
@@ -274,10 +330,16 @@ async def _chat_completion(messages: list[dict], temperature: float, json_mode: 
     return None
 
 
-async def _complete(prompt: str, temperature: float, json_mode: bool, images: list[str] | None = None) -> str | None:
+async def _complete(
+    prompt: str,
+    temperature: float,
+    json_mode: bool,
+    images: list[str] | None = None,
+    allow_retry: bool = True,
+) -> str | None:
     content = _build_content(prompt, images)
     messages = [{"role": "user", "content": content}]
-    return await _chat_completion(messages, temperature, json_mode, label="generate")
+    return await _chat_completion(messages, temperature, json_mode, label="generate", allow_retry=allow_retry)
 
 
 async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
@@ -285,12 +347,11 @@ async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
 
 
 async def generate_json(prompt: str, temperature: float = 0.7, images: list[str] | None = None) -> dict | None:
-    """Основний шлях: запит у json_mode. Якщо модель повернула щось, що не
-    парситься як JSON-об'єкт (порожній рядок, преамбула без валідного {...} —
-    типова поведінка деяких безкоштовних моделей на OpenRouter), робимо ОДИН
-    додатковий запит у звичайному текстовому режимі: без response_format
-    деякі моделі видають чистіший результат, а _extract_json_object все одно
-    витягує {...} навіть з тексту навколо нього."""
+    """Основний шлях: запит у json_mode (з retry — там порожні відповіді
+    найчастіші). Якщо результат не парситься як JSON-об'єкт, робимо ОДИН
+    додатковий запит у звичайному текстовому режимі БЕЗ retry
+    (allow_retry=False) — щоб не подвоювати й так уже додатковий прохід і
+    вкластися в реалістичний загальний бюджет часу."""
     raw = await _complete(prompt, temperature, json_mode=True, images=images)
     data = _try_parse_json_dict(raw)
     if data is not None:
@@ -301,7 +362,7 @@ async def generate_json(prompt: str, temperature: float = 0.7, images: list[str]
     else:
         logger.warning("AI не повернув відповіді в json_mode, пробую текстовий режим.")
 
-    raw_fallback = await _complete(prompt, temperature, json_mode=False, images=images)
+    raw_fallback = await _complete(prompt, temperature, json_mode=False, images=images, allow_retry=False)
     data = _try_parse_json_dict(raw_fallback)
     if data is not None:
         logger.info("Текстовий fallback-запит дав валідний JSON.")

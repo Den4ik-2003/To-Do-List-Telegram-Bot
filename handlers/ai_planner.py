@@ -1,3 +1,25 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/ai_planner.py
+
+Єдина змістовна зміна: AI_PLAN_TIMEOUT_SECONDS 45 → 100.
+
+ЧОМУ: services/ai_service.py у найгіршому разі (json_mode-спроба +
+retry, потім текстовий fallback-прохід) для ОДНІЄЇ моделі може зайняти
+до ~90с (після паралельного фіксу AI_REQUEST_TIMEOUT_SECONDS 45→30 і
+прибирання retry з fallback-проходу). Попередній зовнішній тайм-аут 45с
+був КОРОТШИЙ за цей внутрішній найгірший сценарій — тому користувач
+регулярно бачив "AI не відповів вчасно" навіть тоді, коли AI за трохи
+довший час усе ж відповів би успішно. 100с дає невеликий запас понад
+розрахований найгірший сценарій (~90с) для однієї моделі.
+
+Якщо в AI_FALLBACK_MODELS (config/settings.py) налаштовано кілька
+резервних моделей — час пропорційно зростає на кожну додаткову модель,
+і це значення, можливо, доведеться підняти ще — про це залишено
+коментар і в services/ai_service.py.
+
+Решта файлу — без змін.
+"""
+
 import asyncio
 import logging
 from datetime import datetime
@@ -23,7 +45,9 @@ from handlers.common import require_auth, ai_suggestions_cache, compute_daily_st
 logger = logging.getLogger("tasks_bot")
 router = Router(name="ai_planner")
 
-AI_PLAN_TIMEOUT_SECONDS = 45
+# ЗМІНЕНО: 45 → 100 (див. докстрінг файлу — узгоджено з реальним
+# найгіршим сценарієм часу відповіді в services/ai_service.py).
+AI_PLAN_TIMEOUT_SECONDS = 100
 
 _generation_tasks: dict[int, asyncio.Task] = {}
 
