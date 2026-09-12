@@ -51,8 +51,13 @@ def ikb_channel_menu(shop_id: str, has_channel: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ============================================================
+# Артикули
+# ============================================================
+
 def ikb_articles_menu(shop_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Додати артикул", callback_data=f"artadd:{shop_id}")],
         [InlineKeyboardButton(text="📋 Список артикулів", callback_data=f"artlist:{shop_id}")],
         [InlineKeyboardButton(text="🔎 Пошук по артикулу", callback_data=f"artsearch:{shop_id}")],
         [InlineKeyboardButton(text="◀️ До магазину", callback_data=f"shopopen:{shop_id}")],
@@ -61,3 +66,13 @@ def ikb_articles_menu(shop_id: str) -> InlineKeyboardMarkup:
 
 def kb_cancel_article() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Скасувати")]], resize_keyboard=True)
+
+
+def ikb_article_add_duplicate(shop_id: str, article_id: str) -> InlineKeyboardMarkup:
+    """Клавіатура для випадку дубліката при СТАНДАЛОН-додаванні артикула
+    (окремо від флоу створення поста — там своя клавіатура в keyboards/posts.py)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Переглянути товар", callback_data=f"artaddview:{article_id}")],
+        [InlineKeyboardButton(text="🔄 Все одно додати", callback_data=f"artaddforce:{shop_id}")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"artaddcancel:{shop_id}")],
+    ])

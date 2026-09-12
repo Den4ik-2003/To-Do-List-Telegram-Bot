@@ -39,6 +39,9 @@ def ikb_post_preview(has_channel: bool) -> InlineKeyboardMarkup:
 
 
 def ikb_article_duplicate(article_id: str) -> InlineKeyboardMarkup:
+    """Клавіатура дубліката САМЕ в флоу створення поста (окрема від standalone
+    додавання в handlers/shop_articles.py, бо кнопка «Скасувати» тут веде
+    в postcancel — скасування ВСЬОГО поста, а не тільки кроку з артикулом)."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Переглянути товар", callback_data=f"artview:{article_id}")],
         [InlineKeyboardButton(text="🔄 Все одно додати", callback_data="artforce")],
