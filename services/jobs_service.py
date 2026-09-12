@@ -3,7 +3,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -14,12 +14,15 @@ from services import ai_service
 logger = logging.getLogger("tasks_bot")
 
 DOU_RSS_URL = "https://jobs.dou.ua/vacancies/feeds/?search={query}"
-DJINNI_KEYWORD_RSS_URL = "https://djinni.co/jobs/keyword-{query}/rss/"
+DJINNI_RSS_URL = "https://djinni.co/jobs/rss/?primary_keyword={query}"
 WORKUA_SEARCH_URL = "https://www.work.ua/jobs-{query}/"
 WORKUA_SEARCH_CITY_URL = "https://www.work.ua/jobs-{city}-{query}/"
 ROBOTA_SEARCH_URL = "https://robota.ua/zapros/{query}/ukraine"
 
-CURL_HEADERS = {"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7"}
+CURL_HEADERS = {
+    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
 IMPERSONATE = "chrome124"
 REQUEST_TIMEOUT = 15
 
@@ -199,6 +202,15 @@ def _rss_findtext(item: ET.Element, tag: str) -> str:
     return ""
 
 
+def _looks_like_xml(text: str) -> bool:
+    head = text.lstrip()[:200].lower()
+    if not head:
+        return False
+    if head.startswith("<!doctype html") or head.startswith("<html"):
+        return False
+    return head.startswith("<?xml") or head.startswith("<rss") or head.startswith("<feed")
+
+
 async def _fetch_rss_items(url: str, source_name: str) -> list[dict]:
     try:
         async with aiohttp.ClientSession(headers=CURL_HEADERS) as session:
@@ -209,6 +221,10 @@ async def _fetch_rss_items(url: str, source_name: str) -> list[dict]:
                 xml_text = await resp.text()
     except Exception:
         logger.exception("%s RSS fetch failed for %s", source_name, url)
+        return []
+
+    if not _looks_like_xml(xml_text):
+        logger.warning("%s RSS returned non-XML content for %s", source_name, url)
         return []
 
     try:
@@ -249,8 +265,7 @@ async def fetch_djinni(criteria: dict) -> list[dict]:
     query = _search_slug(criteria)
     if not query:
         return []
-    slug = quote(query.replace(" ", "-").lower())
-    url = DJINNI_KEYWORD_RSS_URL.format(query=slug)
+    url = DJINNI_RSS_URL.format(query=quote_plus(query))
     return await _fetch_rss_items(url, "Djinni")
 
 
