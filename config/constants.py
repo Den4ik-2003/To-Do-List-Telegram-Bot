@@ -14,12 +14,14 @@ LABEL_ORDER = {"urgent": 0, "medium": 1, "low": 2, "idea": 3, "personal": 4}
 LABEL_XP = {"urgent": 25, "medium": 15, "low": 10, "idea": 10, "personal": 10}
 
 CATEGORIES = {
-    "work":    {"emoji": "💻", "name": "Робота"},
-    "finance": {"emoji": "💰", "name": "Фінанси"},
-    "home":    {"emoji": "🏠", "name": "Дім"},
-    "sport":   {"emoji": "💪", "name": "Спорт"},
-    "study":   {"emoji": "📚", "name": "Навчання"},
-    "other":   {"emoji": "🗂", "name": "Інше"},
+    "work":     {"emoji": "💻", "name": "Робота"},
+    "finance":  {"emoji": "💰", "name": "Фінанси"},
+    "home":     {"emoji": "🏠", "name": "Дім"},
+    "sport":    {"emoji": "💪", "name": "Спорт"},
+    "study":    {"emoji": "📚", "name": "Навчання"},
+    "business": {"emoji": "💼", "name": "Бізнес"},
+    "idea":     {"emoji": "💡", "name": "Ідея"},
+    "other":    {"emoji": "🗂", "name": "Інше"},
 }
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}

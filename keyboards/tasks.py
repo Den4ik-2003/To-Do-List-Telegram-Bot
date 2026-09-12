@@ -39,7 +39,8 @@ def kb_category() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="💻 Робота"), KeyboardButton(text="💰 Фінанси")],
         [KeyboardButton(text="🏠 Дім"), KeyboardButton(text="💪 Спорт")],
-        [KeyboardButton(text="📚 Навчання"), KeyboardButton(text="🗂 Інше")],
+        [KeyboardButton(text="📚 Навчання"), KeyboardButton(text="💼 Бізнес")],
+        [KeyboardButton(text="💡 Ідея"), KeyboardButton(text="🗂 Інше")],
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
@@ -47,7 +48,8 @@ def kb_category() -> ReplyKeyboardMarkup:
 def category_from_text(text: str) -> str | None:
     mapping = {
         "💻 Робота": "work", "💰 Фінанси": "finance", "🏠 Дім": "home",
-        "💪 Спорт": "sport", "📚 Навчання": "study", "🗂 Інше": "other",
+        "💪 Спорт": "sport", "📚 Навчання": "study", "💼 Бізнес": "business",
+        "💡 Ідея": "idea", "🗂 Інше": "other",
     }
     return mapping.get(text)
 
