@@ -78,6 +78,7 @@ def register_routers(dp: Dispatcher) -> None:
         jobs,
         shops,
         shop_templates,
+        shop_articles,
         posts,
         settings as settings_handlers,
     )
@@ -112,6 +113,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(jobs.router)
     dp.include_router(shops.router)
     dp.include_router(shop_templates.router)
+    dp.include_router(shop_articles.router)
     dp.include_router(posts.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
