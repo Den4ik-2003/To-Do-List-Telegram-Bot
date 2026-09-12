@@ -1,3 +1,33 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/jobs.py
+
+Три виправлення:
+
+1. У прев'ю "🎯 Найкращі для тебе" (топ-3) тепер додається посилання на
+   кожну вакансію — раніше там була тільки назва й Match%, без url.
+
+2. "Match None%": v['_score'].get('match_percent', '?') підставляє
+   дефолт '?' ЛИШЕ якщо ключа немає в словнику — а ключ там Є, просто
+   зі значенням None (коли профіль не заповнений, score_vacancy() чесно
+   повертає match_percent=None). Тепер явна перевірка на None замість
+   покладання на .get()-дефолт.
+
+3. КРИТИЧНЕ: додано екранування Markdown-спецсимволів (_, *, `, [) у
+   ВСІХ полях, що приходять із зовнішніх джерел (назва вакансії,
+   компанія, локація, зарплата, досвід, AI-текст аналізу/cover letter).
+   Без цього непередбачуваний підкреслення/зірочка в реальній назві
+   вакансії чи описі ламає Markdown-парсинг усього повідомлення —
+   Telegram кидає TelegramBadRequest, він ніде не ловиться локально й
+   вилітає до зовнішнього except Exception в _run_search(), показуючи
+   користувачу загальне "Сталася помилка під час пошуку вакансій" уже
+   ПІСЛЯ того, як частина результатів встигла показатись. Додатково
+   для картки вакансії й топ-3 введено safe-фолбек: якщо навіть після
+   екранування Telegram не зміг розпарсити повідомлення — воно
+   надсилається повторно вже БЕЗ форматування, а не губиться зовсім.
+
+Решта файлу — без змін.
+"""
+
 import logging
 import re
 
@@ -33,35 +63,71 @@ class JobSearch(StatesGroup):
 
 _WORK_FORMAT_LABELS = {"remote": "Remote", "office": "Офіс", "hybrid": "Гібрид"}
 
+# НОВЕ: екранування Markdown-спецсимволів для будь-якого зовнішнього/сирого
+# тексту (назви вакансій, компанії, описи зі скрапінгу, AI-текст) —
+# інакше непарний "_" чи "*" у реальних даних ламає весь Markdown-парсинг
+# повідомлення в Telegram.
+_MD_SPECIAL_RE = re.compile(r"([_*`\[])")
+
+
+def _md_escape(value) -> str:
+    if not value:
+        return ""
+    return _MD_SPECIAL_RE.sub(r"\\\1", str(value))
+
+
+def _fmt_match_line(score: dict) -> str:
+    """ЗМІНЕНО: явна перевірка на None замість .get(key, '?') — інакше
+    коли ключ ІСНУЄ зі значенням None (профіль не заповнений), .get()
+    повертає саме None, а не дефолт '?', і в повідомленні з'являється
+    буквально "Match None%"."""
+    mp = score.get("match_percent")
+    return f"Match {mp}%" if mp is not None else "Match: н/д (заповни профіль)"
+
+
+async def _answer_safe(target: Message, text: str, **kwargs) -> Message:
+    """Надсилає повідомлення; якщо Telegram не зміг розпарсити Markdown
+    (навіть після екранування — напр. якщо десь пропустили поле), не
+    падає з помилкою на весь пошук, а повторює без форматування."""
+    try:
+        return await target.answer(text, **kwargs)
+    except TelegramBadRequest:
+        logger.warning("Markdown parse failed for message, retrying without formatting")
+        kwargs.pop("parse_mode", None)
+        return await target.answer(text, parse_mode=None, **kwargs)
+
 
 def _fmt_vacancy_card(v: dict, total_shown: int, position: int) -> str:
     score = v.get("_score", {})
-    lines = [f"💼 *{v.get('title','')}*", ""]
-    lines.append(f"🏢 {v.get('company') or '—'}")
+    lines = [f"💼 *{_md_escape(v.get('title',''))}*", ""]
+    lines.append(f"🏢 {_md_escape(v.get('company')) or '—'}")
     if v.get("salary"):
-        lines.append(f"💰 {v['salary']}")
+        lines.append(f"💰 {_md_escape(v['salary'])}")
 
     format_label = _WORK_FORMAT_LABELS.get(v.get("work_format"))
-    loc_bits = [x for x in [v.get("location"), format_label] if x]
+    loc_bits = [x for x in [_md_escape(v.get("location")), format_label] if x]
     if loc_bits:
         lines.append(f"📍 {' / '.join(loc_bits)}")
 
     if v.get("experience"):
-        lines.append(f"📊 {v['experience']}")
+        lines.append(f"📊 {_md_escape(v['experience'])}")
 
     if score.get("match_percent") is not None:
         lines.append(f"\n🎯 Match: *{score['match_percent']}%*\n")
         for tag in (score.get("fits") or [])[:4]:
-            lines.append(f"🟢 {tag}")
+            lines.append(f"🟢 {_md_escape(tag)}")
         for tag in (score.get("missing") or [])[:2]:
-            lines.append(f"🟡 {tag}")
+            lines.append(f"🟡 {_md_escape(tag)}")
 
     sources = v.get("sources") or [v.get("source", "")]
-    lines.append(f"\n🌐 Джерело: {' · '.join(s for s in sources if s)}")
+    lines.append(f"\n🌐 Джерело: {_md_escape(' · '.join(s for s in sources if s))}")
+    # URL навмисно НЕ екранується — це просто посилання, Telegram сам
+    # підсвітить його як клікабельне, а екранування підкреслень у ньому
+    # додало б видимі зворотні слеші прямо в лінк.
     lines.append(f"🔗 {v.get('url','')}")
 
     if score.get("advice"):
-        lines.append(f"\n💡 {score['advice']}")
+        lines.append(f"\n💡 {_md_escape(score['advice'])}")
 
     lines.append(f"\n_{position + 1} з {total_shown}_")
     return "\n".join(lines)
@@ -123,11 +189,14 @@ async def _run_search_inner(msg: Message, uid: int, query_text: str):
     _results_cache[uid] = scored
     _position_cache[uid] = 0
 
-    top3 = "\n".join(
-        f"{i+1}. {v.get('title','')} — Match {v['_score'].get('match_percent', '?')}%"
+    # ЗМІНЕНО: додано посилання на кожну вакансію (v.get("url")) і
+    # виправлено формування рядка Match через _fmt_match_line() замість
+    # .get(key, '?'), а назва — через _md_escape().
+    top3 = "\n\n".join(
+        f"{i+1}. {_md_escape(v.get('title',''))} — {_fmt_match_line(v['_score'])}\n🔗 {v.get('url','')}"
         for i, v in enumerate(scored[:3])
     )
-    await msg.answer(f"🎯 *Найкращі для тебе:*\n\n{top3}")
+    await _answer_safe(msg, f"🎯 *Найкращі для тебе:*\n\n{top3}")
 
     if not profile:
         await msg.answer(
@@ -148,7 +217,7 @@ async def _show_current_card(target: Message, uid: int):
     v = results[pos]
     saved = await jobs_db.is_saved(uid, v["url"])
     text = _fmt_vacancy_card(v, len(results), pos)
-    await target.answer(text, reply_markup=ikb_vacancy_card(pos, v["url"], saved=saved))
+    await _answer_safe(target, text, reply_markup=ikb_vacancy_card(pos, v["url"], saved=saved))
 
 
 @router.message(F.text == "🔎 Знайти вакансії")
@@ -240,7 +309,13 @@ async def jobs_analyze_cb(cb: CallbackQuery):
         if not analysis:
             return await _safe_edit(wait_msg, AI_ERROR_TEXT)
 
-        await _safe_edit(wait_msg, f"🤖 *AI аналіз вакансії*\n*{v.get('title','')}*\n\n{analysis}")
+        # ЗМІНЕНО: назва вакансії й текст аналізу екрановані — обидва
+        # можуть містити скраплений/AI-згенерований текст із символами,
+        # що ламають Markdown.
+        await _safe_edit(
+            wait_msg,
+            f"🤖 *AI аналіз вакансії*\n*{_md_escape(v.get('title',''))}*\n\n{_md_escape(analysis)}",
+        )
     except Exception:
         logger.exception("Vacancy analysis crashed for uid=%s idx=%s", uid, idx)
         await _safe_edit(wait_msg, AI_ERROR_TEXT)
@@ -297,7 +372,9 @@ async def jobs_cover_cb(cb: CallbackQuery):
         InlineKeyboardButton(text="🔄 Перегенерувати", callback_data=f"jb_cover:{idx}"),
         InlineKeyboardButton(text="📋 Скопіювати", callback_data=f"jb_copy_noop"),
     ]])
-    await cb.message.answer(f"✉️ *Cover Letter:*\n\n{letter}", reply_markup=kb)
+    # ЗМІНЕНО: letter екранований — це AI-текст, який може містити
+    # довільні символи з вимог вакансії, процитовані дослівно.
+    await _answer_safe(cb.message, f"✉️ *Cover Letter:*\n\n{_md_escape(letter)}", reply_markup=kb)
 
 
 @router.callback_query(F.data == "jb_copy_noop")
@@ -360,11 +437,12 @@ async def jobs_saved_list(msg: Message, state: FSMContext):
 
     for v in saved:
         status = v.get("status", "saved")
+        # ЗМІНЕНО: назва/компанія екрановані.
         text = (
-            f"⭐ *{v.get('title','')}*\n🏢 {v.get('company') or '—'}\n"
+            f"⭐ *{_md_escape(v.get('title',''))}*\n🏢 {_md_escape(v.get('company')) or '—'}\n"
             f"📌 Статус: {status}\n🔗 {v.get('url','')}"
         )
-        await msg.answer(text, reply_markup=ikb_saved_item(str(v["_id"]), status))
+        await _answer_safe(msg, text, reply_markup=ikb_saved_item(str(v["_id"]), status))
 
 
 @router.callback_query(F.data.startswith("jb_status:"))
@@ -401,8 +479,10 @@ async def jobs_watches_list(msg: Message, state: FSMContext):
         criteria = w.get("criteria", {})
         active = w.get("active", True)
         status_icon = "🔔" if active else "🔕"
-        text = f"{status_icon} {criteria.get('profession','')} | {criteria.get('city') or 'будь-де'}"
-        await msg.answer(text, reply_markup=ikb_watch_item(str(w["_id"]), active))
+        # ЗМІНЕНО: значення з criteria (profession/city — можуть містити
+        # довільний текст із запиту користувача) тепер екрановані.
+        text = f"{status_icon} {_md_escape(criteria.get('profession',''))} | {_md_escape(criteria.get('city')) or 'будь-де'}"
+        await _answer_safe(msg, text, reply_markup=ikb_watch_item(str(w["_id"]), active))
 
 
 @router.callback_query(F.data.startswith("jbw_off:"))
@@ -446,9 +526,9 @@ async def jobs_stats(msg: Message, state: FSMContext):
         lines.append(f"\n🎯 Середній Match: {stats['avg_match']}%")
     if stats["top_titles"]:
         lines.append("\n📈 Найчастіші позиції:")
-        lines += [f"• {t} ({c})" for t, c in stats["top_titles"]]
+        lines += [f"• {_md_escape(t)} ({c})" for t, c in stats["top_titles"]]
     if stats["top_companies"]:
         lines.append("\n🏢 Найчастіші компанії:")
-        lines += [f"• {c} ({n})" for c, n in stats["top_companies"]]
+        lines += [f"• {_md_escape(c)} ({n})" for c, n in stats["top_companies"]]
 
-    await msg.answer("\n".join(lines))
+    await _answer_safe(msg, "\n".join(lines))
