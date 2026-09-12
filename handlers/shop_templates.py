@@ -9,8 +9,7 @@ from aiogram.types import Message, CallbackQuery
 from config.constants import DB_ERROR_TEXT
 from database.mongo import DBUnavailable
 from database import shops as shops_db
-from database import shop_templates as templates_db
-from database import shop_examples as examples_db
+from database import shop_content as content_db
 from services import ai_service
 from services.post_template_service import analyze_example, extract_placeholders
 from keyboards.main_menu import kb_main
@@ -42,7 +41,8 @@ def is_cancel(text: str | None) -> bool:
 async def templates_list_cb(cb: CallbackQuery):
     try:
         shop_id = cb.data.split(":", 1)[1]
-        templates = await templates_db.get_templates(shop_id)
+        templates = await content_db.get_templates(shop_id)
+        templates = [content_db.migrate_template(t) for t in templates]
         text = "📂 *Шаблони магазину*"
         if not templates:
             text += "\n\n📭 Ще немає жодного шаблону."
@@ -192,10 +192,10 @@ async def template_name_save(msg: Message, state: FSMContext):
     await state.clear()
 
     try:
-        template_id = await templates_db.add_template(
+        template_id = await content_db.add_template(
             msg.from_user.id, shop_id, name, text_template, placeholders, sticker_file_id,
         )
-        await examples_db.add_example(msg.from_user.id, shop_id, template_id, name, raw_example, [])
+        await content_db.add_example(msg.from_user.id, shop_id, template_id, name, raw_example, [])
         await shops_db.set_last_template(shop_id, template_id)
     except DBUnavailable:
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
@@ -207,9 +207,10 @@ async def template_name_save(msg: Message, state: FSMContext):
 async def template_open_cb(cb: CallbackQuery):
     try:
         template_id = cb.data.split(":", 1)[1]
-        t = await templates_db.get_template(template_id)
+        t = await content_db.get_template(template_id)
         if not t:
             return await cb.answer("Шаблон не знайдено.", show_alert=True)
+        t = content_db.migrate_template(t)
         preview = t["text_template"].replace("{{", "❪").replace("}}", "❫")
         text = f"📄 *{t.get('name','')}*\n\n{preview}\n\nПоля: {', '.join(t.get('placeholders', []))}"
         await cb.message.edit_text(text, reply_markup=ikb_template_actions(template_id, t["shop_id"]))
@@ -223,9 +224,10 @@ async def template_open_cb(cb: CallbackQuery):
 async def template_edit_start_cb(cb: CallbackQuery, state: FSMContext):
     try:
         template_id = cb.data.split(":", 1)[1]
-        t = await templates_db.get_template(template_id)
+        t = await content_db.get_template(template_id)
         if not t:
             return await cb.answer("Шаблон не знайдено.", show_alert=True)
+        t = content_db.migrate_template(t)
         await state.set_state(TemplateFlow.editing_text)
         await state.update_data(edit_template_id=template_id)
         await cb.message.answer(
@@ -253,7 +255,7 @@ async def template_edit_save(msg: Message, state: FSMContext):
     template_id = fd["edit_template_id"]
     await state.clear()
     try:
-        await templates_db.update_template(template_id, {"text_template": text_template, "placeholders": placeholders})
+        await content_db.update_template(template_id, {"text_template": text_template, "placeholders": placeholders})
     except DBUnavailable:
         return await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
     await msg.answer("✅ Шаблон оновлено.", reply_markup=kb_main())
@@ -263,7 +265,7 @@ async def template_edit_save(msg: Message, state: FSMContext):
 async def template_delete_ask_cb(cb: CallbackQuery):
     try:
         template_id = cb.data.split(":", 1)[1]
-        t = await templates_db.get_template(template_id)
+        t = await content_db.get_template(template_id)
         if not t:
             return await cb.answer("Шаблон не знайдено.", show_alert=True)
         await cb.message.edit_text(
@@ -280,8 +282,8 @@ async def template_delete_ask_cb(cb: CallbackQuery):
 async def template_delete_confirm_cb(cb: CallbackQuery):
     try:
         _, template_id, shop_id = cb.data.split(":")
-        await templates_db.delete_template(template_id)
-        templates = await templates_db.get_templates(shop_id)
+        await content_db.delete_template(template_id)
+        templates = await content_db.get_templates(shop_id)
         text = "📂 *Шаблони магазину*"
         if not templates:
             text += "\n\n📭 Ще немає жодного шаблону."

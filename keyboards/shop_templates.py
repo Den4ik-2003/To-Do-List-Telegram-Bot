@@ -26,6 +26,7 @@ def ikb_templates_list(shop_id: str, templates: list) -> InlineKeyboardMarkup:
 
 def ikb_template_actions(template_id: str, shop_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Застосувати", callback_data=f"posttplquick:{shop_id}:{template_id}")],
         [InlineKeyboardButton(text="✏️ Редагувати текст", callback_data=f"tpledit:{template_id}")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"tpldel:{template_id}")],
         [InlineKeyboardButton(text="◀️ До шаблонів", callback_data=f"shoptpls:{shop_id}")],

@@ -36,3 +36,11 @@ def ikb_post_preview(has_channel: bool) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="🔄 Інший шаблон", callback_data="postretpl")])
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="postcancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_article_duplicate(article_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Переглянути товар", callback_data=f"artview:{article_id}")],
+        [InlineKeyboardButton(text="🔄 Все одно додати", callback_data="artforce")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="postcancel")],
+    ])

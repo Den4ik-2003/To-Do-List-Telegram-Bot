@@ -36,7 +36,6 @@ worktime_col = None
 
 olx_deals_col = None
 olx_user_settings_col = None
-
 olx_search_stats_col = None
 
 favorite_recipes_col = None
@@ -50,6 +49,7 @@ shop_examples_col = None
 shop_stickers_col = None
 shop_drafts_col = None
 shop_published_posts_col = None
+shop_articles_col = None
 
 
 async def init_mongo(mongo_uri: str):
@@ -66,7 +66,7 @@ async def init_mongo(mongo_uri: str):
     global favorite_recipes_col, recipe_history_col, shopping_items_col, cooking_sessions_col
     global worktime_col
     global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
-    global shop_drafts_col, shop_published_posts_col
+    global shop_drafts_col, shop_published_posts_col, shop_articles_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -124,9 +124,25 @@ async def init_mongo(mongo_uri: str):
     shop_stickers_col = db["shop_stickers"]
     shop_drafts_col = db["shop_drafts"]
     shop_published_posts_col = db["shop_published_posts"]
+    shop_articles_col = db["shop_articles"]
 
     await ping()
+    await _ensure_shop_indexes()
     return db
+
+
+async def _ensure_shop_indexes():
+    """Індекси, специфічні для магазинів/артикулів. Викликається один раз при старті."""
+    try:
+        await shop_articles_col.create_index(
+            [("shop_id", 1), ("article_norm", 1)],
+            unique=True,
+            name="uniq_shop_article",
+        )
+        await shop_templates_col.create_index([("shop_id", 1)], name="shop_id_idx")
+        await shop_examples_col.create_index([("shop_id", 1)], name="shop_id_idx")
+    except Exception:
+        logger.exception("Failed to ensure shop indexes")
 
 
 async def close_mongo() -> None:

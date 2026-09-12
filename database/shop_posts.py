@@ -6,12 +6,14 @@ from database import mongo as m
 from database.mongo import db_call
 
 
-async def save_draft(uid: int, shop_id: str, template_id: str, fields: dict, rendered_text: str,
-                      photo_file_ids: list, opening_sticker_file_id: str | None) -> str:
+async def save_draft(uid: int, shop_id: str, template_id: str | None, article_id: str | None,
+                      fields: dict, rendered_text: str, photo_file_ids: list,
+                      opening_sticker_file_id: str | None) -> str:
     doc = {
         "uid": uid,
         "shop_id": shop_id,
         "template_id": template_id,
+        "article_id": article_id,
         "fields": fields,
         "rendered_text": rendered_text,
         "photo_file_ids": photo_file_ids,
@@ -23,12 +25,21 @@ async def save_draft(uid: int, shop_id: str, template_id: str, fields: dict, ren
     return str(result.inserted_id) if result else ""
 
 
+async def get_draft(draft_id: str) -> dict | None:
+    return await db_call(m.shop_drafts_col.find_one({"_id": ObjectId(draft_id)}), default=None, raise_on_fail=False)
+
+
+async def update_draft(draft_id: str, fields: dict):
+    await db_call(m.shop_drafts_col.update_one({"_id": ObjectId(draft_id)}, {"$set": fields}))
+
+
 async def delete_draft(draft_id: str):
     await db_call(m.shop_drafts_col.delete_one({"_id": ObjectId(draft_id)}))
 
 
 async def add_published_post(uid: int, shop_id: str, channel_id: int, message_ids: list,
-                              rendered_text: str, photo_file_ids: list) -> str:
+                              rendered_text: str, photo_file_ids: list,
+                              template_id: str | None = None, article_id: str | None = None) -> str:
     doc = {
         "uid": uid,
         "shop_id": shop_id,
@@ -36,6 +47,8 @@ async def add_published_post(uid: int, shop_id: str, channel_id: int, message_id
         "message_ids": message_ids,
         "rendered_text": rendered_text,
         "photo_file_ids": photo_file_ids,
+        "template_id": template_id,
+        "article_id": article_id,
         "published_at": datetime.now().isoformat(),
     }
     result = await db_call(m.shop_published_posts_col.insert_one(doc))

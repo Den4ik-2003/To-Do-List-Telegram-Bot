@@ -28,6 +28,7 @@ def ikb_shop_menu(shop_id: str, has_channel: bool) -> InlineKeyboardMarkup:
     channel_label = "📢 Канал: підключено" if has_channel else "📢 Підключити канал"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📂 Шаблони", callback_data=f"shoptpls:{shop_id}")],
+        [InlineKeyboardButton(text="📦 Артикули товарів", callback_data=f"shopart:{shop_id}")],
         [InlineKeyboardButton(text=channel_label, callback_data=f"shopchannel:{shop_id}")],
         [InlineKeyboardButton(text="✏️ Перейменувати", callback_data=f"shoprename:{shop_id}")],
         [InlineKeyboardButton(text="🗑 Видалити магазин", callback_data=f"shopdel:{shop_id}")],
@@ -48,3 +49,15 @@ def ikb_channel_menu(shop_id: str, has_channel: bool) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🔌 Відв'язати канал", callback_data=f"shopchunbind:{shop_id}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"shopopen:{shop_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_articles_menu(shop_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список артикулів", callback_data=f"artlist:{shop_id}")],
+        [InlineKeyboardButton(text="🔎 Пошук по артикулу", callback_data=f"artsearch:{shop_id}")],
+        [InlineKeyboardButton(text="◀️ До магазину", callback_data=f"shopopen:{shop_id}")],
+    ])
+
+
+def kb_cancel_article() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Скасувати")]], resize_keyboard=True)

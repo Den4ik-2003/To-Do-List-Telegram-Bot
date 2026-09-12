@@ -52,9 +52,12 @@ async def set_last_template(shop_id: str, template_id: str | None):
 
 
 async def delete_shop(shop_id: str):
+    """Каскадно чистить усе, що прив'язано до магазину: шаблони, приклади,
+    стікери, чернетки постів і артикули."""
     oid = ObjectId(shop_id)
     await db_call(m.shop_templates_col.delete_many({"shop_id": shop_id}))
     await db_call(m.shop_examples_col.delete_many({"shop_id": shop_id}))
     await db_call(m.shop_stickers_col.delete_many({"shop_id": shop_id}))
     await db_call(m.shop_drafts_col.delete_many({"shop_id": shop_id}))
+    await db_call(m.shop_articles_col.delete_many({"shop_id": shop_id}))
     await db_call(m.shops_col.delete_one({"_id": oid}))

@@ -158,7 +158,7 @@ async def shop_delete_ask_cb(cb: CallbackQuery):
     try:
         shop_id = cb.data.split(":", 1)[1]
         await cb.message.edit_text(
-            "🗑 Видалити магазин разом з усіма його шаблонами, прикладами та стікерами?",
+            "🗑 Видалити магазин разом з усіма його шаблонами, прикладами, стікерами та артикулами?",
             reply_markup=ikb_shop_delete_confirm(shop_id),
         )
         await cb.answer()
