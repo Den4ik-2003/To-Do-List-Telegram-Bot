@@ -142,6 +142,9 @@ def _strip_json_fence(raw: str) -> str:
 
 
 def _extract_json_object(raw: str) -> str | None:
+    """Шукає перший ЗБАЛАНСОВАНИЙ {...} блок у тексті — навіть якщо модель
+    додала пояснювальний текст до/після JSON (частий випадок у безкоштовних
+    моделей)."""
     start = raw.find("{")
     if start == -1:
         return None
@@ -167,6 +170,22 @@ def _extract_json_object(raw: str) -> str | None:
             if depth == 0:
                 return raw[start:i + 1]
     return None
+
+
+def _try_parse_json_dict(raw: str | None) -> dict | None:
+    """Єдина точка парсингу JSON-словника з сирої відповіді моделі.
+    Повертає None замість того, щоб кидати виняток, якщо парсинг не вдався —
+    виклик generate_json вирішує, чи варто повторити запит інакше."""
+    if not raw or not raw.strip():
+        return None
+    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
+    if not candidate or not candidate.strip():
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _build_content(prompt: str, images: list[str] | None):
@@ -266,18 +285,33 @@ async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
 
 
 async def generate_json(prompt: str, temperature: float = 0.7, images: list[str] | None = None) -> dict | None:
+    """Основний шлях: запит у json_mode. Якщо модель повернула щось, що не
+    парситься як JSON-об'єкт (порожній рядок, преамбула без валідного {...} —
+    типова поведінка деяких безкоштовних моделей на OpenRouter), робимо ОДИН
+    додатковий запит у звичайному текстовому режимі: без response_format
+    деякі моделі видають чистіший результат, а _extract_json_object все одно
+    витягує {...} навіть з тексту навколо нього."""
     raw = await _complete(prompt, temperature, json_mode=True, images=images)
-    if raw is None:
-        return None
-    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
-    try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
-        logger.exception("AI повернув некоректний JSON: %s", raw[:300])
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
+    data = _try_parse_json_dict(raw)
+    if data is not None:
+        return data
+
+    if raw is not None:
+        logger.warning("AI повернув JSON, який не вдалось розпарсити (json_mode), пробую текстовий режим. raw[:300]=%r", raw[:300])
+    else:
+        logger.warning("AI не повернув відповіді в json_mode, пробую текстовий режим.")
+
+    raw_fallback = await _complete(prompt, temperature, json_mode=False, images=images)
+    data = _try_parse_json_dict(raw_fallback)
+    if data is not None:
+        logger.info("Текстовий fallback-запит дав валідний JSON.")
+        return data
+
+    if raw_fallback is not None:
+        logger.error("AI повернув некоректний JSON навіть у текстовому режимі: %s", raw_fallback[:300])
+    else:
+        logger.error("AI не відповів навіть у текстовому fallback-режимі.")
+    return None
 
 
 async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
@@ -348,18 +382,12 @@ async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
     }]
 
     raw = await _chat_completion(messages, temperature=0.2, json_mode=True, label="extract_receipt")
-    if raw is None:
-        return None
-
-    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
-    try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
-        logger.exception("AI повернув некоректний JSON для чека: %s", raw[:300])
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
+    data = _try_parse_json_dict(raw)
+    if data is not None:
+        return data
+    if raw is not None:
+        logger.error("AI повернув некоректний JSON для чека: %s", raw[:300])
+    return None
 
 
 async def transcribe_voice(audio_bytes: bytes) -> str | None:
@@ -411,15 +439,9 @@ async def analyze_product_photo(image_bytes: bytes, mime_type: str = "image/jpeg
     }]
 
     raw = await _chat_completion(messages, temperature=0.4, json_mode=True, label="analyze_product_photo")
-    if raw is None:
-        return None
-
-    candidate = _extract_json_object(raw) or _strip_json_fence(raw)
-    try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
-        logger.exception("AI повернув некоректний JSON для товару: %s", raw[:300])
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
+    data = _try_parse_json_dict(raw)
+    if data is not None:
+        return data
+    if raw is not None:
+        logger.error("AI повернув некоректний JSON для товару: %s", raw[:300])
+    return None
