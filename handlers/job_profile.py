@@ -1,6 +1,7 @@
 import logging
 
 from aiogram import Router, F
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
@@ -65,12 +66,7 @@ def _find_step_index(current_state: str) -> int:
     return -1
 
 
-@router.message(
-    JobProfile.profession, JobProfile.experience, JobProfile.skills, JobProfile.education,
-    JobProfile.languages, JobProfile.desired_salary, JobProfile.location,
-    JobProfile.work_format, JobProfile.employment_type, JobProfile.portfolio_url,
-    JobProfile.linkedin, JobProfile.github, JobProfile.resume_summary,
-)
+@router.message(StateFilter(*[step[0] for step in STEPS]))
 async def profile_step(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear()
