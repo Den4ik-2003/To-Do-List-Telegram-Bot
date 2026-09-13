@@ -1,7 +1,7 @@
 import io
 import zipfile
 
-MAX_ZIP_SIZE = 20 * 1024 * 1024
+MAX_ZIP_SIZE = 200 * 1024 * 1024
 MAX_FILES = 5000
 _IGNORED_PREFIXES = ("__MACOSX/", ".git/", "node_modules/", ".DS_Store")
 
