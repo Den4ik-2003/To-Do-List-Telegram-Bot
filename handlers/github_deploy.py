@@ -183,11 +183,24 @@ async def gh_new_zip_received(msg: Message, state: FSMContext, bot: Bot):
     if not (doc.file_name or "").lower().endswith(".zip"):
         return await msg.answer("⚠️ Це не ZIP-файл. Надішли архів з розширенням .zip")
 
+    if doc.file_size and doc.file_size > github_zip.MAX_ZIP_SIZE:
+        return await msg.answer(_fail_text(
+            f"Архів завеликий: {github_zip.fmt_size(doc.file_size)} "
+            f"(ліміт Telegram Bot API — {github_zip.MAX_ZIP_SIZE // (1024 * 1024)} МБ).",
+            "Прибери node_modules/venv/build-папки з архіву і спробуй ще раз.",
+        ))
+
     wait = await msg.answer("⏳ Завантажую ZIP...")
     try:
         tg_file = await bot.get_file(doc.file_id)
         buf = await bot.download_file(tg_file.file_path)
         zip_bytes = buf.read()
+    except TelegramBadRequest as e:
+        logger.warning("Telegram refused zip download for uid=%s: %s", msg.from_user.id, e)
+        return await _safe_edit(wait, _fail_text(
+            "Telegram відмовився віддати файл (ймовірно, він завеликий).",
+            f"Ліміт — {github_zip.MAX_ZIP_SIZE // (1024 * 1024)} МБ. Зменш архів і спробуй ще раз.",
+        ))
     except Exception:
         logger.exception("Failed to download zip from Telegram for uid=%s", msg.from_user.id)
         return await _safe_edit(wait, _fail_text(
@@ -420,11 +433,24 @@ async def gh_saved_zip_received(msg: Message, state: FSMContext, bot: Bot):
     if not (doc.file_name or "").lower().endswith(".zip"):
         return await msg.answer("⚠️ Це не ZIP-файл.")
 
+    if doc.file_size and doc.file_size > github_zip.MAX_ZIP_SIZE:
+        return await msg.answer(_fail_text(
+            f"Архів завеликий: {github_zip.fmt_size(doc.file_size)} "
+            f"(ліміт Telegram Bot API — {github_zip.MAX_ZIP_SIZE // (1024 * 1024)} МБ).",
+            "Прибери node_modules/venv/build-папки з архіву і спробуй ще раз.",
+        ))
+
     wait = await msg.answer("⏳ Завантажую ZIP...")
     try:
         tg_file = await bot.get_file(doc.file_id)
         buf = await bot.download_file(tg_file.file_path)
         zip_bytes = buf.read()
+    except TelegramBadRequest as e:
+        logger.warning("Telegram refused zip download for saved deploy uid=%s: %s", uid, e)
+        return await _safe_edit(wait, _fail_text(
+            "Telegram відмовився віддати файл (ймовірно, він завеликий).",
+            f"Ліміт — {github_zip.MAX_ZIP_SIZE // (1024 * 1024)} МБ. Зменш архів і спробуй ще раз.",
+        ))
     except Exception:
         logger.exception("Failed to download zip for saved deploy uid=%s", uid)
         return await _safe_edit(wait, _fail_text("Не вдалося завантажити файл із Telegram.", "Спробуй ще раз."))
