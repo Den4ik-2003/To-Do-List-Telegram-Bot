@@ -54,11 +54,14 @@ async def add_listing_tracker(
         "favorited": False,
         "price_history": [{"price": last_price, "currency": currency, "at": now}] if last_price is not None else [],
         "own_listing": own_listing,
-        # НОВЕ: результат "🔍 Аудит мого оголошення" — той самий підхід
-        # кешування за content_hash, що вже використовується для
-        # resale_analysis нижче по файлу.
+        # "🔍 Аудит мого оголошення" — кешування за content_hash.
         "audit_result": None,
         "audit_analysis_at": None,
+        # НОВЕ: "🔎 Аналіз конкурента" — окремий кеш (окремий content_hash-
+        # ключ, бо оголошення-конкурент може оновлюватись незалежно від
+        # того, чи це саме оголошення колись аналізувалось як "своє").
+        "competitor_result": None,
+        "competitor_content_hash": None,
         "created_at": now,
     }
     result = await db_call(olx_tracked_col.insert_one(doc))
@@ -67,15 +70,14 @@ async def add_listing_tracker(
 
 async def upsert_own_listing(uid: int, url: str, details: dict) -> str:
     """
-    НОВЕ: для "🔍 Аудит мого оголошення". На відміну від add_listing_tracker
-    (яка завжди створює нову підписку — це правильна поведінка для "стежити
-    за оголошенням"), тут ми НЕ хочемо плодити дублікати при повторному
-    аудиті того самого власного оголошення користувача — тому upsert за
-    парою (uid, url, own_listing=True): якщо запис уже є, оновлюємо свіжі
-    дані (ціна/опис/фото могли змінитись), якщо немає — створюємо, зберігаючи
-    структуру полів ідентичною add_listing_tracker (щоб усі інші функції —
-    get_tracker, compute_content_hash тощо — працювали з цим документом
-    так само, без спеціальних випадків).
+    Використовується і для "🔍 Аудит мого оголошення", і для
+    "🔎 Аналіз конкурента" — в обох випадках ми не хочемо плодити дублікати
+    записів при повторному аналізі того самого URL для того самого
+    користувача, тому upsert за парою (uid, url, own_listing=True). Назва
+    залишена історичною ("own_listing"), хоча тепер сюди ж потрапляють і
+    оголошення конкурентів — структурно це той самий документ-трекер, і all
+    інші функції (get_tracker, compute_content_hash тощо) працюють з ним
+    однаково незалежно від того, для якої з двох фіч він був створений.
     """
     now = datetime.now().isoformat()
     set_fields = {
@@ -105,6 +107,11 @@ async def upsert_own_listing(uid: int, url: str, details: dict) -> str:
         "price_history": [],
         "audit_result": None,
         "audit_analysis_at": None,
+        # НОВЕ: заготовка полів для "🔎 Аналіз конкурента", як і в
+        # add_listing_tracker вище — щоб save_competitor_result() завжди мав
+        # куди писати, навіть якщо документ щойно створений через цей upsert.
+        "competitor_result": None,
+        "competitor_content_hash": None,
         "created_at": now,
     }
     result = await db_call(
@@ -231,8 +238,8 @@ async def save_resale_analysis(tracker_id, analysis: dict, content_hash: str):
 
 
 async def save_audit_result(tracker_id, audit: dict, content_hash: str):
-    """НОВЕ: кеш результату "🔍 Аудит мого оголошення" — той самий патерн,
-    що й save_resale_analysis вище (прив'язка до content_hash оголошення)."""
+    """Кеш результату "🔍 Аудит мого оголошення" — той самий патерн, що й
+    save_resale_analysis вище (прив'язка до content_hash оголошення)."""
     await db_call(
         olx_tracked_col.update_one(
             {"_id": ObjectId(tracker_id)},
@@ -240,6 +247,27 @@ async def save_audit_result(tracker_id, audit: dict, content_hash: str):
                 "audit_result": audit,
                 "audit_analysis_at": datetime.now().isoformat(),
                 "content_hash": content_hash,
+            }},
+        )
+    )
+
+
+async def save_competitor_result(tracker_id, result: dict, content_hash: str):
+    """НОВЕ: кеш результату "🔎 Аналіз конкурента" — окремий від
+    save_audit_result, бо це принципово інший аналіз (чуже оголошення з
+    точки зору "чим воно сильне/слабке відносно мого"), навіть якщо
+    технічно зберігається в тому самому document-трекері. Використовує
+    окреме поле competitor_content_hash (не content_hash), щоб кеш аудиту
+    власного оголошення і кеш аналізу конкурента не перезаписували
+    контрольні хеші один одного, якщо колись один і той самий URL
+    аналізується через обидві фічі."""
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {
+                "competitor_result": result,
+                "competitor_analysis_at": datetime.now().isoformat(),
+                "competitor_content_hash": content_hash,
             }},
         )
     )

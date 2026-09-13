@@ -1,10 +1,13 @@
 """
 services/olx_audit.py
 
-AI-логіка фічі "🔍 Аудит мого оголошення". НЕ дублює вже наявний
-services/olx_service.fetch_listing_details() — весь парсинг HTML лишається
-там, тут тільки AI-аналіз уже зчитаних даних (title/description/price/
-params/photos-URLs).
+AI-логіка фіч "🔍 Аудит мого оголошення" та "🔎 Аналіз конкурента". Обидві
+фічі НЕ дублюють вже наявний services/olx_service.fetch_listing_details() —
+весь парсинг HTML лишається там, тут тільки AI-аналіз уже зчитаних даних
+(title/description/price/params/photos-URLs). Аналіз конкурента навмисно
+перевикористовує ту саму інфраструктуру завантаження фото й виклику AI
+(_download_photos/_call_vision/_extract_json), що й аудит власного
+оголошення — щоб не тримати дві паралельні реалізації одного й того ж.
 
 ВАЖЛИВО про фото: vision-аналіз робиться через base64 (як і решта
 vision-фіч проєкту — не через прямий image_url, бо не всі AI-провайдери/
@@ -15,7 +18,10 @@ olx_service.fetch_image_bytes()).
 ЧЕСНІСТЬ: якщо поточна AI_MODEL не підтримує vision — перший виклик з
 фото впаде з помилкою від провайдера. У такому разі функція автоматично
 повторює запит БЕЗ фото і явно позначає в результаті, що аналіз
-фотографій не проводився, замість того щоб вигадати оцінку.
+фотографій не проводився, замість того щоб вигадати оцінку. Так само,
+якщо OLX не дозволив зчитати якісь конкретні дані (опис, характеристики,
+кількість переглядів тощо), це явно позначається в звіті, а не
+замовчується/вигадується.
 """
 
 import base64
@@ -83,6 +89,27 @@ async def _download_photos(photo_urls: list[str], limit: int) -> list[dict]:
     return downloaded
 
 
+async def _call_vision(messages: list[dict]) -> dict | None:
+    if not ai_service.client:
+        return None
+    try:
+        resp = await ai_service.client.chat.completions.create(
+            model=ai_service.AI_MODEL if hasattr(ai_service, "AI_MODEL") else None,
+            messages=messages,
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        return _extract_json(raw)
+    except Exception:
+        logger.warning("olx_audit: vision-запит не вдався (можливо модель без vision), спробую без фото", exc_info=True)
+        return None
+
+
+# =========================================================
+# 🔍 АУДИТ МОГО ОГОЛОШЕННЯ
+# =========================================================
+
 def _build_prompt(listing: dict, photos_downloaded: int) -> str:
     params_text = ", ".join(listing.get("params") or []) or "(недоступно з оголошення)"
     photos_count = listing.get("photos_count") or 0
@@ -130,23 +157,6 @@ def _build_prompt(listing: dict, photos_downloaded: int) -> str:
   }},
   "photos_to_add_or_reshoot": ["конкретна порада по фото 1", "..."]
 }}"""
-
-
-async def _call_vision(messages: list[dict]) -> dict | None:
-    if not ai_service.client:
-        return None
-    try:
-        resp = await ai_service.client.chat.completions.create(
-            model=ai_service.AI_MODEL if hasattr(ai_service, "AI_MODEL") else None,
-            messages=messages,
-            temperature=0.4,
-            response_format={"type": "json_object"},
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        return _extract_json(raw)
-    except Exception:
-        logger.warning("olx_audit: vision-запит не вдався (можливо модель без vision), спробую без фото", exc_info=True)
-        return None
 
 
 async def audit_listing(listing: dict) -> dict | None:
@@ -275,3 +285,154 @@ def format_full_improvement(audit: dict, listing: dict) -> str:
         format_photo_advice(audit),
     ]
     return "\n".join(parts)
+
+
+# =========================================================
+# 🔎 АНАЛІЗ КОНКУРЕНТА
+# =========================================================
+
+def _missing_data_notes(listing: dict, photos_downloaded: int) -> list[str]:
+    """Чесний список того, що OLX/парсер НЕ дав змоги отримати — щоб AI
+    (і сам звіт) не вигадував ці дані, а прямо сказав, чого не вистачає."""
+    notes = []
+    if not listing.get("description"):
+        notes.append("опис оголошення")
+    if not listing.get("params"):
+        notes.append("характеристики товару")
+    if listing.get("photos_count") and photos_downloaded < listing["photos_count"]:
+        notes.append(f"частина фото ({photos_downloaded}/{listing['photos_count']} завантажено для аналізу)")
+    elif not listing.get("photos_count"):
+        notes.append("фото (в оголошенні їх немає або не вдалося зчитати)")
+    if listing.get("views") is None:
+        notes.append("кількість переглядів")
+    return notes
+
+
+def _build_competitor_prompt(listing: dict, photos_downloaded: int, missing: list[str]) -> str:
+    params_text = ", ".join(listing.get("params") or []) or "(недоступно з оголошення)"
+    photos_count = listing.get("photos_count") or 0
+    missing_text = ", ".join(missing) if missing else "(усі основні дані доступні)"
+
+    photo_instruction = (
+        "Фото додані нижче окремими зображеннями — оціни їхню якість, кількість, ракурси, "
+        "освітлення й те, наскільки вони роблять оголошення привабливим для покупця."
+        if photos_downloaded > 0
+        else "Фото недоступні для аналізу — оцінюй ЛИШЕ текстову частину (заголовок, опис, "
+             "ціну, характеристики). НЕ вигадуй оцінку якості чи кількості фото понад те, "
+             "що вказано в даних нижче."
+    )
+
+    return f"""Ти — досвідчений консультант з продажу на OLX. Проаналізуй чуже оголошення
+(конкурента) з точки зору того, наскільки воно сильне, і що потрібно зробити краще у
+ВЛАСНОМУ оголошенні того самого товару, щоб виглядати переконливіше за нього.
+
+Дані оголошення конкурента:
+Назва: {listing.get('title') or '(немає)'}
+Опис: {listing.get('description') or '(немає)'}
+Ціна: {listing.get('price')} {listing.get('currency', '')}
+Характеристики/параметри: {params_text}
+Кількість фото в оголошенні: {photos_count} (проаналізовано: {photos_downloaded})
+Локація: {listing.get('location_text') or '(недоступно з оголошення)'}
+
+{photo_instruction}
+
+Дані, які OLX/парсер НЕ дозволив отримати для цього оголошення: {missing_text}.
+Якщо якогось з цих пунктів стосується твій аналіз — прямо зазнач у відповідному
+полі, що дані недоступні, а НЕ вигадуй їх.
+
+Оціни оголошення за шкалою від 1 до 10 (10 — ідеальне, продає само себе).
+
+Поверни ЛИШЕ JSON без пояснень і markdown-огорожі:
+{{
+  "score": число 1-10,
+  "strengths": ["конкретна сильна сторона 1", "..."],
+  "weaknesses": ["конкретна слабка сторона 1", "..."],
+  "improvements": ["конкретна дія для власного оголошення 1", "..."],
+  "conclusion": "1-2 речення підсумку: що зробити, щоб власне оголошення виглядало сильніше"
+}}"""
+
+
+async def analyze_competitor(listing: dict) -> dict | None:
+    """
+    Аналіз чужого (конкурентного) оголошення. Повертає dict з ключами
+    score/strengths/weaknesses/improvements/conclusion, плюс службові поля
+    photos_analyzed (int), vision_used (bool) і missing_data (list[str]) —
+    щоб format_competitor_report() міг чесно позначити, чого не вдалося
+    отримати з оголошення, замість вигадування. Повертає None при повному
+    провалі AI.
+    """
+    if not ai_service.is_available():
+        return None
+
+    photo_urls = listing.get("photos") or []
+    downloaded = await _download_photos(photo_urls, AUDIT_MAX_PHOTOS) if photo_urls else []
+    missing = _missing_data_notes(listing, len(downloaded))
+
+    if downloaded:
+        prompt = _build_competitor_prompt(listing, len(downloaded), missing)
+        content = [{"type": "text", "text": prompt}]
+        for p in downloaded:
+            content.append({"type": "image_url", "image_url": {"url": f"data:{p['mime']};base64,{p['b64']}"}})
+        result = await _call_vision([{"role": "user", "content": content}])
+        if result:
+            result["photos_analyzed"] = len(downloaded)
+            result["vision_used"] = True
+            result["missing_data"] = missing
+            return result
+        logger.info("olx_audit: vision-виклик аналізу конкурента не дав результату, падаємо назад на текст")
+
+    text_prompt = _build_competitor_prompt(listing, 0, missing)
+    text_result = await ai_service.generate_json(text_prompt, temperature=0.4)
+    if not text_result:
+        return None
+    text_result["photos_analyzed"] = 0
+    text_result["vision_used"] = False
+    text_result["missing_data"] = missing
+    return text_result
+
+
+def format_competitor_report(audit: dict, listing: dict) -> str:
+    score = audit.get("score", "?")
+    strengths = audit.get("strengths") or []
+    weaknesses = audit.get("weaknesses") or []
+    improvements = audit.get("improvements") or []
+    conclusion = audit.get("conclusion") or ""
+    missing = audit.get("missing_data") or []
+
+    lines = [
+        "🔎 *Аналіз конкурента*",
+        f"⭐ Оцінка: {score}/10",
+        "",
+    ]
+
+    if strengths:
+        lines.append("✅ *Сильні сторони:*")
+        for s in strengths:
+            lines.append(f"— {s}")
+        lines.append("")
+
+    if weaknesses:
+        lines.append("❌ *Слабкі:*")
+        for w in weaknesses:
+            lines.append(f"— {w}")
+        lines.append("")
+
+    if improvements:
+        lines.append("💡 *Що зробити краще:*")
+        for imp in improvements:
+            lines.append(f"— {imp}")
+        lines.append("")
+
+    if conclusion:
+        lines.append(f"🚀 *Висновок:* {conclusion}")
+
+    if not audit.get("vision_used") and (listing.get("photos") or []):
+        lines.append(
+            "\n⚠️ _Фото не вдалося проаналізувати (поточна AI-модель без vision або фото "
+            "не завантажились) — оцінка базується лише на тексті оголошення._"
+        )
+
+    if missing:
+        lines.append("\nℹ️ _OLX не дав отримати: " + ", ".join(missing) + "._")
+
+    return "\n".join(lines).strip()

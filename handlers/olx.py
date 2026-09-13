@@ -52,6 +52,10 @@ class OlxAudit(StatesGroup):
     waiting_url = State()
 
 
+class OlxCompetitor(StatesGroup):
+    waiting_url = State()
+
+
 def _ikb_olx_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Стежити за оголошенням", callback_data="olx_add_listing")],
@@ -63,6 +67,7 @@ def _ikb_olx_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Мій бюджет", callback_data="olx_budget_start"),
         ],
         [InlineKeyboardButton(text="🔍 Аудит мого оголошення", callback_data="olx_audit_start")],
+        [InlineKeyboardButton(text="🔎 Аналіз конкурента", callback_data="olx_competitor_start")],
     ])
 
 
@@ -102,6 +107,12 @@ def _ikb_audit_actions(tracker_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _ikb_competitor_actions(tracker_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Оновити аналіз", callback_data=f"olx_competitor_redo:{tracker_id}")],
+    ])
+
+
 @router.message(F.text == "📉 OLX Ціни")
 async def olx_menu(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
@@ -109,8 +120,8 @@ async def olx_menu(msg: Message, state: FSMContext):
     await msg.answer(
         "📉 *OLX — AI Resale Hunter*\n\n"
         "Стеж за оголошенням і отримуй повний AI-аналіз вигідності перепродажу, "
-        "перевіряй нові оголошення автоматично, або зроби аудит власного "
-        "оголошення перед публікацією.",
+        "перевіряй нові оголошення автоматично, зроби аудит власного оголошення "
+        "перед публікацією, або проаналізуй оголошення конкурента.",
         reply_markup=_ikb_olx_menu(),
     )
 
@@ -479,13 +490,6 @@ _SKU_CODE_RE = re.compile(
     r"\b(?:[A-ZА-ЯІЇЄ]{1,5}-?\d{4,}|[A-ZА-ЯІЇЄ]{2,}\d{3,})\b", re.IGNORECASE
 )
 
-# Загальні маркетингові слова, які часто друкують на упаковці/в описі і які
-# AI іноді помилково приймає за назву бренду товару (напр. "Professional",
-# "Premium" на коробці з фішками для покеру). Використання ТАКОГО слова як
-# єдиного пошукового запиту призводить до абсолютно нерелевантної видачі
-# (будь-який товар з написом "Professional" на упаковці). Тому такі слова
-# ніколи не приймаються як самостійний бренд/модель для пошуку "Схожих" —
-# у такому разі код одразу переходить до пошуку за назвою товару.
 _GENERIC_MARKETING_WORDS = {
     "professional", "premium", "original", "classic", "standard", "deluxe",
     "super", "mega", "new", "quality", "pro", "elite", "extra",
@@ -522,8 +526,6 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     if not isinstance(analysis, dict):
         analysis = {}
 
-    # reject_generic=True — бренд/модель ігноруються, якщо це загальне
-    # маркетингове слово (типу "Professional"), а не справжня назва бренду.
     brand = _first_nonempty(analysis.get("item_brand"), analysis.get("brand"), reject_generic=True)
     model = _first_nonempty(analysis.get("item_model"), analysis.get("model"), reject_generic=True)
     if brand and model:
@@ -535,8 +537,6 @@ def _build_similar_query(analysis: dict, tracker: dict) -> str:
     if not name:
         name = _first_nonempty(tracker.get("title"))
 
-    # З назви товару теж прибираємо загальні маркетингові слова, щоб вони
-    # не "з'їдали" одне з обмежених 4 слів запиту і не тягнули видачу вбік.
     words = [w for w in name.split() if not _is_generic_marketing_word(w)]
     if not words:
         words = name.split()
@@ -983,3 +983,83 @@ async def olx_audit_all_cb(cb: CallbackQuery):
         return await cb.message.answer("⚠️ Спочатку зроби аудит цього оголошення.")
     await cb.answer()
     await cb.message.answer(olx_audit.format_full_improvement(audit, _listing_payload(tracker)))
+
+
+# =========================================================
+# 🔎 АНАЛІЗ КОНКУРЕНТА
+# =========================================================
+
+@router.callback_query(F.data == "olx_competitor_start")
+async def olx_competitor_start_cb(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OlxCompetitor.waiting_url)
+    await cb.answer()
+    await cb.message.answer(
+        "🔎 *Аналіз конкурента*\n\n"
+        "Встав посилання на ЧУЖЕ оголошення того самого товару на OLX — "
+        "проаналізую фото, заголовок, опис і ціну, і скажу, що зробити краще "
+        "у власному оголошенні, щоб виглядати переконливіше.",
+        reply_markup=kb_cancel(),
+    )
+
+
+async def _run_competitor_flow(target_msg: Message, uid: int, url: str, force: bool = False):
+    """Аналогічна структура до _run_audit_flow, але для чужого оголошення
+    (конкурента) — окремий кеш і окремий формат звіту, без запису в
+    "мої підписки" як звичайного трекера ціни."""
+    if not ai_service.is_available():
+        return await target_msg.answer(AI_ERROR_TEXT)
+    remaining = await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT)
+    if remaining <= 0:
+        return await target_msg.answer(AI_LIMIT_TEXT)
+
+    wait_msg = await target_msg.answer("🔎 Читаю оголошення конкурента...")
+    details = await olx_service.fetch_listing_details(url)
+    if not details or details.get("price") is None:
+        return await wait_msg.edit_text(
+            "🤔 Не вдалося зчитати оголошення (можливо, немає видимої ціни або воно "
+            "видалене). Перевір посилання й спробуй ще раз."
+        )
+
+    tracker_id = await olx_db.upsert_own_listing(uid, url, details)
+    tracker = await olx_db.get_tracker(tracker_id)
+    current_hash = olx_db.compute_content_hash(tracker)
+
+    if not force and tracker.get("competitor_result") and tracker.get("competitor_content_hash") == current_hash:
+        audit = tracker["competitor_result"]
+    else:
+        await wait_msg.edit_text("🤖 Аналізую фото, заголовок, опис і ціну конкурента (може зайняти хвилину)...")
+        audit = await olx_audit.analyze_competitor(details)
+        if not audit:
+            return await wait_msg.edit_text(AI_ERROR_TEXT)
+        await ai_usage_db.increment_usage(uid)
+        await olx_db.save_competitor_result(tracker_id, audit, current_hash)
+
+    report = olx_audit.format_competitor_report(audit, details)
+    await wait_msg.edit_text(report, reply_markup=_ikb_competitor_actions(tracker_id))
+
+
+@router.message(OlxCompetitor.waiting_url)
+async def olx_competitor_url_msg(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+
+    url = msg.text.strip()
+    if "olx." not in url:
+        return await msg.answer("⚠️ Схоже, це не посилання на OLX. Спробуй ще раз:")
+
+    await state.clear()
+    await _run_competitor_flow(msg, msg.from_user.id, url, force=False)
+    await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
+
+
+@router.callback_query(F.data.startswith("olx_competitor_redo:"))
+async def olx_competitor_redo_cb(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    uid = cb.from_user.id
+    tracker = await olx_db.get_tracker(tid)
+    if not tracker or tracker.get("uid") != uid:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    await cb.answer("Оновлюю аналіз...")
+    await _run_competitor_flow(cb.message, uid, tracker["url"], force=True)
