@@ -13,6 +13,10 @@ from config.settings import (
     AI_DAILY_PLAN_ENABLED,
     CURRENCY_UPDATE_TIME,
     WEATHER_MORNING_TIME,
+    AI_CLEANER_ENABLED,
+    AI_CLEANER_STALE_DAYS,
+    AI_CLEANER_WEEKDAY,
+    AI_CLEANER_TIME,
 )
 from config import settings as _settings
 from database import mongo as m
@@ -25,6 +29,7 @@ from services import ai_service
 from services import currency_service
 from services import weather_service
 from services import notification_service
+from services import task_cleaner_service
 from services.planner_service import generate_daily_analysis
 from services.insights_service import detect_stalled_goal, generate_insight_text
 from services.thread_generator_service import generate_thread_ideas, format_ideas_message
@@ -34,7 +39,9 @@ from keyboards.ai import ikb_insight_actions
 from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
 from keyboards.shop_threads import ikb_thread_ideas_actions
+from keyboards.task_cleaner import ikb_cleaner_actions
 from handlers.common import compute_daily_stats
+from handlers.task_cleaner import cleaner_digest_cache
 
 ai_suggestions_cache: dict = {}
 
@@ -48,6 +55,10 @@ INSIGHT_CHECK_TIME = "12:00"
 # значення за замовчуванням, щоб не вимагати обов'язкової правки
 # config/settings.py для роботи фічі.
 THREADS_MORNING_TIME = getattr(_settings, "THREADS_MORNING_TIME", "08:30")
+
+# НОВЕ: день тижня для "🧹 AI-прибиральник" (0=понеділок ... 6=неділя,
+# сумісно з datetime.weekday()).
+_WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -390,6 +401,49 @@ async def thread_ideas_morning_task(bot: Bot):
             logger.exception("thread_ideas_morning_task outer loop failed")
 
 
+# =========================================================
+# НОВЕ: 🧹 AI-прибиральник
+# =========================================================
+
+async def ai_cleaner_task(bot: Bot):
+    """🧹 Раз на тиждень (день/час — AI_CLEANER_WEEKDAY/AI_CLEANER_TIME)
+    шукає PENDING-задачі, які довго не виконуються (алгоритмічно, за віком —
+    див. services/task_cleaner_service.py, НЕ залежить від AI-провайдера),
+    і надсилає кожному користувачу окремий дайджест із пропозицією видалити
+    їх (одразу всі / вибірково / залишити) — той самий патерн кнопок, що й
+    у групового дайджесту "📅 Автоперенесення задач"."""
+    target_weekday = _WEEKDAY_MAP.get((AI_CLEANER_WEEKDAY or "mon").strip().lower(), 0)
+    while True:
+        if not AI_CLEANER_ENABLED:
+            logger.info("ai_cleaner_task: вимкнено налаштуванням AI_CLEANER_ENABLED, перевірю знову через добу")
+            await asyncio.sleep(86400)
+            continue
+        try:
+            hh, mm = map(int, AI_CLEANER_TIME.split(":"))
+        except ValueError:
+            hh, mm = 10, 0
+        now = datetime.now()
+        days_ahead = (target_weekday - now.weekday()) % 7
+        target = (now + timedelta(days=days_ahead)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=7)
+        logger.info("ai_cleaner_task: сплю до %s (локальний час сервера)", target.isoformat())
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            by_uid = await task_cleaner_service.find_stale_tasks_by_user(AI_CLEANER_STALE_DAYS)
+            logger.info("ai_cleaner_task: знайдено застарілі задачі для %d користувачів", len(by_uid))
+            for uid, tasks in by_uid.items():
+                try:
+                    intro = await task_cleaner_service.build_cleaner_intro(len(tasks))
+                    text = task_cleaner_service.format_cleaner_digest(tasks, intro)
+                    cleaner_digest_cache[uid] = [t["id"] for t in tasks]
+                    await notification_service.safe_send(bot, uid, text, reply_markup=ikb_cleaner_actions())
+                except Exception:
+                    logger.exception("ai_cleaner_task failed for uid %s", uid)
+        except Exception:
+            logger.exception("ai_cleaner_task outer loop failed")
+
+
 def register_scheduler_jobs(bot: Bot):
     _spawn(reminder_task(bot), "reminder_task")
     _spawn(midnight_rollover_task(bot), "midnight_rollover_task")
@@ -399,4 +453,5 @@ def register_scheduler_jobs(bot: Bot):
     _spawn(currency_update_task(), "currency_update_task")
     _spawn(weather_morning_task(bot), "weather_morning_task")
     _spawn(thread_ideas_morning_task(bot), "thread_ideas_morning_task")
+    _spawn(ai_cleaner_task(bot), "ai_cleaner_task")
     logger.info("Зареєстровано %d фонових задач планувальника, посилання збережено (захист від GC)", len(_background_tasks))

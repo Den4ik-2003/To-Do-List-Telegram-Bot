@@ -92,3 +92,16 @@ MAX_TASKS_PER_DAY = int(os.environ.get("MAX_TASKS_PER_DAY", "5"))
 # ДОДАТКОВО до MAX_TASKS_PER_DAY, тільки для задач, у яких estimated_minutes
 # заданий (напр. створені через AI Планер). 480 хв = 8 год.
 MAX_MINUTES_PER_DAY = int(os.environ.get("MAX_MINUTES_PER_DAY", "480"))
+
+# --- НОВЕ: 🧹 AI-прибиральник (задачі, що довго не виконуються) ---
+# Сам критерій "застаріла задача" — алгоритмічний (вік задачі), НЕ рішення
+# AI-моделі, тому фіча працює навіть без AI_API_KEY (див.
+# services/task_cleaner_service.py). AI, якщо доступний, лише додає
+# опціональний коментар одним реченням.
+AI_CLEANER_ENABLED = os.environ.get("AI_CLEANER_ENABLED", "true").strip().lower() == "true"
+# Скільки днів без активності (прострочення терміну, або від created_at,
+# якщо терміну немає) вважати "застарілою" задачею.
+AI_CLEANER_STALE_DAYS = int(os.environ.get("AI_CLEANER_STALE_DAYS", "30"))
+# День тижня й час розсилки дайджесту. mon/tue/wed/thu/fri/sat/sun.
+AI_CLEANER_WEEKDAY = os.environ.get("AI_CLEANER_WEEKDAY", "mon")
+AI_CLEANER_TIME = os.environ.get("AI_CLEANER_TIME", "10:00")
