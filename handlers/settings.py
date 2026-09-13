@@ -1,6 +1,35 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/settings.py
+
+Додано (фіча "👥 Авторизовані користувачі" — блокування ПО ІМЕНІ, не по ID):
+- settings_users_list: дістає всі uid з users_db.get_all_uids(), для
+  кожного через bot.get_chat(uid) дістає реальне ім'я з Telegram (works,
+  бо бот вже мав контакт із кожним авторизованим користувачем — інакше
+  вони б не потрапили в auth_col). Якщо get_chat впав (юзер видалив акаунт
+  тощо) — показує запасний варіант "Без імені (ID ...)", щоб такого
+  користувача теж можна було прибрати.
+- settings_block_ask:{uid}: екран підтвердження "Заблокувати {ім'я}? Так/Ні".
+- settings_block_confirm:{uid}: викликає users_db.deauthorize(uid),
+  повертає до оновленого списку.
+- settings_back: повернення з підменю користувачів до головного меню
+  налаштувань (на відміну від settings_close — не закриває, а показує
+  меню налаштувань знову).
+
+⚠️ ВАЖЛИВО: у поточному коді немає окремої ролі "адмін" — будь-який
+авторизований користувач тепер бачить і може заблокувати БУДЬ-КОГО,
+включно з іншими користувачами (себе заблокувати не можна — окрема
+перевірка нижче). Якщо бот призначений не лише для вас особисто, варто
+обмежити пункт "👥 Авторизовані користувачі" конкретним ADMIN_UID
+(наприклад, перевіркою `if uid != ADMIN_UID: return await cb.answer(...)`
+на початку settings_users_list) — скажіть, і я додам.
+
+Решта хендлерів файлу — 1:1 як було.
+"""
+
 import logging
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
@@ -8,7 +37,13 @@ from aiogram.types import Message, CallbackQuery
 from database.mongo import DBUnavailable
 from database import users as users_db
 from keyboards.main_menu import kb_main, kb_cancel
-from keyboards.settings import ikb_settings_menu, kb_currency_select, currency_from_text
+from keyboards.settings import (
+    ikb_settings_menu,
+    kb_currency_select,
+    currency_from_text,
+    ikb_users_list,
+    ikb_block_confirm,
+)
 from handlers.common import require_auth
 from config.constants import DB_ERROR_TEXT
 
@@ -212,3 +247,87 @@ async def close_settings(cb: CallbackQuery):
     await cb.message.delete()
     await cb.message.answer("🏠 *Головне меню*", reply_markup=kb_main())
     await cb.answer()
+
+
+# =========================================================
+# НОВЕ: 👥 Авторизовані користувачі (список і блокування по імені)
+# =========================================================
+
+async def _display_name(cb: CallbackQuery, uid: int) -> str:
+    """Дістає ім'я користувача напряму з Telegram (get_chat), бо в auth_col
+    зберігається лише uid. Працює, бо бот вже мав контакт із кожним
+    авторизованим користувачем."""
+    try:
+        chat = await cb.bot.get_chat(uid)
+        name = (getattr(chat, "full_name", "") or "").strip()
+        if not name and chat.username:
+            name = f"@{chat.username}"
+        return name or f"Без імені (ID {uid})"
+    except Exception:
+        logger.warning("Не вдалось дістати ім'я для uid %s через get_chat", uid, exc_info=True)
+        return f"Без імені (ID {uid})"
+
+
+async def _render_users_list(cb: CallbackQuery):
+    uids = await users_db.get_all_uids()
+    users = []
+    for u in uids:
+        name = await _display_name(cb, u)
+        users.append({"uid": u, "name": name})
+    users.sort(key=lambda x: x["name"].lower())
+    text = "👥 *Авторизовані користувачі*\n\nНатисни на ім'я, щоб заблокувати:" if users \
+        else "👥 *Авторизовані користувачі*\n\nСписок порожній."
+    return text, ikb_users_list(users)
+
+
+@router.callback_query(F.data == "settings_users_list")
+async def settings_users_list(cb: CallbackQuery):
+    try:
+        text, kb = await _render_users_list(cb)
+    except DBUnavailable:
+        return await cb.answer(DB_ERROR_TEXT, show_alert=True)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # текст не змінився (наприклад, повторний клік "Ні" на тому ж списку)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "settings_back")
+async def settings_back(cb: CallbackQuery):
+    text, kb = await _render_settings(cb.from_user.id)
+    if text is None:
+        return await cb.answer(DB_ERROR_TEXT, show_alert=True)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("settings_block_ask:"))
+async def settings_block_ask(cb: CallbackQuery):
+    target_uid = int(cb.data.split(":", 1)[1])
+    if target_uid == cb.from_user.id:
+        return await cb.answer("⚠️ Не можна заблокувати самого себе.", show_alert=True)
+    name = await _display_name(cb, target_uid)
+    await cb.message.edit_text(
+        f"🚫 Заблокувати *{name}*?\n\nВін втратить доступ до бота.",
+        reply_markup=ikb_block_confirm(target_uid),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("settings_block_confirm:"))
+async def settings_block_confirm(cb: CallbackQuery):
+    target_uid = int(cb.data.split(":", 1)[1])
+    if target_uid == cb.from_user.id:
+        return await cb.answer("⚠️ Не можна заблокувати самого себе.", show_alert=True)
+    name = await _display_name(cb, target_uid)
+    try:
+        await users_db.deauthorize(target_uid)
+    except DBUnavailable:
+        return await cb.answer(DB_ERROR_TEXT, show_alert=True)
+    try:
+        text, kb = await _render_users_list(cb)
+    except DBUnavailable:
+        return await cb.answer(DB_ERROR_TEXT, show_alert=True)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer(f"🚫 {name} заблоковано")

@@ -1,3 +1,14 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: database/users.py
+
+Додано (для фічі "👥 Авторизовані користувачі" в налаштуваннях):
+- deauthorize(uid): прибирає користувача з auth_col і з in-memory кешу
+  authorized_uids, тобто фактично блокує його (require_auth перестане
+  пропускати цього uid).
+
+Решта функцій — 1:1 як було.
+"""
+
 import logging
 
 from database import mongo as m
@@ -21,6 +32,14 @@ async def is_authorized(uid: int) -> bool:
 async def authorize(uid: int):
     authorized_uids.add(uid)
     await db_call(m.auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True))
+
+
+async def deauthorize(uid: int):
+    """НОВЕ: прибирає uid з авторизованих — і з БД, і з in-memory кешу.
+    Після цього require_auth() більше не пропускатиме цього користувача."""
+    authorized_uids.discard(uid)
+    await db_call(m.auth_col.delete_one({"uid": uid}))
+    logger.info("Користувача %s деавторизовано (заблоковано)", uid)
 
 
 async def load_authorized_uids():

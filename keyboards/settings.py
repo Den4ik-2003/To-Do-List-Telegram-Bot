@@ -1,3 +1,17 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: keyboards/settings.py
+
+Додано (для фічі "👥 Авторизовані користувачі"):
+- ikb_settings_menu: нова кнопка "👥 Авторизовані користувачі"
+  (callback_data="settings_users_list").
+- ikb_users_list(users): список кнопок — одна на кожного авторизованого
+  користувача, підписана його ІМ'ЯМ (не ID). users — список dict
+  {"uid": int, "name": str}, формується в хендлері через bot.get_chat().
+- ikb_block_confirm(uid, name): підтвердження "Так / Ні" перед блокуванням.
+
+Решта — 1:1 як було.
+"""
+
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -29,6 +43,7 @@ def ikb_settings_menu(
         [InlineKeyboardButton(text=notif_label, callback_data="settings_toggle_notifications")],
         [InlineKeyboardButton(text=worktime_label, callback_data="settings_toggle_worktime")],
         [InlineKeyboardButton(text="⏰ Час нагадування про облік часу", callback_data="settings_worktime_time")],
+        [InlineKeyboardButton(text="👥 Авторизовані користувачі", callback_data="settings_users_list")],
         [InlineKeyboardButton(text="◀️ Головне меню", callback_data="settings_close")],
     ])
 
@@ -49,5 +64,30 @@ def ikb_archive_clear() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="✅ Так", callback_data="archclr:yes"),
             InlineKeyboardButton(text="❌ Ні", callback_data="archclr:no"),
+        ],
+    ])
+
+
+# =========================================================
+# НОВЕ: 👥 Авторизовані користувачі (список + блокування по імені)
+# =========================================================
+
+def ikb_users_list(users: list) -> InlineKeyboardMarkup:
+    """users: список {"uid": int, "name": str}. Текст кнопки — ІМ'Я,
+    callback_data несе uid (технічна необхідність Telegram API), але
+    юзер бачить і обирає саме за іменем."""
+    rows = [
+        [InlineKeyboardButton(text=f"🚫 {u['name']}", callback_data=f"settings_block_ask:{u['uid']}")]
+        for u in users
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_block_confirm(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Так, заблокувати", callback_data=f"settings_block_confirm:{uid}"),
+            InlineKeyboardButton(text="❌ Ні", callback_data="settings_users_list"),
         ],
     ])
