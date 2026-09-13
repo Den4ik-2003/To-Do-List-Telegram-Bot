@@ -1,10 +1,17 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: keyboards/tasks.py
 
-Додано (для фічі "🎙 Голосова задача"):
-- kb_tasks_menu: нова кнопка "🎙 Голосова задача" поруч з "➕ Додати задачу".
+Додано (для фічі "🔥 One Thing"):
+- ikb_one_thing_actions(): інлайн-кнопки під повідомленням з One Thing —
+  "✅ Зроблено" (callback: onething_done) і "🔄 Обрати іншу"
+  (callback: onething_reroll). Обробники цих callback_data ще треба
+  зареєструвати в хендлері, що показує ранковий план (handlers/ai_planner.py) —
+  його я поки не бачив, тож роутер не чіпав.
 
-Решта — 1:1 як було (включно з autoresched/rollover-доповненнями).
+Також лишилось попереднє доповнення (фіча "🎙 Голосова задача"):
+- kb_tasks_menu: кнопка "🎙 Голосова задача" поруч з "➕ Додати задачу".
+
+Решта — 1:1 як було.
 """
 
 from datetime import date
@@ -192,3 +199,22 @@ def ikb_categories() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=f"{cat['emoji']} {cat['name']}", callback_data=f"catopen:{key}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="tasks_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# =========================================================
+# НОВЕ: 🔥 One Thing дня
+# =========================================================
+
+def ikb_one_thing_actions(done: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки під повідомленням із сьогоднішнім One Thing.
+    callback_data не прив'язана до конкретного tid (One Thing зберігається
+    в user_state, а не як окрема задача в tasks_col), тому обробник у
+    handlers/ повинен брати uid із callback.from_user.id."""
+    if done:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обрати іншу", callback_data="onething_reroll")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Зроблено", callback_data="onething_done")],
+        [InlineKeyboardButton(text="🔄 Обрати іншу", callback_data="onething_reroll")],
+    ])

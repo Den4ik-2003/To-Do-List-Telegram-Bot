@@ -1,8 +1,37 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/planner_service.py
+
+ДОДАНО: фіча "🔥 One Thing" — AI під час генерації ранкового плану також
+обирає ОДНУ найголовнішу дію дня (окремо від звичайного списку задач) і
+пояснює чому саме вона. Результат зберігається на весь день через
+уже існуючий узагальнений user_state (users_db.save_user_state) — без
+нових колекцій БД і без міграцій.
+
+Нове:
+- generate_daily_plan(): у промпт додано блок "one_thing" (JSON), у return
+  додано ключ "one_thing": {"text": ..., "reason": ...} | None. Після
+  вдалої генерації one_thing автоматично зберігається на сьогодні.
+- get_todays_one_thing(uid): дістати збережений на сьогодні One Thing
+  (або None, якщо на сьогодні ще не генерували / вже інший день).
+- save_one_thing(uid, one_thing): зберегти/перезаписати One Thing на
+  сьогодні (використовується і generate_daily_plan, і для "🔄 Обрати іншу").
+- mark_one_thing_done(uid): позначити сьогоднішній One Thing виконаним.
+- format_one_thing_block(one_thing): готовий текстовий блок для вставки
+  у повідомлення ранкового плану (Markdown, як і решта бота).
+
+Якщо AI з якоїсь причини не повернув валідний "one_thing" (порожньо,
+неправильний формат) — є fallback: беремо найпріоритетнішу за LABEL_ORDER
+задачу зі згенерованого tasks_out і робимо її One Thing автоматично, щоб
+фіча не "мовчала", навіть якщо AI недопрацював.
+
+Решта функцій файлу — 1:1 як було, окрім generate_daily_plan (доповнено).
+"""
+
 import logging
 import re
 from datetime import datetime
 
-from config.constants import LABELS, CATEGORIES, DEFAULT_CURRENCY
+from config.constants import LABELS, CATEGORIES, DEFAULT_CURRENCY, LABEL_ORDER
 from config.settings import WORK_HOURS_TEXT, AI_DAILY_LIMIT
 from database import tasks as tasks_db
 from database import goals as goals_db
@@ -137,6 +166,66 @@ async def _build_context(uid: int) -> dict:
     }
 
 
+# =========================================================
+# НОВЕ: 🔥 One Thing дня
+# =========================================================
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+async def get_todays_one_thing(uid: int) -> dict | None:
+    """Повертає збережений на сьогодні One Thing, або None, якщо його ще
+    не генерували сьогодні (чи настав новий день)."""
+    state = await users_db.get_user_state(uid)
+    if state.get("one_thing_date") != _today_str():
+        return None
+    ot = state.get("one_thing")
+    return ot if isinstance(ot, dict) and ot.get("text") else None
+
+
+async def save_one_thing(uid: int, one_thing: dict) -> None:
+    """Зберігає/перезаписує One Thing на сьогодні. Скидає прапорець
+    виконання (нова обрана задача ще не зроблена)."""
+    await users_db.save_user_state(uid, {
+        "one_thing_date": _today_str(),
+        "one_thing": one_thing,
+        "one_thing_done": False,
+    })
+
+
+async def mark_one_thing_done(uid: int) -> bool:
+    """Позначає сьогоднішній One Thing виконаним. Повертає False, якщо на
+    сьогодні One Thing не було збережено (наприклад, уже минула північ)."""
+    state = await users_db.get_user_state(uid)
+    if state.get("one_thing_date") != _today_str():
+        return False
+    await users_db.save_user_state(uid, {"one_thing_done": True})
+    return True
+
+
+def _fallback_one_thing_from_tasks(tasks_out: list) -> dict | None:
+    """Якщо AI не повернув валідний one_thing — беремо найпріоритетнішу
+    (за LABEL_ORDER, той самий порядок що й у database/tasks.py) задачу
+    зі щойно згенерованого списку, щоб фіча не залишалась порожньою."""
+    if not tasks_out:
+        return None
+    best = min(tasks_out, key=lambda t: LABEL_ORDER.get(t.get("label", "idea"), 9))
+    return {"text": best["text"], "reason": "Найпріоритетніша задача з сьогоднішнього плану."}
+
+
+def format_one_thing_block(one_thing: dict | None, done: bool = False) -> str:
+    """Готовий Markdown-блок для вставки у повідомлення ранкового плану
+    (чи будь-яке інше). Повертає порожній рядок, якщо one_thing відсутній."""
+    if not one_thing or not one_thing.get("text"):
+        return ""
+    status = "✅ " if done else ""
+    lines = [f"🔥 *One Thing дня:*\n{status}{one_thing['text']}"]
+    if one_thing.get("reason"):
+        lines.append(f"_{one_thing['reason']}_")
+    return "\n".join(lines)
+
+
 async def generate_daily_plan(uid: int, available: dict | None = None) -> dict | None:
     if not ai_service.is_available():
         return None
@@ -197,11 +286,18 @@ XP: {ctx['state'].get('xp', 0)}
 - Балансуй між напрямками (проєкти, робота, фінанси, особисте) — не роби весь план лише про одне.
 - Якщо є фінансова ціль або бюджет проєкту — врахуй це при виборі фокуса дня.
 {time_rule}
+Додатково обери ОДНУ (і тільки одну) найголовнішу дію дня — "One Thing":
+конкретну дію, яка дасть найбільший реальний прогрес сьогодні (з
+урахуванням прострочень, дедлайнів, активних проєктів/цілей). Це може
+збігатися з однією з задач списку "tasks" нижче або бути окремою
+ключовою дією. Поясни одним коротким реченням чому саме вона.
+
 Поверни ВИКЛЮЧНО валідний JSON без жодного тексту навколо, без коментарів, без markdown-розмітки (без ```), у форматі:
 {{
   "focus": "короткий головний фокус дня",
   "reason": "одне речення чому саме такий фокус",
   "advice": "одна коротка порада щодо активних проєктів, цілей або фінансів",
+  "one_thing": {{"text": "одна конкретна найголовніша дія дня", "reason": "одне речення чому саме вона"}},
   "tasks": [
     {{"text": "конкретна дія", "label": "urgent|medium|low|idea|personal", "category": "work|finance|home|sport|study|other", "time": "гг:хх", "estimated_minutes": 30}}
   ]
@@ -253,10 +349,24 @@ XP: {ctx['state'].get('xp', 0)}
 
     await ai_usage_db.increment_usage(uid)
 
+    one_thing_raw = data.get("one_thing")
+    one_thing = None
+    if isinstance(one_thing_raw, dict):
+        ot_text = str(one_thing_raw.get("text") or "").strip()[:150]
+        ot_reason = str(one_thing_raw.get("reason") or "").strip()[:200]
+        if ot_text:
+            one_thing = {"text": ot_text, "reason": ot_reason}
+    if not one_thing:
+        one_thing = _fallback_one_thing_from_tasks(tasks_out)
+
+    if one_thing:
+        await save_one_thing(uid, one_thing)
+
     return {
         "focus": str(data.get("focus", "")).strip()[:120],
         "reason": str(data.get("reason", "")).strip()[:250],
         "advice": str(data.get("advice", "")).strip()[:250],
+        "one_thing": one_thing,
         "tasks": tasks_out[:6],
     }
 
