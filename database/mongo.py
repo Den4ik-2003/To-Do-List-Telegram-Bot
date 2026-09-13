@@ -51,6 +51,9 @@ shop_drafts_col = None
 shop_published_posts_col = None
 shop_articles_col = None
 
+github_projects_col = None
+github_credentials_col = None
+
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
@@ -67,6 +70,7 @@ async def init_mongo(mongo_uri: str):
     global worktime_col
     global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
     global shop_drafts_col, shop_published_posts_col, shop_articles_col
+    global github_projects_col, github_credentials_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -126,8 +130,12 @@ async def init_mongo(mongo_uri: str):
     shop_published_posts_col = db["shop_published_posts"]
     shop_articles_col = db["shop_articles"]
 
+    github_projects_col = db["github_projects"]
+    github_credentials_col = db["github_credentials"]
+
     await ping()
     await _ensure_shop_indexes()
+    await _ensure_github_indexes()
     return db
 
 
@@ -143,6 +151,14 @@ async def _ensure_shop_indexes():
         await shop_examples_col.create_index([("shop_id", 1)], name="shop_id_idx")
     except Exception:
         logger.exception("Failed to ensure shop indexes")
+
+
+async def _ensure_github_indexes():
+    try:
+        await github_credentials_col.create_index([("userId", 1)], unique=True, name="uniq_user_credential")
+        await github_projects_col.create_index([("userId", 1), ("updatedAt", -1)], name="user_updated_idx")
+    except Exception:
+        logger.exception("Failed to ensure github indexes")
 
 
 async def close_mongo() -> None:

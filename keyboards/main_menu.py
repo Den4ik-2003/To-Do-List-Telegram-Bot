@@ -12,6 +12,7 @@ CATEGORY_LIFE = "🌍 Побут"
 CATEGORY_BUSINESS = "💼 Бізнес"
 CATEGORY_JOBS = "💼 Вакансії"
 CATEGORY_SHOPS = "🏪 Магазини"
+CATEGORY_GITHUB = "🚀 Deploy to GitHub"
 
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
@@ -47,6 +48,10 @@ MAIN_CATEGORIES = {
     CATEGORY_SHOPS: [
         "🏪 Мої магазини", "📢 Створити пост",
         "⚡ Швидкий пост",
+    ],
+    CATEGORY_GITHUB: [
+        "📦 Новий проєкт", "📚 Мої проєкти",
+        "⚙️ Налаштування GitHub",
     ],
 }
 
