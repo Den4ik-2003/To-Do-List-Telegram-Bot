@@ -1,17 +1,19 @@
 import logging
+from datetime import datetime
 
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import BufferedInputFile, Message, CallbackQuery
 
 from database import github_projects as github_projects_db
-from services import github_api, github_crypto, github_zip
+from services import github_api, github_crypto, github_download, github_zip
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.github import (
     ikb_github_settings, ikb_disconnect_confirm, ikb_repo_choice, ikb_deploy_confirm,
     ikb_projects_list, ikb_project_actions, ikb_project_delete_confirm, ikb_edit_fields,
+    ikb_download_branches, ikb_download_version_choice, ikb_download_commits,
 )
 from handlers.common import require_auth
 
@@ -24,6 +26,11 @@ _pending_saved_target: dict[int, str] = {}
 _pending_repos: dict[int, list] = {}
 _pending_add: dict[int, dict] = {}
 _pending_edit: dict[int, dict] = {}
+
+# --- state for the Download ZIP flow (mirrors the _pending_* pattern above) ---
+_pending_download: dict[int, dict] = {}
+_pending_dl_branches: dict[int, list] = {}
+_pending_dl_commits: dict[int, list] = {}
 
 
 class GithubDeploy(StatesGroup):
@@ -582,24 +589,6 @@ async def gh_proj_add_name(msg: Message, state: FSMContext):
     await msg.answer(f"✅ Проєкт «{name}» додано.", reply_markup=kb_main())
 
 
-@router.callback_query(F.data.startswith("ghproj_history:"))
-async def gh_proj_history(cb: CallbackQuery):
-    uid = cb.from_user.id
-    pid = cb.data.split(":", 1)[1]
-    project = await github_projects_db.get_project(uid, pid)
-    if not project:
-        return await cb.answer("Проєкт не знайдено", show_alert=True)
-    await cb.answer()
-    history = project.get("deployHistory") or []
-    if not history:
-        return await cb.message.answer("📭 Ще не було деплоїв цього проєкту.")
-    lines = [f"📜 *Історія — {project['projectName']}*"]
-    for h in history[:10]:
-        at = (h.get("at") or "")[:16].replace("T", " ")
-        lines.append(f"\n🟢 {at}\n{h.get('fileCount', '?')} файлів\nCommit: {h.get('commit', '')}")
-    await cb.message.answer("\n".join(lines))
-
-
 @router.callback_query(F.data.startswith("ghproj_del:"))
 async def gh_proj_del_ask(cb: CallbackQuery):
     pid = cb.data.split(":", 1)[1]
@@ -689,3 +678,251 @@ async def gh_edit_value(msg: Message, state: FSMContext):
     ok = await github_projects_db.update_project(uid, pending["project_id"], updates)
     await state.clear()
     await msg.answer("✅ Оновлено." if ok else "⚠️ Не вдалося оновити.", reply_markup=kb_main())
+
+
+@router.callback_query(F.data.startswith("ghproj_history:"))
+async def gh_proj_history(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project:
+        return await cb.answer("Проєкт не знайдено", show_alert=True)
+    await cb.answer()
+
+    deploy_entries = [
+        {
+            "at": h.get("at"), "kind": "deploy",
+            "commit": h.get("commit"), "fileCount": h.get("fileCount"),
+        }
+        for h in (project.get("deployHistory") or [])
+    ]
+    download_entries = [
+        {
+            "at": h.get("at"), "kind": "download",
+            "branch": h.get("branch"), "commitSha": h.get("commitSha"),
+            "fileCount": h.get("fileCount"), "archiveSize": h.get("archiveSize"),
+        }
+        for h in (project.get("downloadHistory") or [])
+    ]
+    combined = sorted(deploy_entries + download_entries, key=lambda e: e.get("at") or "", reverse=True)
+
+    if not combined:
+        return await cb.message.answer("📭 Ще не було деплоїв чи завантажень цього проєкту.")
+
+    lines = [f"📜 Історія — {project['projectName']}"]
+    for h in combined[:10]:
+        at = (h.get("at") or "")[:16].replace("T", " ")
+        if h["kind"] == "deploy":
+            lines.append(f"\n🚀 Deploy — {at}\n{h.get('fileCount', '?')} файлів\nCommit: {h.get('commit', '')}")
+        else:
+            size = github_download.fmt_size(h.get("archiveSize") or 0)
+            short_sha = (h.get("commitSha") or "")[:7]
+            lines.append(
+                f"\n📥 Download — {at}\nBranch: {h.get('branch', '?')}\n"
+                f"Commit: {short_sha}\n{h.get('fileCount', '?')} файлів, {size}"
+            )
+    await cb.message.answer("\n".join(lines))
+
+
+# ============================================================================
+# Download ZIP — вибір проєкту вже зроблено (ikb_project_actions), звідси
+# користувач обирає branch → версію (остання / конкретний commit) → отримує ZIP.
+# ============================================================================
+
+@router.callback_query(F.data.startswith("ghproj_download:"))
+async def gh_download_start(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project:
+        return await cb.answer("Проєкт не знайдено", show_alert=True)
+    await cb.answer()
+
+    cred = await github_projects_db.get_credential(uid)
+    if not cred:
+        return await cb.message.answer("🔐 Спочатку підключи GitHub у «⚙️ Налаштування GitHub».")
+    token = github_crypto.decrypt_token(cred["encryptedToken"])
+    if not token:
+        return await cb.message.answer(_fail_text(
+            "Не вдалося розшифрувати токен.", "Підключи GitHub заново в налаштуваннях.",
+        ))
+
+    wait = await cb.message.answer("⏳ Підключаюсь до GitHub...")
+
+    repo_info = await github_api.get_repo(token, project["githubOwner"], project["githubRepo"])
+    if not repo_info:
+        return await _safe_edit(wait, _fail_text(
+            "Repository не знайдено або немає доступу.",
+            "Можливо, він був видалений або перейменований. Перевір посилання в «✏️ Редагувати».",
+        ))
+
+    await _safe_edit(wait, "✅ Repository знайдено\n\n⏳ Отримую branches...")
+
+    branches = await github_api.list_branches(token, repo_info["owner"], repo_info["name"])
+    if not branches:
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося отримати список branch.", "Спробуй ще раз через кілька хвилин.",
+        ))
+
+    _pending_download[uid] = {
+        "project_id": str(project["_id"]),
+        "project_name": project["projectName"],
+        "owner": repo_info["owner"],
+        "repo": repo_info["name"],
+        "default_branch": repo_info["default_branch"],
+        "token": token,
+    }
+    _pending_dl_branches[uid] = branches
+
+    await _safe_edit(wait, "🌿 Обери branch:", reply_markup=ikb_download_branches(branches, repo_info["default_branch"]))
+
+
+@router.callback_query(F.data.startswith("ghdl_branch:"))
+async def gh_download_branch_pick(cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    branches = _pending_dl_branches.get(uid) or []
+    session = _pending_download.get(uid)
+    if idx >= len(branches) or not session:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+
+    session["branch"] = branches[idx]["name"]
+    await cb.answer()
+    await cb.message.answer(
+        f"🌿 Branch: {session['branch']}\n\nЯку версію завантажити?",
+        reply_markup=ikb_download_version_choice(),
+    )
+
+
+@router.callback_query(F.data == "ghdl_latest")
+async def gh_download_latest(cb: CallbackQuery):
+    await _gh_download_execute(cb, commit_sha=None)
+
+
+@router.callback_query(F.data == "ghdl_pick_commit")
+async def gh_download_pick_commit(cb: CallbackQuery):
+    uid = cb.from_user.id
+    session = _pending_download.get(uid)
+    if not session or "branch" not in session:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+    await cb.answer()
+
+    wait = await cb.message.answer("⏳ Отримую останні commit...")
+    commits = await github_api.list_commits(
+        session["token"], session["owner"], session["repo"], session["branch"], limit=10,
+    )
+    if not commits:
+        return await _safe_edit(wait, _fail_text("Не вдалося отримати список commit.", "Спробуй ще раз."))
+
+    _pending_dl_commits[uid] = commits
+    await _safe_edit(wait, "🕐 Обери commit:", reply_markup=ikb_download_commits(commits))
+
+
+@router.callback_query(F.data.startswith("ghdl_commit:"))
+async def gh_download_commit_pick(cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    commits = _pending_dl_commits.get(uid) or []
+    if idx >= len(commits):
+        return await cb.answer("Сесія застаріла", show_alert=True)
+    await cb.answer()
+    await _gh_download_execute(cb, commit_sha=commits[idx]["sha"])
+
+
+@router.callback_query(F.data == "ghdl_cancel")
+async def gh_download_cancel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    session = _pending_download.pop(uid, None)
+    _pending_dl_branches.pop(uid, None)
+    _pending_dl_commits.pop(uid, None)
+    await cb.answer("Скасовано")
+
+    if session:
+        project = await github_projects_db.get_project(uid, session["project_id"])
+        if project:
+            return await cb.message.answer(
+                f"📁 {project['projectName']}", reply_markup=ikb_project_actions(project["_id"]),
+            )
+    await cb.message.answer("Скасовано.", reply_markup=kb_main())
+
+
+async def _gh_download_execute(cb: CallbackQuery, commit_sha: str | None):
+    """Shared tail for both 'latest version' and 'chosen commit' paths:
+    resolve tree → size-check → fetch blobs → zip → send → log history."""
+    uid = cb.from_user.id
+    session = _pending_download.pop(uid, None)
+    _pending_dl_branches.pop(uid, None)
+    _pending_dl_commits.pop(uid, None)
+    if not session or "branch" not in session:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+
+    owner, repo, branch, token = session["owner"], session["repo"], session["branch"], session["token"]
+    project_id = session["project_id"]
+
+    wait = await cb.message.answer("⏳ Завантажую файли...")
+
+    if commit_sha is None:
+        branches = await github_api.list_branches(token, owner, repo)
+        branch_sha = next((b["sha"] for b in branches if b["name"] == branch), None)
+        if not branch_sha:
+            return await _safe_edit(wait, _fail_text(
+                "Не вдалося визначити останній commit branch.", "Спробуй ще раз.",
+            ))
+        commit_sha = branch_sha
+
+    try:
+        tree_info = await github_download.prepare_download(token, owner, repo, commit_sha)
+    except github_download.DownloadError as e:
+        return await _safe_edit(wait, _fail_text(e.reason, e.hint))
+    except Exception:
+        logger.exception("GitHub tree fetch crashed for uid=%s repo=%s/%s", uid, owner, repo)
+        return await _safe_edit(wait, _fail_text(
+            "GitHub тимчасово недоступний.", "Спробуй ще раз через кілька хвилин.",
+        ))
+
+    items = tree_info["items"]
+    total = len(items)
+
+    async def progress(done, total_files):
+        pct = int(done / total_files * 100)
+        bar_len = 10
+        filled = int(bar_len * done / total_files)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        try:
+            await wait.edit_text(f"⏳ Завантажую файли...\n{bar} {pct}%\nФайлів: {done}/{total_files}")
+        except Exception:
+            pass
+
+    try:
+        zip_bytes = await github_download.build_zip(
+            token, owner, repo, items, root_folder=repo, progress_cb=progress,
+        )
+    except github_download.DownloadError as e:
+        return await _safe_edit(wait, _fail_text(e.reason, e.hint))
+    except Exception:
+        logger.exception("GitHub zip build crashed for uid=%s repo=%s/%s", uid, owner, repo)
+        return await _safe_edit(wait, _fail_text("Не вдалося створити ZIP.", "Спробуй ще раз."))
+
+    await _safe_edit(wait, "⏳ Відправляю файл...")
+
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"{repo}-{date_str}.zip"
+    doc_file = BufferedInputFile(zip_bytes, filename=filename)
+    short_sha = commit_sha[:7]
+
+    try:
+        await cb.message.answer_document(
+            doc_file,
+            caption=f"✅ Готово!\n\n{owner}/{repo}\nBranch: {branch}\nCommit: {short_sha}",
+        )
+    except TelegramBadRequest:
+        logger.warning("Failed to send zip document for uid=%s repo=%s/%s", uid, owner, repo)
+        return await cb.message.answer(_fail_text(
+            "Не вдалося надіслати ZIP у Telegram.",
+            "Файл, ймовірно, завеликий для відправки. Спробуй зменшити repository.",
+        ))
+
+    if project_id:
+        await github_projects_db.record_download(
+            uid, project_id, branch, commit_sha, short_sha, total, len(zip_bytes),
+        )

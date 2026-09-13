@@ -48,6 +48,7 @@ def ikb_project_actions(project_id) -> InlineKeyboardMarkup:
     pid = str(project_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Deploy оновлення", callback_data=f"ghproj_deploy:{pid}")],
+        [InlineKeyboardButton(text="📥 Download ZIP", callback_data=f"ghproj_download:{pid}")],
         [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"ghproj_edit:{pid}")],
         [InlineKeyboardButton(text="📜 Історія", callback_data=f"ghproj_history:{pid}")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"ghproj_del:{pid}")],
@@ -70,3 +71,29 @@ def ikb_edit_fields(project_id) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔗 GitHub URL", callback_data=f"ghedit_url:{pid}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data=f"ghproj:{pid}")],
     ])
+
+
+def ikb_download_branches(branches: list[dict], default_branch: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i, b in enumerate(branches[:25]):
+        label = f"🌿 {b['name']}" + (" (default)" if b["name"] == default_branch else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"ghdl_branch:{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="ghdl_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_download_version_choice() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Остання версія", callback_data="ghdl_latest")],
+        [InlineKeyboardButton(text="🕐 Вибрати commit", callback_data="ghdl_pick_commit")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ghdl_cancel")],
+    ])
+
+
+def ikb_download_commits(commits: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{c['short_sha']} — {c['message']}", callback_data=f"ghdl_commit:{i}")]
+        for i, c in enumerate(commits)
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="ghdl_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

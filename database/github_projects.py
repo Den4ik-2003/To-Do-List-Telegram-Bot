@@ -69,6 +69,7 @@ async def create_project(uid: int, name: str, owner: str, repo: str, default_bra
         "lastDeployAt": None,
         "lastCommit": None,
         "deployHistory": [],
+        "downloadHistory": [],
     }
     result = await db_call(github_projects_col.insert_one(doc), raise_on_fail=False)
     if result:
@@ -117,6 +118,40 @@ async def record_deploy(uid: int, project_id, commit_sha: str, commit_message: s
             {
                 "$set": {"lastDeployAt": now, "lastCommit": commit_message, "updatedAt": now},
                 "$push": {"deployHistory": {"$each": [entry], "$position": 0, "$slice": MAX_HISTORY_ENTRIES}},
+            },
+        ),
+        raise_on_fail=False,
+    )
+
+
+async def record_download(
+    uid: int,
+    project_id,
+    branch: str,
+    commit_sha: str,
+    commit_message: str,
+    file_count: int,
+    archive_size: int,
+) -> None:
+    try:
+        oid = ObjectId(project_id)
+    except Exception:
+        return
+    now = datetime.utcnow().isoformat()
+    entry = {
+        "at": now,
+        "branch": branch,
+        "commitSha": commit_sha,
+        "commit": commit_message,
+        "fileCount": file_count,
+        "archiveSize": archive_size,
+    }
+    await db_call(
+        github_projects_col.update_one(
+            {"_id": oid, "userId": uid},
+            {
+                "$set": {"updatedAt": now},
+                "$push": {"downloadHistory": {"$each": [entry], "$position": 0, "$slice": MAX_HISTORY_ENTRIES}},
             },
         ),
         raise_on_fail=False,
