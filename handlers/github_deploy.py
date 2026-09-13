@@ -1,3 +1,18 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/github_deploy.py
+
+Єдина зміна (для фічі "👨‍💻 AI Developer"):
+- gh_proj_open(): до вже існуючої клавіатури проєкту (ikb_project_actions)
+  додається ОДНА кнопка "👨‍💻 AI Developer" (callback_data="aidev_open:{pid}"),
+  яку обробляє новий handlers/ai_developer.py. Сама клавіатура
+  (keyboards/github.py → ikb_project_actions) НЕ змінена — рядок додається
+  поверх готового InlineKeyboardMarkup, щоб нічого там не зламати.
+- Додано імпорт InlineKeyboardButton (раніше в цьому файлі не був потрібен
+  напряму — клавіатури збирались лише в keyboards/github.py).
+
+Решта файлу — 1:1 як було.
+"""
+
 import logging
 from datetime import datetime
 
@@ -5,7 +20,7 @@ from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, Message, CallbackQuery
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardButton
 
 from database import github_projects as github_projects_db
 from services import github_api, github_crypto, github_download, github_zip
@@ -519,7 +534,11 @@ async def gh_proj_open(cb: CallbackQuery):
         f"GitHub: {project['githubOwner']}/{project['githubRepo']}\n"
         f"Останній деплой: {last_deploy[:16].replace('T', ' ') if last_deploy else 'ще не було'}"
     )
-    await cb.message.answer(text, reply_markup=ikb_project_actions(project["_id"]))
+    # НОВЕ: додаємо кнопку входу в AI Developer поверх готової клавіатури
+    # проєкту, нічого в самій ikb_project_actions не змінюючи.
+    kb = ikb_project_actions(project["_id"])
+    kb.inline_keyboard.insert(0, [InlineKeyboardButton(text="👨‍💻 AI Developer", callback_data=f"aidev_open:{pid}")])
+    await cb.message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "ghproj_back")
