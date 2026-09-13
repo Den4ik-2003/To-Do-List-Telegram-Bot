@@ -1,3 +1,17 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/site_watch_service.py
+
+НОВЕ: discover_page_urls() — публічна функція, що завантажує головну
+сторінку сайту і повертає список внутрішніх посилань, знайдених на ній
+(до MAX_DISCOVER_PAGES штук). Раніше пошук посилань (_discover_internal_links)
+був приватним і використовувався лише всередині одноразового QA-скану
+(run_qa_scan) — тепер та сама логіка перевикористовується і для фічі
+"сайт → його сторінки" (handlers/site_watch.py: sw_discover_cb).
+
+Сама _discover_internal_links НЕ змінена — лише додана нова функція-обгортка
+навколо неї плюс новий fetch головної сторінки.
+"""
+
 import hashlib
 import logging
 import re
@@ -20,6 +34,9 @@ HEADERS = {
 
 SLOW_PAGE_MS = 2000
 MAX_LINKS_TO_CHECK = 20
+
+# НОВЕ: скільки посилань максимум пропонувати при автопошуку сторінок сайту.
+MAX_DISCOVER_PAGES = 30
 
 
 def normalize_url(raw: str) -> str:
@@ -106,6 +123,18 @@ def _discover_internal_links(base_url: str, html: str, limit: int = 10) -> list[
         if len(links) >= limit:
             break
     return links
+
+
+async def discover_page_urls(base_url: str, limit: int = MAX_DISCOVER_PAGES, timeout: int = 12) -> list[str] | None:
+    """НОВЕ: завантажує головну сторінку сайту і повертає список внутрішніх
+    посилань, знайдених на ній (без самої base_url). Повертає None, якщо
+    головну сторінку не вдалось завантажити взагалі — щоб виклик міг чесно
+    повідомити користувачу причину, а не показати порожній список."""
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        status, _, html = await _fetch(session, base_url, timeout=timeout)
+    if status is None or status >= 400 or not html:
+        return None
+    return _discover_internal_links(base_url, html, limit=limit)
 
 
 def _analyze_forms(html: str) -> dict:
@@ -252,7 +281,7 @@ def format_qa_report(report: dict) -> str:
 
 
 # ============================================================
-# НОВЕ: Моніторинг сторінок (контент-діф + AI-аналіз)
+# Моніторинг сторінок (контент-діф + AI-аналіз)
 # ============================================================
 
 PAGE_CONTENT_SNAPSHOT_CHARS = 6000   # скільки символів зберігати як знімок
@@ -428,7 +457,7 @@ def format_global_stats(watches: list[dict]) -> str:
     )
 
 
-def build_page_card_text(w: dict) -> str:
+def build_page_card_text(w: dict, site_label: str | None = None) -> str:
     label = w.get("label") or w["url"]
     checks = w.get("checks_count", 0)
     changes = w.get("changes_count", 0)
@@ -442,7 +471,8 @@ def build_page_card_text(w: dict) -> str:
 
     text = (
         f"📄 *{label}*\n🌐 {w['url']}\n\n"
-        f"🔎 Перевірок: {checks} | 🔄 Змін: {changes} (важливих: {important})\n"
+        + (f"🔗 Частина сайту: {site_label}\n\n" if site_label else "")
+        + f"🔎 Перевірок: {checks} | 🔄 Змін: {changes} (важливих: {important})\n"
         f"🕐 Остання зміна: {last_change_text}\n"
         f"⏱ Частота: {freq}\n"
         f"🔔 Сповіщення: {'увімкнено' if notif_on else 'вимкнено'}"

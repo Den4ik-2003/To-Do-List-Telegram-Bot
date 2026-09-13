@@ -1,14 +1,17 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: database/site_watch.py
 
-Додано підтримку "🌐 Моніторинг сторінок" (контент-діф + AI-аналіз) поверх
-ІСНУЮЧОЇ колекції site_watch_col. Старі документи (uptime-моніторинги без
-поля "kind") нічим не відрізняються за поведінкою — kind трактується як
-"uptime" за замовчуванням через .get("kind", "uptime") у сервісному шарі.
+НОВЕ (фіча "сайт → його сторінки"): сторінки (kind="page") тепер можуть
+бути прив'язані до конкретного сайту (kind="uptime") через поле site_id.
+Раніше кожна сторінка додавалась повністю окремо, без жодного зв'язку з
+сайтом — тому не було способу "додати всі сторінки цього сайту".
 
-Жодна існуюча функція (add_site_watch, get_user_watches, get_watch,
-get_all_watches, update_watch_status, save_qa_result, get_last_qa,
-delete_watch) НЕ змінена.
+- add_page_watch(): додано опціональний параметр site_id (за замовчуванням
+  None — стара поведінка, окрема самостійна сторінка, не ламається).
+- get_pages_for_site(site_id): нова функція — всі сторінки, прив'язані до
+  конкретного сайту.
+
+Решта функцій — 1:1 як було, не змінені.
 """
 
 from bson import ObjectId
@@ -95,15 +98,18 @@ async def delete_watch(watch_id, uid: int) -> bool:
 
 
 # ============================================================
-# НОВЕ: Моніторинг сторінок (контент-діф + AI-аналіз)
+# Моніторинг сторінок (контент-діф + AI-аналіз)
 # ============================================================
 
-async def add_page_watch(uid: int, url: str, label: str = "") -> str:
+async def add_page_watch(uid: int, url: str, label: str = "", site_id: str | None = None) -> str:
+    """site_id — ОПЦІОНАЛЬНИЙ зв'язок із батьківським сайтом (kind="uptime").
+    None — сторінка сама по собі, як і раніше (стара поведінка збережена)."""
     doc = {
         "uid": uid,
         "url": url,
         "label": label or url,
         "kind": "page",
+        "site_id": site_id,
         "check_interval_minutes": PAGE_CHECK_INTERVAL_MINUTES,
         "notifications_enabled": True,
         "notify_moderate": False,
@@ -124,6 +130,12 @@ async def add_page_watch(uid: int, url: str, label: str = "") -> str:
 async def get_watches_by_kind(kind: str) -> list[dict]:
     cursor = site_watch_col.find({"kind": kind})
     return await db_call(cursor.to_list(length=1000))
+
+
+async def get_pages_for_site(site_id: str) -> list[dict]:
+    """Усі сторінки (kind="page"), прив'язані до конкретного сайту."""
+    cursor = site_watch_col.find({"kind": "page", "site_id": site_id})
+    return await db_call(cursor.to_list(length=200))
 
 
 async def update_content_snapshot(watch_id, content_hash: str, content_text: str):

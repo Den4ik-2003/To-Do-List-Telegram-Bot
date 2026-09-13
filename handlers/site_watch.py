@@ -1,4 +1,31 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/site_watch.py
+
+НОВЕ (фіча "сайт → його сторінки"): до кожного сайту (кнопка "🧪 QA скан" /
+uptime-запису) тепер можна прив'язати довільну кількість сторінок двома
+способами:
+
+1. "🔎 Знайти сторінки автоматично" (sw_discover_cb) — бот завантажує
+   головну сторінку сайту, шукає на ній внутрішні посилання
+   (services/site_watch_service.py:discover_page_urls) і показує їх
+   чекбокс-списком (за замовчуванням усі позначені — досить одразу
+   натиснути "Додати", якщо потрібні всі). Стан вибору живе в
+   discover_drafts_cache (in-memory, per draft_id — той самий патерн, що
+   voice_task_drafts у handlers/common.py).
+
+2. "✏️ Додати вручну" (sw_add_manual_cb) — користувач вставляє один чи
+   кілька URL одним повідомленням, кожен з нового рядка.
+
+Обидва шляхи ведуть у add_page_watch(..., site_id=wid) — тому додані
+сторінки лишаються видимими в тому самому "📋 Список моніторингів", але
+тепер позначені, частиною якого сайту вони є (build_page_card_text
+показує "🔗 Частина сайту: ...").
+
+Решта файлу — без змін.
+"""
+
 import logging
+import secrets
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -14,11 +41,19 @@ from handlers.common import require_auth
 logger = logging.getLogger("tasks_bot")
 router = Router(name="site_watch")
 
+# НОВЕ: чернетки автопошуку сторінок сайту до підтвердження — та сама
+# логіка, що voice_task_drafts у handlers/common.py. Ключ — випадковий
+# draft_id (не uid!), щоб callback_data лишався коротким.
+discover_drafts_cache: dict = {}
+
+MAX_MANUAL_URLS_PER_MESSAGE = 20
+
 
 class SiteWatch(StatesGroup):
     waiting_url = State()
     waiting_page_url = State()
     waiting_label = State()
+    waiting_multi_pages_url = State()  # НОВЕ: ручне додавання кількох сторінок сайту
 
 
 def _ikb_menu() -> InlineKeyboardMarkup:
@@ -36,7 +71,8 @@ async def site_watch_menu(msg: Message, state: FSMContext):
         return
     await msg.answer(
         "🌐 *Моніторинг сайтів та сторінок*\n\n"
-        "• *Сайт* — перевіряю доступність (uptime) і можу запустити QA-скан.\n"
+        "• *Сайт* — перевіряю доступність (uptime), можу запустити QA-скан, "
+        "і до нього можна прив'язати всі сторінки, які хочеш стежити.\n"
         "• *Сторінка* — стежу за змістом (ціни, наявність товару, вакансії тощо) "
         "і AI пояснює, що саме змінилося та чи це важливо.",
         reply_markup=_ikb_menu(),
@@ -85,7 +121,9 @@ async def site_watch_add_url(msg: Message, state: FSMContext):
     status_line = "🟢 зараз доступний" if is_up else "🔴 зараз НЕ відповідає"
     await wait_msg.edit_text(
         f"✅ Додано до моніторингу!\n\n🌐 `{url}`\n{status_line}\n\n"
-        f"Перевірятиму регулярно і одразу повідомлю, якщо статус зміниться."
+        f"Перевірятиму регулярно і одразу повідомлю, якщо статус зміниться.\n\n"
+        f"💡 Тепер можеш додати до нього сторінки для AI-аналізу змін — "
+        f"у списку моніторингів з'явиться кнопка «📄 Сторінки сайту»."
     )
     await msg.answer("Що далі?", reply_markup=_ikb_menu())
 
@@ -137,11 +175,19 @@ async def site_watch_list(cb: CallbackQuery):
     if not watches:
         return await cb.message.answer("📭 У тебе ще немає активних моніторингів.")
 
+    # НОВЕ: щоб показати "🔗 Частина сайту: ..." на картці сторінки, наперед
+    # збираємо label-и всіх сайтів користувача за їхніми _id.
+    site_labels = {
+        str(w["_id"]): (w.get("label") or w.get("url", ""))
+        for w in watches if w.get("kind", "uptime") == "uptime"
+    }
+
     for w in watches:
         kind = w.get("kind", "uptime")
 
         if kind == "page":
-            text = site_watch_service.build_page_card_text(w)
+            site_label = site_labels.get(w.get("site_id")) if w.get("site_id") else None
+            text = site_watch_service.build_page_card_text(w, site_label=site_label)
             wid = str(w["_id"])
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📜 Історія", callback_data=f"sw_hist:{wid}"),
@@ -163,11 +209,16 @@ async def site_watch_list(cb: CallbackQuery):
             elif qa_ok is False:
                 qa_line = "\n🧪 Останній QA: ⚠️ є проблеми"
 
-            text = f"{icon} {w.get('url', '')}{qa_line}"
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🧪 QA скан", callback_data=f"sw_qa:{wid}"),
-                InlineKeyboardButton(text="🗑 Видалити", callback_data=f"sw_del:{wid}"),
-            ]])
+            # НОВЕ: скільки сторінок прив'язано до цього сайту
+            pages = await site_watch_db.get_pages_for_site(wid)
+            pages_line = f"\n📄 Сторінок під наглядом: {len(pages)}" if pages else ""
+
+            text = f"{icon} {w.get('url', '')}{qa_line}{pages_line}"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧪 QA скан", callback_data=f"sw_qa:{wid}"),
+                 InlineKeyboardButton(text=f"📄 Сторінки сайту ({len(pages)})", callback_data=f"sw_pages:{wid}")],
+                [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"sw_del:{wid}")],
+            ])
             await cb.message.answer(text, reply_markup=kb)
 
 
@@ -180,7 +231,7 @@ async def site_watch_global_stats(cb: CallbackQuery):
     await cb.message.answer(site_watch_service.format_global_stats(watches))
 
 
-# ---------------- Додавання сторінки ----------------
+# ---------------- Додавання окремої сторінки (без прив'язки до сайту) ----------------
 
 @router.callback_query(F.data == "sw_add_page")
 async def site_watch_add_page_start(cb: CallbackQuery, state: FSMContext):
@@ -229,6 +280,227 @@ async def site_watch_add_page_url(msg: Message, state: FSMContext):
         f"Зробив перший знімок вмісту. З наступної перевірки почну порівнювати "
         f"зміни й пояснювати їх через AI."
     )
+    await msg.answer("Що далі?", reply_markup=_ikb_menu())
+
+
+# ---------------- НОВЕ: сторінки конкретного сайту ----------------
+
+@router.callback_query(F.data.startswith("sw_pages:"))
+async def site_watch_pages_menu(cb: CallbackQuery):
+    wid = cb.data.split(":", 1)[1]
+    watch = await site_watch_db.get_watch(wid)
+    if not watch or watch.get("uid") != cb.from_user.id:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    pages = await site_watch_db.get_pages_for_site(wid)
+    await cb.answer()
+
+    label = watch.get("label") or watch.get("url", "")
+    text = f"📄 *Сторінки сайту* — {label}\n\n"
+    if pages:
+        text += f"Уже під наглядом: {len(pages)} шт. (переглянути можна в «📋 Список моніторингів»).\n\n"
+    else:
+        text += "Поки що жодної сторінки не додано.\n\n"
+    text += "Як хочеш додати сторінки?"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Знайти автоматично", callback_data=f"sw_discover:{wid}")],
+        [InlineKeyboardButton(text="✏️ Додати вручну (список URL)", callback_data=f"sw_add_manual:{wid}")],
+    ])
+    await cb.message.answer(text, reply_markup=kb)
+
+
+def _ikb_discover(draft_id: str, urls: list[str], selected: set[int]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, url in enumerate(urls):
+        mark = "☑" if i in selected else "☐"
+        short = url if len(url) <= 42 else url[:39] + "…"
+        rows.append([InlineKeyboardButton(text=f"{mark} {short}", callback_data=f"sw_disc_toggle:{draft_id}:{i}")])
+    rows.append([
+        InlineKeyboardButton(text=f"✅ Додати обрані ({len(selected)})", callback_data=f"sw_disc_confirm:{draft_id}"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data=f"sw_disc_cancel:{draft_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("sw_discover:"))
+async def site_watch_discover_cb(cb: CallbackQuery):
+    wid = cb.data.split(":", 1)[1]
+    watch = await site_watch_db.get_watch(wid)
+    if not watch or watch.get("uid") != cb.from_user.id:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    await cb.answer("Шукаю сторінки на сайті...")
+    wait_msg = await cb.message.answer("🔎 Завантажую головну сторінку і шукаю посилання...")
+
+    urls = await site_watch_service.discover_page_urls(watch["url"])
+    if urls is None:
+        return await wait_msg.edit_text("⚠️ Не вдалося завантажити головну сторінку сайту. Спробуй пізніше.")
+
+    already = {p["url"] for p in await site_watch_db.get_pages_for_site(wid)}
+    urls = [u for u in urls if u not in already]
+
+    if not urls:
+        return await wait_msg.edit_text(
+            "📭 Нових сторінок не знайшов (усі знайдені посилання вже додані, "
+            "або на головній немає внутрішніх посилань)."
+        )
+
+    draft_id = secrets.token_hex(4)
+    discover_drafts_cache[draft_id] = {
+        "uid": cb.from_user.id,
+        "site_id": wid,
+        "urls": urls,
+        "selected": set(range(len(urls))),  # за замовчуванням — усі позначені
+    }
+
+    await wait_msg.edit_text(
+        f"🔎 Знайшов {len(urls)} нових сторінок. Усі позначені за замовчуванням — "
+        f"можеш зняти зайві або одразу тиснути «✅ Додати обрані»:",
+        reply_markup=_ikb_discover(draft_id, urls, discover_drafts_cache[draft_id]["selected"]),
+    )
+
+
+@router.callback_query(F.data.startswith("sw_disc_toggle:"))
+async def site_watch_discover_toggle_cb(cb: CallbackQuery):
+    _, draft_id, idx_s = cb.data.split(":")
+    draft = discover_drafts_cache.get(draft_id)
+    if not draft or draft["uid"] != cb.from_user.id:
+        return await cb.answer("Список застарів, почни пошук ще раз.", show_alert=True)
+
+    idx = int(idx_s)
+    if idx in draft["selected"]:
+        draft["selected"].discard(idx)
+    else:
+        draft["selected"].add(idx)
+
+    try:
+        await cb.message.edit_reply_markup(reply_markup=_ikb_discover(draft_id, draft["urls"], draft["selected"]))
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("sw_disc_cancel:"))
+async def site_watch_discover_cancel_cb(cb: CallbackQuery):
+    draft_id = cb.data.split(":", 1)[1]
+    draft = discover_drafts_cache.pop(draft_id, None)
+    if draft and draft["uid"] != cb.from_user.id:
+        discover_drafts_cache[draft_id] = draft  # чужий чорновик — не чіпаємо
+        return await cb.answer("Не твій список.", show_alert=True)
+    try:
+        await cb.message.edit_text("Скасовано.")
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("sw_disc_confirm:"))
+async def site_watch_discover_confirm_cb(cb: CallbackQuery):
+    draft_id = cb.data.split(":", 1)[1]
+    draft = discover_drafts_cache.get(draft_id)
+    if not draft or draft["uid"] != cb.from_user.id:
+        return await cb.answer("Список застарів, почни пошук ще раз.", show_alert=True)
+
+    selected_urls = [draft["urls"][i] for i in sorted(draft["selected"])]
+    discover_drafts_cache.pop(draft_id, None)
+
+    if not selected_urls:
+        return await cb.answer("Нічого не обрано.", show_alert=True)
+
+    await cb.answer(f"Додаю {len(selected_urls)} сторінок...")
+    try:
+        await cb.message.edit_text(f"⏳ Додаю {len(selected_urls)} сторінок і роблю перші знімки...")
+    except Exception:
+        pass
+
+    added, failed = 0, 0
+    for url in selected_urls:
+        result = await site_watch_service.fetch_page_content_text(url)
+        if not result or result.get("error"):
+            failed += 1
+            continue
+        wid = await site_watch_db.add_page_watch(cb.from_user.id, url, site_id=draft["site_id"])
+        await site_watch_db.update_content_snapshot(wid, site_watch_service.hash_content(result["text"]), result["text"])
+        added += 1
+
+    summary = f"✅ Додано {added} сторінок."
+    if failed:
+        summary += f"\n⚠️ Не вдалося завантажити {failed} — спробуй додати їх вручну пізніше."
+    try:
+        await cb.message.edit_text(summary)
+    except Exception:
+        await cb.message.answer(summary)
+
+
+@router.callback_query(F.data.startswith("sw_add_manual:"))
+async def site_watch_add_manual_cb(cb: CallbackQuery, state: FSMContext):
+    wid = cb.data.split(":", 1)[1]
+    watch = await site_watch_db.get_watch(wid)
+    if not watch or watch.get("uid") != cb.from_user.id:
+        return await cb.answer("Не знайдено", show_alert=True)
+
+    await state.set_state(SiteWatch.waiting_multi_pages_url)
+    await state.update_data(site_id=wid)
+    await cb.answer()
+    await cb.message.answer(
+        "🔗 Встав адреси сторінок — кожну з нового рядка "
+        f"(максимум {MAX_MANUAL_URLS_PER_MESSAGE} за раз):",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(SiteWatch.waiting_multi_pages_url, F.text == "❌ Скасувати")
+async def site_watch_add_manual_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb_category(CATEGORY_LIFE))
+
+
+@router.message(SiteWatch.waiting_multi_pages_url)
+async def site_watch_add_manual_urls(msg: Message, state: FSMContext):
+    if not msg.text:
+        return await msg.answer("⚠️ Надішли текстом одну або кілька адрес (або ❌ Скасувати):", reply_markup=kb_cancel())
+
+    data = await state.get_data()
+    site_id = data.get("site_id")
+    await state.clear()
+    if not site_id:
+        return await msg.answer("⚠️ Щось пішло не так, спробуй ще раз через список моніторингів.", reply_markup=kb_category(CATEGORY_LIFE))
+
+    raw_lines = [line.strip() for line in msg.text.splitlines() if line.strip()]
+    raw_lines = raw_lines[:MAX_MANUAL_URLS_PER_MESSAGE]
+    if not raw_lines:
+        return await msg.answer("⚠️ Не знайшов жодної адреси. Спробуй ще раз:", reply_markup=kb_cancel())
+
+    already = {p["url"] for p in await site_watch_db.get_pages_for_site(site_id)}
+    wait_msg = await msg.answer(f"⏳ Додаю {len(raw_lines)} сторінок...")
+
+    added, skipped, failed = 0, 0, 0
+    for raw in raw_lines:
+        url = site_watch_service.normalize_url(raw)
+        if "." not in url:
+            failed += 1
+            continue
+        if url in already:
+            skipped += 1
+            continue
+
+        result = await site_watch_service.fetch_page_content_text(url)
+        if not result or result.get("error"):
+            failed += 1
+            continue
+
+        wid = await site_watch_db.add_page_watch(msg.from_user.id, url, site_id=site_id)
+        await site_watch_db.update_content_snapshot(wid, site_watch_service.hash_content(result["text"]), result["text"])
+        already.add(url)
+        added += 1
+
+    summary = f"✅ Додано {added} сторінок."
+    if skipped:
+        summary += f"\n➖ Пропущено {skipped} — вже були додані."
+    if failed:
+        summary += f"\n⚠️ Не вдалося завантажити {failed}."
+    await wait_msg.edit_text(summary)
     await msg.answer("Що далі?", reply_markup=_ikb_menu())
 
 
