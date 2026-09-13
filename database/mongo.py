@@ -50,6 +50,7 @@ shop_stickers_col = None
 shop_drafts_col = None
 shop_published_posts_col = None
 shop_articles_col = None
+shop_thread_ideas_col = None
 
 github_projects_col = None
 github_credentials_col = None
@@ -69,7 +70,7 @@ async def init_mongo(mongo_uri: str):
     global favorite_recipes_col, recipe_history_col, shopping_items_col, cooking_sessions_col
     global worktime_col
     global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
-    global shop_drafts_col, shop_published_posts_col, shop_articles_col
+    global shop_drafts_col, shop_published_posts_col, shop_articles_col, shop_thread_ideas_col
     global github_projects_col, github_credentials_col
 
     mongo_client = AsyncIOMotorClient(
@@ -129,6 +130,7 @@ async def init_mongo(mongo_uri: str):
     shop_drafts_col = db["shop_drafts"]
     shop_published_posts_col = db["shop_published_posts"]
     shop_articles_col = db["shop_articles"]
+    shop_thread_ideas_col = db["shop_thread_ideas"]
 
     github_projects_col = db["github_projects"]
     github_credentials_col = db["github_credentials"]
@@ -149,6 +151,10 @@ async def _ensure_shop_indexes():
         )
         await shop_templates_col.create_index([("shop_id", 1)], name="shop_id_idx")
         await shop_examples_col.create_index([("shop_id", 1)], name="shop_id_idx")
+        await shop_thread_ideas_col.create_index(
+            [("shop_id", 1), ("created_at", -1)],
+            name="shop_id_created_idx",
+        )
     except Exception:
         logger.exception("Failed to ensure shop indexes")
 

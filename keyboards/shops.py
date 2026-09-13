@@ -29,6 +29,7 @@ def ikb_shop_menu(shop_id: str, has_channel: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📂 Шаблони", callback_data=f"shoptpls:{shop_id}")],
         [InlineKeyboardButton(text="📦 Артикули товарів", callback_data=f"shopart:{shop_id}")],
+        [InlineKeyboardButton(text="🧵 Threads", callback_data=f"shopthreads:{shop_id}")],
         [InlineKeyboardButton(text=channel_label, callback_data=f"shopchannel:{shop_id}")],
         [InlineKeyboardButton(text="✏️ Перейменувати", callback_data=f"shoprename:{shop_id}")],
         [InlineKeyboardButton(text="🗑 Видалити магазин", callback_data=f"shopdel:{shop_id}")],
