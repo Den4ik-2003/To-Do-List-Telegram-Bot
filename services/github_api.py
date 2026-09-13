@@ -242,6 +242,25 @@ async def _update_ref(session, owner, repo, branch, commit_sha, create_branch=Fa
                 data = await resp.json()
                 raise GithubDeployError(f"ref update failed: {data}")
 
+async def create_repo(token: str, name: str, private: bool = True) -> dict | None:
+    async with aiohttp.ClientSession(headers=_headers(token)) as session:
+        async with session.post(
+            "https://api.github.com/user/repos",
+            json={"name": name, "private": private, "auto_init": True},
+        ) as resp:
+            if resp.status not in (200, 201):
+                return None
+            data = await resp.json()
+            return {
+                "owner": data["owner"]["login"],
+                "repo": data["name"],
+                "default_branch": data.get("default_branch", "main"),
+            }
+
+async def repo_exists(token: str, owner: str, repo: str) -> bool:
+    async with aiohttp.ClientSession(headers=_headers(token)) as session:
+        async with session.get(f"https://api.github.com/repos/{owner}/{repo}") as resp:
+            return resp.status == 200
 
 async def deploy_files(
     token: str,

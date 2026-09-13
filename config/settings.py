@@ -105,3 +105,5 @@ AI_CLEANER_STALE_DAYS = int(os.environ.get("AI_CLEANER_STALE_DAYS", "30"))
 # День тижня й час розсилки дайджесту. mon/tue/wed/thu/fri/sat/sun.
 AI_CLEANER_WEEKDAY = os.environ.get("AI_CLEANER_WEEKDAY", "mon")
 AI_CLEANER_TIME = os.environ.get("AI_CLEANER_TIME", "10:00")
+
+NETLIFY_TOKEN = os.getenv("NETLIFY_TOKEN", "")

@@ -55,6 +55,10 @@ shop_thread_ideas_col = None
 github_projects_col = None
 github_credentials_col = None
 
+# НОВЕ: колекція для AI Website Builder (services/website_builder_service.py,
+# handlers/website_builder.py, database/websites.py)
+websites_col = None
+
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
@@ -72,6 +76,7 @@ async def init_mongo(mongo_uri: str):
     global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
     global shop_drafts_col, shop_published_posts_col, shop_articles_col, shop_thread_ideas_col
     global github_projects_col, github_credentials_col
+    global websites_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -135,9 +140,12 @@ async def init_mongo(mongo_uri: str):
     github_projects_col = db["github_projects"]
     github_credentials_col = db["github_credentials"]
 
+    websites_col = db["websites"]
+
     await ping()
     await _ensure_shop_indexes()
     await _ensure_github_indexes()
+    await _ensure_websites_indexes()
     return db
 
 
@@ -165,6 +173,14 @@ async def _ensure_github_indexes():
         await github_projects_col.create_index([("userId", 1), ("updatedAt", -1)], name="user_updated_idx")
     except Exception:
         logger.exception("Failed to ensure github indexes")
+
+
+async def _ensure_websites_indexes():
+    """Індекс для AI Website Builder (database/websites.py)."""
+    try:
+        await websites_col.create_index([("uid", 1), ("updatedAt", -1)], name="uid_updated_idx")
+    except Exception:
+        logger.exception("Failed to ensure websites indexes")
 
 
 async def close_mongo() -> None:

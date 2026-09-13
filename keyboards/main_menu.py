@@ -13,6 +13,8 @@ CATEGORY_BUSINESS = "💼 Бізнес"
 CATEGORY_JOBS = "💼 Вакансії"
 CATEGORY_SHOPS = "🏪 Магазини"
 CATEGORY_GITHUB = "🚀 Deploy to GitHub"
+# НОВЕ: категорія для AI Website Builder (handlers/website_builder.py)
+CATEGORY_WEBSITE = "🌐 AI Website Builder"
 
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
@@ -53,6 +55,10 @@ MAIN_CATEGORIES = {
     CATEGORY_GITHUB: [
         "📦 Новий проєкт", "📚 Мої проєкти",
         "⚙️ Налаштування GitHub",
+    ],
+    CATEGORY_WEBSITE: [
+        "🔗 Клонувати сайт", "🤖 Новий лендінг",
+        "📂 Мої сайти",
     ],
 }
 

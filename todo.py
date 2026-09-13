@@ -83,6 +83,7 @@ def register_routers(dp: Dispatcher) -> None:
         posts,
         github_deploy,
         ai_developer,
+        website_builder,
         settings as settings_handlers,
     )
 
@@ -128,6 +129,9 @@ def register_routers(dp: Dispatcher) -> None:
     # AI Developer відкривається з картки проєкту в github_deploy.py
     # (кнопка "aidev_open:{pid}") — тому реєструємо одразу поруч.
     dp.include_router(ai_developer.router)
+    # AI Website Builder — окрема категорія головного меню
+    # (CATEGORY_WEBSITE у keyboards/main_menu.py).
+    dp.include_router(website_builder.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
     dp.include_router(finances.router)
