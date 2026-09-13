@@ -12,8 +12,9 @@ from database import tasks as tasks_db
 from database import projects as projects_db
 from database import ai_usage as ai_usage_db
 from handlers.common import require_auth, voice_task_drafts, parse_due
+from keyboards.main_menu import kb_cancel
 from keyboards.tasks import (
-    kb_tasks_menu, kb_cancel, kb_label, label_from_text,
+    kb_tasks_menu, kb_label, label_from_text,
     kb_category, category_from_text, kb_project_select,
 )
 from services import voice_task_parser
