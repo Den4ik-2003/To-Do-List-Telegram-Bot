@@ -83,3 +83,12 @@ RESALE_CHECK_TIME = os.environ.get("RESALE_CHECK_TIME", "13:00")
 
 import os
 GITHUB_TOKEN_ENCRYPTION_KEY = os.getenv("GITHUB_TOKEN_ENCRYPTION_KEY")
+
+# --- НОВЕ: 📅 Автоперенесення задач ---
+# Максимум PENDING-задач на один день, понад який день вважається "зайнятим"
+# і алгоритм автоперенесення шукає далі.
+MAX_TASKS_PER_DAY = int(os.environ.get("MAX_TASKS_PER_DAY", "5"))
+# Максимум сумарних estimated_minutes PENDING-задач на день — застосовується
+# ДОДАТКОВО до MAX_TASKS_PER_DAY, тільки для задач, у яких estimated_minutes
+# заданий (напр. створені через AI Планер). 480 хв = 8 год.
+MAX_MINUTES_PER_DAY = int(os.environ.get("MAX_MINUTES_PER_DAY", "480"))

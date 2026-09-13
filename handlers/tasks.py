@@ -1,6 +1,27 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: handlers/tasks.py
+
+Додано (для фічі "📅 Автоперенесення задач"):
+- rollover_digest_cache — module-level кеш {uid: [task_id, ...]} для
+  групового нічного повідомлення (заповнює scheduler/daily_jobs.py,
+  читають нові callback-хендлери тут; той самий патерн, що вже
+  використовується для user_list_cache в handlers/common.py).
+- autoresched_cb — "📅 Найближчий вільний" (працює і з картки задачі,
+  і з нічної пропозиції — та сама callback_data "autoresched:{tid}").
+- dismiss_rollover_cb — "🔕 Залишити" на одиночній нічній пропозиції.
+- resched_all_cb / resched_pick_cb / dismiss_all_cb — три дії групового
+  дайджесту, коли невиконаних задач за ніч декілька.
+- view_day_cb — "📋 Переглянути день" після підтвердження перенесення
+  (нового екрана для цього не було — перевикористовує вже наявний
+  ikb_tasks_list).
+
+Решта файлу — без змін, жодна існуюча функція не видалена і не
+перейменована.
+"""
+
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramAPIError
@@ -17,11 +38,13 @@ from database.mongo import DBUnavailable
 from database import tasks as tasks_db
 from database import users as users_db
 from database import projects as projects_db
+from services import reschedule_service
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.tasks import (
     kb_tasks_menu, kb_label, label_from_text, kb_category, category_from_text,
     kb_date, kb_project_select, project_from_text,
     ikb_task_actions, ikb_edit_fields, ikb_tasks_list, ikb_categories,
+    ikb_view_day,
 )
 from handlers.common import (
     require_auth, user_list_cache, fmt_task, fmt_due, parse_due,
@@ -34,6 +57,11 @@ router = Router(name="tasks")
 CANCEL_TEXT = "❌ Скасувати"
 NO_DUE_TEXT = "⏭ Без терміну"
 NO_PROJECT_TEXT = "📋 Без проекту"
+
+# НОВЕ: кеш task_id-ів групового нічного дайджесту, ключ — uid.
+# Наповнює scheduler/daily_jobs.py (import цього словника звідти),
+# читають resched_all_cb / resched_pick_cb / dismiss_all_cb нижче.
+rollover_digest_cache: dict[int, list[int]] = {}
 
 
 class AddTask(StatesGroup):
@@ -415,6 +443,31 @@ async def view_task(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
+# НОВЕ: перегляд усіх задач конкретного дня (кнопка "📋 Переглянути день"
+# після підтвердження перенесення). Перевикористовує ikb_tasks_list.
+@router.callback_query(F.data.startswith("viewday:"))
+async def view_day_cb(cb: CallbackQuery):
+    try:
+        date_str = cb.data.split(":", 1)[1]  # YYYY-MM-DD (date.isoformat())
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        uid = cb.from_user.id
+
+        tasks = await tasks_db.get_user_tasks(uid, statuses=[STATUS_PENDING, STATUS_DONE])
+        tasks = [t for t in tasks if (parse_due(t.get("due", "")) or datetime.min).date() == target]
+        tasks = sort_tasks_by_label_then_due(tasks)
+        user_list_cache[uid] = tasks
+
+        pretty = target.strftime("%d.%m.%Y")
+        if not tasks:
+            await cb.message.edit_text(f"📭 На {pretty} задач немає.")
+        else:
+            await cb.message.edit_text(f"📅 *{pretty}* — {len(tasks)} шт.", reply_markup=ikb_tasks_list(tasks))
+        await cb.answer()
+    except Exception:
+        logger.exception("view_day_cb failed")
+        await _safe_alert(cb)
+
+
 # =========================================================
 # ДІЇ НАД ЗАДАЧЕЮ
 # =========================================================
@@ -502,6 +555,132 @@ async def postpone_tomorrow(cb: CallbackQuery):
         await _postpone(cb, tid, new_due)
     except Exception:
         logger.exception("postpone_tomorrow failed")
+        await _safe_alert(cb)
+
+
+# НОВЕ: "📅 Найближчий вільний" — і з картки задачі (ikb_task_actions), і
+# з нічної пропозиції (ikb_rollover_actions) — та сама callback_data.
+@router.callback_query(F.data.startswith("autoresched:"))
+async def auto_reschedule_cb(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+        uid = cb.from_user.id
+        t = await tasks_db.get_task(tid)
+        if not t:
+            return await cb.answer("Не знайдено!", show_alert=True)
+
+        new_day = await reschedule_service.reschedule_task_to_next_free_day(uid, tid, auto=False)
+        if not new_day:
+            return await cb.answer("Не знайдено!", show_alert=True)
+
+        t = await tasks_db.get_task(tid)
+        pretty = new_day.strftime("%d.%m.%Y")
+        text = f"✅ *Задачу перенесено*\n\n📝 {t.get('text','')}\n📅 Новий день: {pretty}"
+        try:
+            await cb.message.edit_text(text, reply_markup=ikb_view_day(new_day))
+        except TelegramAPIError:
+            await cb.message.answer(text, reply_markup=ikb_view_day(new_day))
+        await cb.answer("🔁 Перенесено")
+    except Exception:
+        logger.exception("auto_reschedule_cb failed")
+        await _safe_alert(cb)
+
+
+# НОВЕ: "🔕 Залишити" на одиночній нічній пропозиції — позначає, що
+# пропозицію вже показали сьогодні (не змінює саму задачу інакше).
+@router.callback_query(F.data.startswith("dismiss_rollover:"))
+async def dismiss_rollover_cb(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+        await tasks_db.update_task(tid, {"reschedule_prompt_sent_at": datetime.now().strftime("%Y-%m-%d")})
+        try:
+            await cb.message.edit_text("🔕 Залишено як є. Нагадаю знову, якщо не виконаєш.")
+        except TelegramAPIError:
+            pass
+        await cb.answer()
+    except Exception:
+        logger.exception("dismiss_rollover_cb failed")
+        await _safe_alert(cb)
+
+
+# НОВЕ: групові дії дайджесту "У тебе залишилось N невиконаних задач"
+@router.callback_query(F.data == "resched_all")
+async def resched_all_cb(cb: CallbackQuery):
+    try:
+        uid = cb.from_user.id
+        task_ids = rollover_digest_cache.get(uid) or []
+        if not task_ids:
+            return await cb.answer("Список застарів, спробуй ще раз завтра.", show_alert=True)
+
+        results = await reschedule_service.reschedule_many(uid, task_ids)
+        rollover_digest_cache.pop(uid, None)
+
+        if not results:
+            return await cb.answer("Нічого не перенесено (задачі вже змінились).", show_alert=True)
+
+        lines = ["✅ *Перенесено:*", ""]
+        for tid, day in results.items():
+            t = await tasks_db.get_task(tid)
+            title = (t or {}).get("text", "")
+            lines.append(f"📝 {title} → {day.strftime('%d.%m.%Y')}")
+        try:
+            await cb.message.edit_text("\n".join(lines))
+        except TelegramAPIError:
+            await cb.message.answer("\n".join(lines))
+        await cb.answer(f"Перенесено {len(results)} задач")
+    except Exception:
+        logger.exception("resched_all_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data == "resched_pick")
+async def resched_pick_cb(cb: CallbackQuery):
+    try:
+        uid = cb.from_user.id
+        task_ids = rollover_digest_cache.get(uid) or []
+        if not task_ids:
+            return await cb.answer("Список застарів, спробуй ще раз завтра.", show_alert=True)
+
+        tasks = []
+        for tid in task_ids:
+            t = await tasks_db.get_task(tid)
+            if t:
+                tasks.append(t)
+        if not tasks:
+            return await cb.answer("Список застарів.", show_alert=True)
+
+        user_list_cache[uid] = tasks
+        try:
+            await cb.message.edit_text(
+                "Обери задачу — відкриється картка, де можна перенести саме її:",
+                reply_markup=ikb_tasks_list(tasks),
+            )
+        except TelegramAPIError:
+            await cb.message.answer(
+                "Обери задачу — відкриється картка, де можна перенести саме її:",
+                reply_markup=ikb_tasks_list(tasks),
+            )
+        await cb.answer()
+    except Exception:
+        logger.exception("resched_pick_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data == "dismiss_all")
+async def dismiss_all_cb(cb: CallbackQuery):
+    try:
+        uid = cb.from_user.id
+        task_ids = rollover_digest_cache.pop(uid, None) or []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for tid in task_ids:
+            await tasks_db.update_task(tid, {"reschedule_prompt_sent_at": today_str})
+        try:
+            await cb.message.edit_text("🔕 Залишено як є. Нагадаю знову, якщо щось лишиться невиконаним.")
+        except TelegramAPIError:
+            pass
+        await cb.answer()
+    except Exception:
+        logger.exception("dismiss_all_cb failed")
         await _safe_alert(cb)
 
 

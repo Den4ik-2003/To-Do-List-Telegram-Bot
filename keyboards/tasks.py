@@ -1,3 +1,24 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: keyboards/tasks.py
+
+Додано (для фічі "📅 Автоперенесення задач"):
+- ikb_task_actions: нова кнопка "📅 Найближчий вільний" (autoresched:{tid})
+  поруч із вже наявними "🕐 +1 год"/"📅 Завтра" — жодна стара кнопка не
+  прибрана.
+- ikb_rollover_actions: додано "📅 Найближчий вільний" і "🔕 Залишити"
+  (dismiss_rollover:{tid}), старі "✅ Виконано"/"🕐 Через 1 год"/
+  "📅 Завтра"/"❌ Видалити" лишились як були.
+- ikb_rollover_digest(): НОВА клавіатура для випадку, коли невиконаних
+  задач за ніч декілька — "📅 Перенести всі" / "⚙️ Вибрати задачі" /
+  "❌ Залишити".
+- ikb_view_day(): НОВА клавіатура-кнопка "📋 Переглянути день" після
+  підтвердження перенесення.
+
+Решта файлу — без змін.
+"""
+
+from datetime import date
+
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -93,6 +114,8 @@ def ikb_task_actions(tid: int, t: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🕐 +1 год", callback_data=f"postp1h:{tid}"),
             InlineKeyboardButton(text="📅 Завтра", callback_data=f"postptom:{tid}"),
         ],
+        # НОВЕ: смарт-перенесення на найближчий реально вільний день
+        [InlineKeyboardButton(text="📅 Найближчий вільний", callback_data=f"autoresched:{tid}")],
         [
             InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"edit:{tid}"),
             InlineKeyboardButton(text="🗑 Видалити", callback_data=f"deltask:{tid}"),
@@ -104,9 +127,33 @@ def ikb_task_actions(tid: int, t: dict) -> InlineKeyboardMarkup:
 def ikb_rollover_actions(tid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Виконано", callback_data=f"done:{tid}")],
-        [InlineKeyboardButton(text="🕐 Через 1 год", callback_data=f"postp1h:{tid}")],
-        [InlineKeyboardButton(text="📅 Завтра", callback_data=f"postptom:{tid}")],
-        [InlineKeyboardButton(text="❌ Видалити", callback_data=f"deltask:{tid}")],
+        # НОВЕ: смарт-перенесення прямо з нічної пропозиції
+        [InlineKeyboardButton(text="📅 Найближчий вільний", callback_data=f"autoresched:{tid}")],
+        [
+            InlineKeyboardButton(text="🕐 Через 1 год", callback_data=f"postp1h:{tid}"),
+            InlineKeyboardButton(text="📅 Завтра", callback_data=f"postptom:{tid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔕 Залишити", callback_data=f"dismiss_rollover:{tid}"),
+            InlineKeyboardButton(text="❌ Видалити", callback_data=f"deltask:{tid}"),
+        ],
+    ])
+
+
+def ikb_rollover_digest() -> InlineKeyboardMarkup:
+    """НОВЕ: коли невиконаних задач за ніч кілька — одне повідомлення
+    замість спаму окремими картками на кожну."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Перенести всі", callback_data="resched_all")],
+        [InlineKeyboardButton(text="⚙️ Вибрати задачі", callback_data="resched_pick")],
+        [InlineKeyboardButton(text="❌ Залишити", callback_data="dismiss_all")],
+    ])
+
+
+def ikb_view_day(day: date) -> InlineKeyboardMarkup:
+    """НОВЕ: кнопка після підтвердження перенесення."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Переглянути день", callback_data=f"viewday:{day.isoformat()}")],
     ])
 
 
