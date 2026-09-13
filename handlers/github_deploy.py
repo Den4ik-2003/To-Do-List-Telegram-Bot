@@ -36,8 +36,19 @@ class GithubDeploy(StatesGroup):
     edit_waiting_value = State()
 
 
+def _md_escape(text: str) -> str:
+    """Escape legacy-Markdown special chars so dynamic text (filenames, repo
+    names, exception messages, e.g. 'node_modules') can't break entity parsing."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def _fail_text(reason: str, hint: str) -> str:
-    return f"❌ Не вдалося задеплоїти\n\nПричина:\n{reason}\n\nЩо зробити:\n{hint}"
+    return (
+        f"❌ Не вдалося задеплоїти\n\nПричина:\n{_md_escape(reason)}"
+        f"\n\nЩо зробити:\n{_md_escape(hint)}"
+    )
 
 
 async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
