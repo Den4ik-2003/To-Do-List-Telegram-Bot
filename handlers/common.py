@@ -5,7 +5,7 @@ from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config.constants import LABELS, CATEGORIES, STATUS_DONE, STATUS_PENDING, DB_ERROR_TEXT
+from config.constants import LABELS, CATEGORIES, LABEL_XP, STATUS_DONE, STATUS_PENDING, DB_ERROR_TEXT
 from database.mongo import DBUnavailable
 from database import users as users_db
 
@@ -170,6 +170,52 @@ def level_progress(xp: int):
         threshold = 100 + level * 150
     into_level = xp - total
     return level, into_level, threshold
+
+
+# =========================================================
+# НОВЕ: екран "🏆 Мій прогрес"
+# =========================================================
+# Нічого з формули XP/рівня не змінено — render_progress_bar і
+# build_progress_text лише ФОРМАТУЮТЬ те, що вже повертає level_progress()
+# та вже зберігається в users_db (xp, total_completed). "Останні отримані
+# XP" рахуються з уже наявних виконаних задач (status=done, completed_at) —
+# окремої історії нарахувань не додавалось, щоб не чіпати схему БД:
+# XP за задачу відтворюється тим самим LABEL_XP.get(label, 10), яким його
+# нарахував handlers/tasks.py.task_done() у момент виконання.
+
+def render_progress_bar(current: int, total: int, length: int = 10) -> str:
+    if total <= 0:
+        filled = length
+    else:
+        filled = int(round((current / total) * length))
+        filled = max(0, min(length, filled))
+    return "█" * filled + "░" * (length - filled)
+
+
+def build_progress_text(xp: int, total_completed: int, recent_completed: list) -> str:
+    level, into_level, threshold = level_progress(xp)
+    remain = max(threshold - into_level, 0)
+    bar = render_progress_bar(into_level, threshold)
+
+    lines = [
+        f"🏆 *Рівень {level}*",
+        f"`{bar}` {into_level} / {threshold} XP",
+        f"До рівня {level + 1}: {remain} XP",
+        "",
+        f"✅ Виконано задач: {total_completed}",
+    ]
+
+    if recent_completed:
+        lines.append("")
+        lines.append("🕐 *Останні отримані XP:*")
+        for t in recent_completed[:5]:
+            gain = LABEL_XP.get(t.get("label", "idea"), 10)
+            when = (t.get("completed_at") or "")[:16].replace("T", " ")
+            text = (t.get("text") or "")[:30]
+            suffix = f" ({when})" if when else ""
+            lines.append(f"✨ +{gain} XP — {text}{suffix}")
+
+    return "\n".join(lines)
 
 
 async def compute_daily_stats(uid: int, tasks_db) -> dict:

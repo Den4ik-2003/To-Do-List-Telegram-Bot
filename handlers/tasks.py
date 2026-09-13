@@ -1,7 +1,20 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/tasks.py
 
-Додано (для фічі "📅 Автоперенесення задач"):
+Додано (для фічі "🏆 Мій прогрес"):
+- progress_view — новий екран "🏆 Мій прогрес": рівень, XP, прогрес-бар,
+  скільки XP до наступного рівня, кількість виконаних задач, останні
+  отримані XP. Формула рівня/XP НЕ змінена — усе так само рахується
+  через level_progress() з handlers/common.py; новий екран лише читає
+  вже наявні users_db.get_user_state()/tasks_db.get_user_tasks() і
+  форматує через build_progress_text() (теж у handlers/common.py).
+- task_done(): нарахування XP і сам gain — БЕЗ ЗМІН. Змінено лише подачу
+  повідомлення про новий рівень — за ТЗ воно тепер надсилається окремим
+  повідомленням у форматі "🎉 Новий рівень!\\nТи досяг {N} рівня 🏆"
+  замість дописування рядка "🏆 Новий рівень: N!" в те саме повідомлення
+  про виконання задачі.
+
+Раніше додано (для фічі "📅 Автоперенесення задач"):
 - rollover_digest_cache — module-level кеш {uid: [task_id, ...]} для
   групового нічного повідомлення (заповнює scheduler/daily_jobs.py,
   читають нові callback-хендлери тут; той самий патерн, що вже
@@ -49,6 +62,7 @@ from keyboards.tasks import (
 from handlers.common import (
     require_auth, user_list_cache, fmt_task, fmt_due, parse_due,
     is_today, is_missed, sort_tasks, sort_tasks_by_label_then_due, level_progress,
+    build_progress_text,
 )
 
 logger = logging.getLogger("tasks_bot")
@@ -121,6 +135,30 @@ async def tasks_menu_cb(cb: CallbackQuery):
         pass
     await cb.message.answer("Обери дію:", reply_markup=kb_tasks_menu())
     await cb.answer()
+
+
+# =========================================================
+# НОВЕ: 🏆 МІЙ ПРОГРЕС
+# =========================================================
+
+@router.message(F.text == "🏆 Мій прогрес")
+async def progress_view(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state):
+        return
+    try:
+        uid = msg.from_user.id
+        udata = await users_db.get_user_state(uid)
+        xp = udata.get("xp", 0)
+        total_completed = udata.get("total_completed", 0)
+
+        done_tasks = await tasks_db.get_user_tasks(uid, statuses=[STATUS_DONE])
+        recent_completed = sorted(done_tasks, key=lambda t: t.get("completed_at") or "", reverse=True)[:5]
+
+        text = build_progress_text(xp, total_completed, recent_completed)
+        await msg.answer(text, reply_markup=kb_main())
+    except Exception:
+        logger.exception("progress_view failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
 
 
 # =========================================================
@@ -494,15 +532,23 @@ async def task_done(cb: CallbackQuery):
         })
         t = await tasks_db.get_task(tid)
 
+        # НЕ ЗМІНЕНО: сам gain і апдейт XP/рівня — та сама логіка, що й раніше.
         extra = f"\n\n✨ +{gain} XP"
-        if new_level > old_level:
-            extra += f"\n🏆 Новий рівень: *{new_level}*!"
 
         try:
             await cb.message.edit_text(f"✅ *Виконано!*\n\n{await _fmt_task_full(t)}{extra}")
         except TelegramAPIError:
             await cb.message.answer(f"✅ *Виконано!*\n\n{await _fmt_task_full(t)}{extra}")
         await cb.answer("✅ Виконано!")
+
+        # ЗМІНЕНО за ТЗ "🏆 XP-система": повідомлення про новий рівень тепер
+        # надсилається ОКРЕМИМ повідомленням у форматі з ТЗ, а не рядком,
+        # дописаним до картки виконаної задачі.
+        if new_level > old_level:
+            try:
+                await cb.message.answer(f"🎉 *Новий рівень!*\nТи досяг {new_level} рівня 🏆")
+            except TelegramAPIError:
+                logger.exception("Не вдалося надіслати повідомлення про новий рівень для uid=%s", t["uid"])
     except Exception:
         logger.exception("task_done failed")
         await _safe_alert(cb)
