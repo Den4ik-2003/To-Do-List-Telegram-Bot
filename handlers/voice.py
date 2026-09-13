@@ -10,6 +10,7 @@ from database import ai_usage as ai_usage_db
 from services import ai_service
 from handlers.common import require_auth
 from handlers.ai_chat import handle_text_message
+from handlers.voice_task import handle_voice_as_task
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="voice")
@@ -46,6 +47,14 @@ async def voice_message(msg: Message, state: FSMContext, bot):
         return await wait_msg.edit_text(
             "🤔 Не вдалося розпізнати мову. Спробуй ще раз або напиши текстом у «💬 AI Чат»."
         )
+
+    # НОВЕ: спершу перевіряємо, чи це схоже на задачу (пасивний режим, без
+    # натискання "🎙 Голосова задача"). Якщо так — показуємо пропозицію додати
+    # задачу і НЕ йдемо далі в AI-чат. Якщо ні — стара поведінка без змін.
+    handled_as_task = await handle_voice_as_task(msg, text, explicit=False)
+    if handled_as_task:
+        await wait_msg.delete()
+        return
 
     await wait_msg.edit_text(f"🎙 Розпізнано: «{text}»\n\n🤖 Обробляю...")
     await handle_text_message(uid, text, wait_msg)

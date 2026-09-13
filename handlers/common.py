@@ -19,6 +19,8 @@ class Auth(StatesGroup):
 # ---- пагінація списку задач і AI-план (per uid, in-memory) ----
 user_list_cache: dict = {}
 ai_suggestions_cache: dict = {}
+# НОВЕ: чернетки задач, розпізнаних із голосу, до підтвердження/редагування
+voice_task_drafts: dict = {}
 
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
@@ -114,7 +116,7 @@ def fmt_task(t: dict, short: bool = False) -> str:
     if due_dt and status != STATUS_DONE:
         remain = "  " + time_remaining_str(due_dt)
 
-    src = " 🤖" if t.get("source") == "ai" else ""
+    src = " 🤖" if t.get("source") == "ai" else (" 🎙" if t.get("source") == "voice" else "")
 
     lines = [
         f"{pin_str}*№{t['id']}* {label['emoji']} {status_icon}{src}",
@@ -180,9 +182,6 @@ async def compute_daily_stats(uid: int, tasks_db) -> dict:
     longest = None
 
     for t in tasks:
-        # --- ВИКОНАНІ: рахуємо по completed_at (дата ФАКТИЧНОГО виконання),
-        # а не по due (дедлайну). Раніше фільтр був по due.startswith(today_str),
-        # тому задачі, виконані сьогодні з учорашнім/пустим дедлайном, губились.
         if t.get("status") == STATUS_DONE:
             completed = t.get("completed_at")
             if not completed:
@@ -205,8 +204,6 @@ async def compute_daily_stats(uid: int, tasks_db) -> dict:
                     pass
             continue
 
-        # --- ПРОСТРОЧЕНІ: тут логіка лишається прив'язаною до due,
-        # бо "прострочено сьогодні" стосується саме дедлайну, а не виконання.
         due = t.get("due", "")
         if due.startswith(today_str) and is_missed(t):
             missed_today.append(t)

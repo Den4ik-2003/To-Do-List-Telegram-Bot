@@ -49,6 +49,7 @@ def register_routers(dp: Dispatcher) -> None:
         start,
         menu,
         tasks,
+        voice_task,
         kitchen,
         worktime,
         ai_planner,
@@ -86,6 +87,12 @@ def register_routers(dp: Dispatcher) -> None:
 
     dp.include_router(start.router)
     dp.include_router(tasks.router)
+    # ВАЖЛИВО: voice_task.router МАЄ бути зареєстрований ДО voice.router —
+    # у voice_task є state-специфічний обробник F.voice (тільки в стані
+    # VoiceTaskFlow.waiting_voice), а voice.router ловить F.voice без
+    # прив'язки до стану. Якщо стан не waiting_voice — voice_task пропускає
+    # повідомлення далі, і воно коректно потрапляє в voice.router як і раніше.
+    dp.include_router(voice_task.router)
     dp.include_router(kitchen.router)
     dp.include_router(worktime.router)
     dp.include_router(ai_planner.router)
