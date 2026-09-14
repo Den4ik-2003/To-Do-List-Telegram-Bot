@@ -262,6 +262,31 @@ async def repo_exists(token: str, owner: str, repo: str) -> bool:
         async with session.get(f"https://api.github.com/repos/{owner}/{repo}") as resp:
             return resp.status == 200
 
+
+async def delete_repo(token: str, owner: str, repo: str) -> bool:
+    """Видаляє репозиторій НАЗАВЖДИ. Потребує, щоб токен мав scope
+    delete_repo (для classic Personal Access Token) або дозвіл
+    Administration: write (для fine-grained token) — без цього GitHub
+    поверне 403, і функція коректно поверне False, не кидаючи виняток."""
+    try:
+        async with aiohttp.ClientSession(headers=_headers(token)) as session:
+            async with session.delete(
+                f"{GITHUB_API}/repos/{owner}/{repo}",
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                if resp.status == 204:
+                    return True
+                if resp.status == 404:
+                    logger.info("GitHub delete_repo: %s/%s вже не існує (404)", owner, repo)
+                    return True
+                body = await resp.text()
+                logger.error("GitHub delete_repo failed for %s/%s: %s %s", owner, repo, resp.status, body[:300])
+                return False
+    except Exception:
+        logger.exception("GitHub delete_repo crashed for %s/%s", owner, repo)
+        return False
+
+
 async def deploy_files(
     token: str,
     owner: str,

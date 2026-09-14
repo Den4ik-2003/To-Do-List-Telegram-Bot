@@ -1,10 +1,13 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: services/netlify_service.py
 
-Єдина зміна відносно попередньої версії: _build_zip() тепер приймає
-dict[str, str | bytes] замість dict[str, str] — бінарний контент (фото
-товару, services/product_asset_service.py) пишеться в архів як є, без
-utf-8 кодування; рядковий контент (html/css/js) кодується ЯК І РАНІШЕ.
+Зміни відносно попередньої версії:
+1. _build_zip() приймає dict[str, str | bytes] — бінарний контент (фото
+   товару) пишеться в архів як є, без utf-8 кодування; рядковий контент
+   (html/css/js) кодується ЯК І РАНІШЕ.
+2. НОВЕ: delete_site() — видаляє Netlify-сайт назавжди (разом з усіма
+   деплоями й доменом).
+
 Усі існуючі виклики deploy_new_site/redeploy_site з чистими текстовими
 файлами поводяться ІДЕНТИЧНО попередній версії — нічого не зламано.
 """
@@ -95,3 +98,21 @@ async def redeploy_site(token: str, site_id: str, files: dict[str, "str | bytes"
                 return {"site_id": site_id, "url": None, "admin_url": None, "name": None}
             site_data = await site_resp.json()
             return _extract_site_info(site_data)
+
+
+async def delete_site(token: str, site_id: str) -> bool:
+    """Видаляє Netlify-сайт НАЗАВЖДИ (разом з усіма деплоями й доменом)."""
+    try:
+        async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:
+            async with session.delete(f"{API_BASE}/sites/{site_id}") as resp:
+                if resp.status in (200, 204):
+                    return True
+                if resp.status == 404:
+                    logger.info("Netlify delete_site: %s вже не існує (404)", site_id)
+                    return True
+                body = await resp.text()
+                logger.error("Netlify delete_site failed for %s: %s %s", site_id, resp.status, body[:300])
+                return False
+    except Exception:
+        logger.exception("Netlify delete_site crashed for site_id=%s", site_id)
+        return False

@@ -2,11 +2,12 @@
 ЗМІНЕНИЙ ФАЙЛ: keyboards/website_builder.py
 
 Додано відносно попередньої версії:
-- ikb_wb_result(): нові кнопки "🖼 Додати товар" і "📦 Замовлення"
-  (обидві потребують, щоб сайт уже мав db_id, бо це дії над збереженим
-  сайтом — цю перевірку робить хендлер, а не клавіатура).
-- ikb_wb_product_confirm(): підтвердження перед комітом товару (щоб
-  дотриматись пункту ТЗ "після підтвердження оновити сайт").
+- ikb_wb_result(): кнопки "🖼 Додати товар" і "📦 Замовлення" (лише при
+  has_db_id — це дії над збереженим сайтом).
+- ikb_wb_product_confirm(): підтвердження перед комітом товару.
+- НОВЕ: кнопка "🗑 Видалити" в ikb_wb_result() (теж лише при has_db_id) +
+  ikb_wb_delete_confirm() — окреме підтвердження перед незворотним
+  видаленням з GitHub/Netlify/бота.
 """
 
 from aiogram.types import InlineKeyboardButton
@@ -32,6 +33,7 @@ def ikb_wb_result(has_github: bool, has_netlify: bool, has_db_id: bool = False) 
             InlineKeyboardButton(text="🖼 Додати товар", callback_data="wb_product_start"),
             InlineKeyboardButton(text="📦 Замовлення", callback_data="wb_orders_view"),
         )
+        b.row(InlineKeyboardButton(text="🗑 Видалити", callback_data="wb_delete_start"))
     b.row(InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_cancel"))
     return b.as_markup()
 
@@ -49,5 +51,14 @@ def ikb_wb_product_confirm() -> InlineKeyboardBuilder:
     b.row(
         InlineKeyboardButton(text="✅ Додати", callback_data="wb_product_confirm"),
         InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_product_cancel"),
+    )
+    return b.as_markup()
+
+
+def ikb_wb_delete_confirm() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Так, видалити назавжди", callback_data="wb_delete_confirm"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_delete_cancel"),
     )
     return b.as_markup()

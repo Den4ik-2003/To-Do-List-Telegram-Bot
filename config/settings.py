@@ -81,9 +81,6 @@ AI_FALLBACK_MODELS = _parse_model_list(os.environ.get("AI_FALLBACK_MODELS", ""))
 OLX_CHECK_TIME = os.environ.get("OLX_CHECK_TIME", "13:00")
 RESALE_CHECK_TIME = os.environ.get("RESALE_CHECK_TIME", "13:00")
 
-import os
-GITHUB_TOKEN_ENCRYPTION_KEY = os.getenv("GITHUB_TOKEN_ENCRYPTION_KEY")
-
 # --- НОВЕ: 📅 Автоперенесення задач ---
 # Максимум PENDING-задач на один день, понад який день вважається "зайнятим"
 # і алгоритм автоперенесення шукає далі.

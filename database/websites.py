@@ -1,5 +1,5 @@
 """
-НОВИЙ ФАЙЛ: database/websites.py
+database/websites.py
 
 Зберігає згенеровані AI Website Builder сайти: files-знімок (щоб можна
 було "Переробити" навіть після рестарту бота), GitHub-репозиторій (якщо
@@ -81,7 +81,7 @@ async def delete_website(uid: int, site_id: str) -> bool:
     result = await mongo.websites_col.delete_one({"_id": oid, "uid": uid})
     return result.deleted_count > 0
 
-# додати в кінець файлу
+
 async def get_website_by_id_any_owner(site_id: str) -> dict | None:
     """Використовується ЛИШЕ webhook'ом /order/{site_id} у main.py — там
     ще невідомо, хто власник (форма шле лише site_id), тому пошук іде без

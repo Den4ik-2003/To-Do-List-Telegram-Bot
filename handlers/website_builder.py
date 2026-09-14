@@ -2,33 +2,22 @@
 ЗМІНЕНИЙ ФАЙЛ: handlers/website_builder.py
 
 Додано відносно попередньої версії (без зміни старої логіки клонування/
-генерації/деплою/переробки — вона 1:1 як була):
+генерації/деплою/переробки/товарів/замовлень — вона 1:1 як була):
 
-1. ✏️ Редагування текстом — уже існувало (wb_refine_start/wb_refine_apply),
-   тепер лишень явно згадано в _result_text, нічого нового по суті.
-
-2. 🖼 Додавання товару через фото (пункт 2 ТЗ):
-   - wb_product_start: точка входу з картки конкретного сайту
-     ("🖼 Додати товар" в ikb_wb_result, з'являється лише якщо сайт уже
-     має db_id, тобто хоч раз задеплоєний).
-   - waiting_product_photo: приймає фото (+ підпис як текст характеристик).
-   - Якщо product_asset_service визначив, що бракує title/price —
-     переходить у waiting_product_missing і питає ТІЛЬКИ бракуюче поле.
-   - Показує підсумок і чекає підтвердження (ikb_wb_product_confirm).
-   - На підтвердження: оптимізує фото, комітить його як asset (у GitHub,
-     якщо є; у Netlify-zip при наступному деплої — через _pending["assets"]),
-     проганяє generate_product_card_update, оновлює обидва деплої (якщо
-     вже були), зберігає новий files-знімок у БД.
-
-3. 🐙 GitHub — це вже було (wb_deploy_gh створює репозиторій при першому
-   виклику). Тепер кнопка підписана "🚀 Deploy GitHub"/"🐙 Оновити GitHub".
-
-4. 📦 Замовлення — wb_orders_view показує останні заявки САМЕ цього сайту
-   (database/orders.get_orders_for_site, фільтр по site_id ТА owner_uid).
-
-__SITE_ID__-плейсхолдер (services/website_builder_service._ORDER_FORM_RULES)
-підміняється на реальний db_id одразу після ПЕРШОГО збереження сайту —
-_persist_pending() тепер робить це через _inject_site_id().
+5. 🗑 Видалення сайту (НОВЕ):
+   - wb_delete_start: кнопка "🗑 Видалити" в ikb_wb_result (з'являється
+     лише якщо сайт уже має db_id). Показує підтвердження зі списком
+     того, що саме буде видалено (GitHub-репо / Netlify-сайт / запис у
+     боті).
+   - wb_delete_cancel: скасування, повертає в меню без жодних дій.
+   - wb_delete_confirm: видаляє GitHub-репозиторій (якщо був) через
+     github_api.delete_repo, Netlify-сайт (якщо був) через
+     netlify_service.delete_site, і сам запис з MongoDB через
+     websites_db.delete_website. Якщо GitHub/Netlify видалення не
+     вдалося (наприклад, токену бракує прав) — користувачу прямо
+     повідомляється, що саме не вдалося видалити і де зробити це вручну,
+     а запис з бота видаляється в будь-якому разі (щоб не лишався
+     "мертвий" запис, на який більше нема способу натиснути в UI бота).
 """
 
 import logging
@@ -48,12 +37,14 @@ from services import ai_service, github_crypto, github_api, netlify_service
 from services import website_builder_service, product_asset_service
 from services.planner_service import check_ai_limit
 from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_WEBSITE
-from keyboards.website_builder import ikb_wb_result, ikb_wb_sites_list, ikb_wb_product_confirm
+from keyboards.website_builder import (
+    ikb_wb_result, ikb_wb_sites_list, ikb_wb_product_confirm, ikb_wb_delete_confirm,
+)
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="website_builder")
 
-# _pending: uid -> {..., "assets": {path: bytes}}  # НОВЕ: assets — бінарні
+# _pending: uid -> {..., "assets": {path: bytes}}  # assets — бінарні
 # файли (фото товарів), окремо від текстових "files", щоб не ламати
 # генератор/refine_site, які працюють лише з текстом.
 _pending: dict[int, dict] = {}
@@ -312,7 +303,7 @@ async def wb_deploy_gh(cb: CallbackQuery):
             pending["github_owner"], pending["github_repo"], pending["branch"] = owner, repo, branch
 
         files_bytes = {p: c.encode("utf-8") for p, c in pending["files"].items()}
-        files_bytes.update(pending.get("assets", {}))  # НОВЕ: фото товарів разом з текстовими файлами
+        files_bytes.update(pending.get("assets", {}))  # фото товарів разом з текстовими файлами
         commit_sha = await github_api.deploy_files(token, owner, repo, branch, files_bytes, pending["commit_message"])
     except Exception:
         logger.exception("Website Builder GitHub deploy crashed for uid=%s", uid)
@@ -344,7 +335,7 @@ async def wb_deploy_netlify(cb: CallbackQuery):
     await cb.answer()
     wait = await cb.message.answer("⏳ Деплою на Netlify...")
 
-    combined_files = _all_deploy_files(pending)  # НОВЕ: текст + фото товарів
+    combined_files = _all_deploy_files(pending)  # текст + фото товарів
     try:
         if pending.get("netlify_site_id"):
             info = await netlify_service.redeploy_site(NETLIFY_TOKEN, pending["netlify_site_id"], combined_files)
@@ -370,12 +361,12 @@ async def wb_deploy_netlify(cb: CallbackQuery):
 
 async def _persist_pending(uid: int, pending: dict) -> None:
     """Зберігає/оновлює запис у БД одразу після успішного деплою (GitHub
-    або Netlify). НОВЕ: якщо це ПЕРШЕ збереження (db_id ще не було),
-    одразу підміняє __SITE_ID__ у файлах на реальний db_id — форма
-    замовлення (services/website_builder_service._ORDER_FORM_RULES) від
-    цього моменту шле заявки на правильний webhook. Файли з підміненим
-    site_id ще НЕ задеплоєні — користувачу варто передеплоїти ще раз;
-    про це попереджає _result_text/повідомлення хендлера вище."""
+    або Netlify). Якщо це ПЕРШЕ збереження (db_id ще не було), одразу
+    підміняє __SITE_ID__ у файлах на реальний db_id — форма замовлення
+    (services/website_builder_service._ORDER_FORM_RULES) від цього
+    моменту шле заявки на правильний webhook. Файли з підміненим site_id
+    ще НЕ задеплоєні — користувачу варто передеплоїти ще раз; про це
+    попереджає _result_text/повідомлення хендлера вище."""
     is_first_save = not pending.get("db_id")
 
     payload = {
@@ -491,7 +482,7 @@ async def wb_site_open(cb: CallbackQuery):
 
 
 # =========================================================
-# 🖼 Додавання товару через фото (НОВЕ, пункт 2 ТЗ)
+# 🖼 Додавання товару через фото
 # =========================================================
 
 @router.callback_query(F.data == "wb_product_start")
@@ -668,7 +659,7 @@ async def wb_product_confirm(cb: CallbackQuery):
 
 
 # =========================================================
-# 📦 Замовлення (НОВЕ, пункт 4 ТЗ)
+# 📦 Замовлення
 # =========================================================
 
 @router.callback_query(F.data == "wb_orders_view")
@@ -691,3 +682,94 @@ async def wb_orders_view(cb: CallbackQuery):
             f"📦 {o.get('product', '—')}\n💬 {o.get('comment') or '—'}\n"
         )
     await cb.message.answer("\n".join(lines))
+
+
+# =========================================================
+# 🗑 Видалення сайту (НОВЕ)
+# =========================================================
+
+@router.callback_query(F.data == "wb_delete_start")
+async def wb_delete_start(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending or not pending.get("db_id"):
+        return await cb.answer("Сайт ще не збережено, немає що видаляти", show_alert=True)
+
+    await cb.answer()
+
+    will_delete = []
+    if pending.get("github_repo"):
+        will_delete.append(f"📦 GitHub-репозиторій {pending['github_owner']}/{pending['github_repo']}")
+    if pending.get("netlify_url"):
+        will_delete.append(f"🌍 Netlify-сайт {pending['netlify_url']}")
+    will_delete.append("🗂 Запис і всі дані сайту в боті")
+
+    details = "\n".join(f"• {p}" for p in will_delete)
+    await cb.message.answer(
+        f"⚠️ Точно видалити «{pending['site_name']}» НАЗАВЖДИ?\n\n"
+        f"Буде видалено:\n{details}\n\n"
+        "Цю дію не можна скасувати.",
+        reply_markup=ikb_wb_delete_confirm(),
+    )
+
+
+@router.callback_query(F.data == "wb_delete_cancel")
+async def wb_delete_cancel(cb: CallbackQuery):
+    await cb.answer("Скасовано")
+    await cb.message.answer("Скасовано, сайт не видалено.", reply_markup=kb_category(CATEGORY_WEBSITE))
+
+
+@router.callback_query(F.data == "wb_delete_confirm")
+async def wb_delete_confirm(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending or not pending.get("db_id"):
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Видаляю сайт...")
+
+    problems: list[str] = []
+
+    if pending.get("github_repo"):
+        token = await _get_github_token(uid)
+        if not token:
+            problems.append(
+                f"🐙 GitHub: токен не підключено, репозиторій "
+                f"{pending['github_owner']}/{pending['github_repo']} НЕ видалено — "
+                "видали вручну на github.com"
+            )
+        else:
+            ok = await github_api.delete_repo(token, pending["github_owner"], pending["github_repo"])
+            if not ok:
+                problems.append(
+                    f"🐙 GitHub: не вдалося видалити {pending['github_owner']}/{pending['github_repo']} "
+                    "(можливо, токену бракує прав delete_repo) — видали вручну на github.com"
+                )
+
+    if pending.get("netlify_site_id"):
+        if not NETLIFY_TOKEN:
+            problems.append(
+                f"🌍 Netlify: сервіс недоступний, сайт {pending.get('netlify_url', '')} НЕ видалено — "
+                "видали вручну на netlify.com"
+            )
+        else:
+            ok = await netlify_service.delete_site(NETLIFY_TOKEN, pending["netlify_site_id"])
+            if not ok:
+                problems.append(
+                    f"🌍 Netlify: не вдалося видалити сайт {pending.get('netlify_url', '')} — "
+                    "видали вручну на netlify.com"
+                )
+
+    site_name = pending["site_name"]
+    await websites_db.delete_website(uid, pending["db_id"])
+    _pending.pop(uid, None)
+    _pending_product.pop(uid, None)
+
+    if problems:
+        text = f"⚠️ «{site_name}» видалено з бота, але виникли проблеми:\n\n" + "\n".join(f"• {p}" for p in problems)
+    else:
+        text = f"✅ «{site_name}» видалено повністю — з GitHub, Netlify і бота."
+
+    await _safe_edit(wait, text)
+    await cb.message.answer("🏠 Головне меню:", reply_markup=kb_category(CATEGORY_WEBSITE))
