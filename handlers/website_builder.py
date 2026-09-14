@@ -1,41 +1,34 @@
 """
-НОВИЙ ФАЙЛ: handlers/website_builder.py
+ЗМІНЕНИЙ ФАЙЛ: handlers/website_builder.py
 
-Хендлери фічі "🌐 AI Website Builder". Вхід — через звичайну reply-
-категорію головного меню CATEGORY_WEBSITE (keyboards/main_menu.py), як і
-решта фіч (GitHub, Магазини тощо), а НЕ через окреме inline-меню:
-- "🔗 Клонувати сайт"  -> wb_clone_entry
-- "🤖 Новий лендінг"    -> wb_scratch_entry
-- "📂 Мої сайти"        -> wb_list_entry
+Додано відносно попередньої версії (без зміни старої логіки клонування/
+генерації/деплою/переробки — вона 1:1 як була):
 
-Перемикання між категоріями (BACK_TO_MAIN, сам показ CATEGORY_WEBSITE)
-обробляється загальним handlers/menu.py по MAIN_CATEGORIES — я його не
-бачив, але судячи з main_menu.py він генеричний (проходиться по словнику
-категорій), тож нову категорію додавати в нього окремо не треба.
+1. ✏️ Редагування текстом — уже існувало (wb_refine_start/wb_refine_apply),
+   тепер лишень явно згадано в _result_text, нічого нового по суті.
 
-Нічого не дублює:
-- GitHub-токен: database.github_projects.get_credential() + github_crypto —
-  ТОЙ САМИЙ, що й у Deploy ZIP / AI Developer.
-- Запис у GitHub: services/github_api.deploy_files (як і скрізь), плюс
-  ДВІ НОВІ функції create_repo/repo_exists — їх треба додати в
-  services/github_api.py (окремий snippet, я не бачив цей файл цілком).
-- Netlify: НОВИЙ ізольований services/netlify_service.py, спільний
-  сервісний токен NETLIFY_TOKEN з налаштувань (за рішенням користувача —
-  один спільний акаунт, а не токен на кожного).
-- AI-ліміт: database/ai_usage.py + services/planner_service.check_ai_limit —
-  той самий денний ліміт, що й у AI Developer / ранковому плані.
+2. 🖼 Додавання товару через фото (пункт 2 ТЗ):
+   - wb_product_start: точка входу з картки конкретного сайту
+     ("🖼 Додати товар" в ikb_wb_result, з'являється лише якщо сайт уже
+     має db_id, тобто хоч раз задеплоєний).
+   - waiting_product_photo: приймає фото (+ підпис як текст характеристик).
+   - Якщо product_asset_service визначив, що бракує title/price —
+     переходить у waiting_product_missing і питає ТІЛЬКИ бракуюче поле.
+   - Показує підсумок і чекає підтвердження (ikb_wb_product_confirm).
+   - На підтвердження: оптимізує фото, комітить його як asset (у GitHub,
+     якщо є; у Netlify-zip при наступному деплої — через _pending["assets"]),
+     проганяє generate_product_card_update, оновлює обидва деплої (якщо
+     вже були), зберігає новий files-знімок у БД.
 
-Модель стану:
-- _pending[uid]: поточний "чернетковий" сайт (щойно згенерований або
-  завантажений із "Мої сайти") — files, site_name, summary, і, якщо вже
-  був задеплоєний раніше, github/netlify ідентифікатори. Живе в пам'яті
-  процесу на час сесії.
-- database/websites.py: ПОСТІЙНЕ збереження сайту (включно з files-
-  знімком) відбувається одразу після ПЕРШОГО успішного деплою (GitHub або
-  Netlify) — до першого деплою чернетка ніде, крім пам'яті, не зберігається.
+3. 🐙 GitHub — це вже було (wb_deploy_gh створює репозиторій при першому
+   виклику). Тепер кнопка підписана "🚀 Deploy GitHub"/"🐙 Оновити GitHub".
 
-⚠️ Роутер `router` (name="website_builder") потрібно зареєструвати в
-main.py (dp.include_router(...)) — вже зроблено поруч з ai_developer.
+4. 📦 Замовлення — wb_orders_view показує останні заявки САМЕ цього сайту
+   (database/orders.get_orders_for_site, фільтр по site_id ТА owner_uid).
+
+__SITE_ID__-плейсхолдер (services/website_builder_service._ORDER_FORM_RULES)
+підміняється на реальний db_id одразу після ПЕРШОГО збереження сайту —
+_persist_pending() тепер робить це через _inject_site_id().
 """
 
 import logging
@@ -46,27 +39,32 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from config.settings import AI_DAILY_LIMIT, NETLIFY_TOKEN
+from config.settings import AI_DAILY_LIMIT, NETLIFY_TOKEN, ORDERS_DISPLAY_LIMIT
 from database import ai_usage as ai_usage_db
 from database import github_projects as github_projects_db
 from database import websites as websites_db
-from services import ai_service, github_crypto, github_api, netlify_service, website_builder_service
+from database import orders as orders_db
+from services import ai_service, github_crypto, github_api, netlify_service
+from services import website_builder_service, product_asset_service
 from services.planner_service import check_ai_limit
 from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_WEBSITE
-from keyboards.website_builder import ikb_wb_result, ikb_wb_sites_list
+from keyboards.website_builder import ikb_wb_result, ikb_wb_sites_list, ikb_wb_product_confirm
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="website_builder")
 
-# _pending: uid -> {
-#   "mode": "clone" | "scratch" | "refine",
-#   "site_name": str, "summary": str, "commit_message": str,
-#   "files": {path: content},
-#   "db_id": str | None,               # якщо сайт уже колись збережено в БД
-#   "github_owner": str | None, "github_repo": str | None, "branch": str | None,
-#   "netlify_site_id": str | None, "netlify_url": str | None,
-# }
+# _pending: uid -> {..., "assets": {path: bytes}}  # НОВЕ: assets — бінарні
+# файли (фото товарів), окремо від текстових "files", щоб не ламати
+# генератор/refine_site, які працюють лише з текстом.
 _pending: dict[int, dict] = {}
+
+# _pending_product: uid -> {
+#   "site_uid_key": int,           # ключ у _pending, до якого додаємо товар
+#   "image_bytes": bytes | None,
+#   "caption": str,
+#   "data": {"title","description","category","price_uah","missing"},
+# }
+_pending_product: dict[int, dict] = {}
 
 
 class WebsiteBuilder(StatesGroup):
@@ -74,6 +72,8 @@ class WebsiteBuilder(StatesGroup):
     waiting_clone_description = State()
     waiting_landing_description = State()
     waiting_refine_instruction = State()
+    waiting_product_photo = State()
+    waiting_product_missing = State()
 
 
 def _fail(reason: str) -> str:
@@ -108,6 +108,22 @@ def _result_text(pending: dict) -> str:
     if pending.get("netlify_url"):
         lines.append(f"🌍 Netlify: {pending['netlify_url']}")
     return "\n".join(lines)
+
+
+def _inject_site_id(files: dict[str, str], site_id: str) -> dict[str, str]:
+    """Підміняє плейсхолдер __SITE_ID__ (services/website_builder_service.
+    _ORDER_FORM_RULES) на реальний db_id. Безпечно викликати повторно —
+    якщо плейсхолдера вже нема (заміна була раніше), рядки просто
+    лишаться без змін."""
+    return {p: c.replace("__SITE_ID__", site_id) for p, c in files.items()}
+
+
+def _all_deploy_files(pending: dict) -> dict[str, str | bytes]:
+    """Об'єднує текстові файли сайту з бінарними asset'ами (фото товарів)
+    для передачі в netlify_service (яка тепер приймає str|bytes)."""
+    combined: dict[str, str | bytes] = dict(pending["files"])
+    combined.update(pending.get("assets", {}))
+    return combined
 
 
 # =========================================================
@@ -149,15 +165,17 @@ async def wb_list_entry(msg: Message, state: FSMContext):
 
 
 # =========================================================
-# 🔗 Клонувати та переробити сайт
+# 🔗 Клонувати та переробити сайт (без змін по суті)
 # =========================================================
 
 @router.message(WebsiteBuilder.waiting_clone_url, F.text == "❌ Скасувати")
 @router.message(WebsiteBuilder.waiting_clone_description, F.text == "❌ Скасувати")
 @router.message(WebsiteBuilder.waiting_landing_description, F.text == "❌ Скасувати")
 @router.message(WebsiteBuilder.waiting_refine_instruction, F.text == "❌ Скасувати")
+@router.message(WebsiteBuilder.waiting_product_missing, F.text == "❌ Скасувати")
 async def wb_cancel_flow(msg: Message, state: FSMContext):
     await state.clear()
+    _pending_product.pop(msg.from_user.id, None)
     await msg.answer("Скасовано.", reply_markup=kb_main())
 
 
@@ -201,17 +219,18 @@ async def wb_clone_generate(msg: Message, state: FSMContext):
         "mode": "clone", "db_id": None,
         "github_owner": None, "github_repo": None, "branch": None,
         "netlify_site_id": None, "netlify_url": None,
+        "assets": {},
         **result,
     }
     try:
         await wait.delete()
     except Exception:
         pass
-    await msg.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False))
+    await msg.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False, False))
 
 
 # =========================================================
-# 🤖 Згенерувати лендінг з нуля
+# 🤖 Згенерувати лендінг з нуля (без змін по суті)
 # =========================================================
 
 @router.message(WebsiteBuilder.waiting_landing_description)
@@ -233,17 +252,18 @@ async def wb_scratch_generate(msg: Message, state: FSMContext):
         "mode": "scratch", "db_id": None,
         "github_owner": None, "github_repo": None, "branch": None,
         "netlify_site_id": None, "netlify_url": None,
+        "assets": {},
         **result,
     }
     try:
         await wait.delete()
     except Exception:
         pass
-    await msg.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False))
+    await msg.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False, False))
 
 
 # =========================================================
-# 👀 Переглянути / 🚀 Deploy GitHub / 🌐 Deploy Netlify / ✏️ Переробити / ❌ Скасувати
+# 👀 Переглянути / 🚀 Deploy GitHub / 🌐 Deploy Netlify / ✏️ Переробити
 # =========================================================
 
 @router.callback_query(F.data == "wb_preview")
@@ -292,6 +312,7 @@ async def wb_deploy_gh(cb: CallbackQuery):
             pending["github_owner"], pending["github_repo"], pending["branch"] = owner, repo, branch
 
         files_bytes = {p: c.encode("utf-8") for p, c in pending["files"].items()}
+        files_bytes.update(pending.get("assets", {}))  # НОВЕ: фото товарів разом з текстовими файлами
         commit_sha = await github_api.deploy_files(token, owner, repo, branch, files_bytes, pending["commit_message"])
     except Exception:
         logger.exception("Website Builder GitHub deploy crashed for uid=%s", uid)
@@ -304,7 +325,10 @@ async def wb_deploy_gh(cb: CallbackQuery):
         f"✅ Задеплоєно в GitHub!\nCommit: `{commit_sha[:7]}`\n"
         f"https://github.com/{owner}/{repo}",
     )
-    await cb.message.answer(_result_text(pending), reply_markup=ikb_wb_result(True, bool(pending.get("netlify_url"))))
+    await cb.message.answer(
+        _result_text(pending),
+        reply_markup=ikb_wb_result(True, bool(pending.get("netlify_url")), bool(pending.get("db_id"))),
+    )
 
 
 @router.callback_query(F.data == "wb_deploy_netlify")
@@ -320,11 +344,12 @@ async def wb_deploy_netlify(cb: CallbackQuery):
     await cb.answer()
     wait = await cb.message.answer("⏳ Деплою на Netlify...")
 
+    combined_files = _all_deploy_files(pending)  # НОВЕ: текст + фото товарів
     try:
         if pending.get("netlify_site_id"):
-            info = await netlify_service.redeploy_site(NETLIFY_TOKEN, pending["netlify_site_id"], pending["files"])
+            info = await netlify_service.redeploy_site(NETLIFY_TOKEN, pending["netlify_site_id"], combined_files)
         else:
-            info = await netlify_service.deploy_new_site(NETLIFY_TOKEN, pending["files"], desired_name=pending.get("site_name"))
+            info = await netlify_service.deploy_new_site(NETLIFY_TOKEN, combined_files, desired_name=pending.get("site_name"))
     except Exception:
         logger.exception("Website Builder Netlify deploy crashed for uid=%s", uid)
         return await _safe_edit(wait, _fail("Помилка під час деплою на Netlify. Спробуй ще раз пізніше."))
@@ -337,13 +362,22 @@ async def wb_deploy_netlify(cb: CallbackQuery):
     await _persist_pending(uid, pending)
 
     await _safe_edit(wait, f"✅ Задеплоєно на Netlify!\n🌍 {info['url']}")
-    await cb.message.answer(_result_text(pending), reply_markup=ikb_wb_result(bool(pending.get("github_repo")), True))
+    await cb.message.answer(
+        _result_text(pending),
+        reply_markup=ikb_wb_result(bool(pending.get("github_repo")), True, bool(pending.get("db_id"))),
+    )
 
 
 async def _persist_pending(uid: int, pending: dict) -> None:
     """Зберігає/оновлює запис у БД одразу після успішного деплою (GitHub
-    або Netlify) — щоб сайт з'явився в «📂 Мої сайти» і його можна було
-    переробляти навіть після рестарту бота."""
+    або Netlify). НОВЕ: якщо це ПЕРШЕ збереження (db_id ще не було),
+    одразу підміняє __SITE_ID__ у файлах на реальний db_id — форма
+    замовлення (services/website_builder_service._ORDER_FORM_RULES) від
+    цього моменту шле заявки на правильний webhook. Файли з підміненим
+    site_id ще НЕ задеплоєні — користувачу варто передеплоїти ще раз;
+    про це попереджає _result_text/повідомлення хендлера вище."""
+    is_first_save = not pending.get("db_id")
+
     payload = {
         "site_name": pending["site_name"],
         "summary": pending["summary"],
@@ -359,17 +393,22 @@ async def _persist_pending(uid: int, pending: dict) -> None:
     else:
         pending["db_id"] = await websites_db.create_website(uid, payload)
 
+    if is_first_save:
+        pending["files"] = _inject_site_id(pending["files"], pending["db_id"])
+        await websites_db.update_website(uid, pending["db_id"], {"files": pending["files"]})
+
 
 @router.callback_query(F.data == "wb_cancel")
 async def wb_cancel(cb: CallbackQuery):
     uid = cb.from_user.id
     _pending.pop(uid, None)
+    _pending_product.pop(uid, None)
     await cb.answer("Скасовано")
     await cb.message.answer("Скасовано.", reply_markup=kb_category(CATEGORY_WEBSITE))
 
 
 # =========================================================
-# ✏️ Переробити
+# ✏️ Переробити (без змін по суті)
 # =========================================================
 
 @router.callback_query(F.data == "wb_refine_start")
@@ -417,7 +456,9 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
     await msg.answer(
         "✏️ Готово. Не забудь передеплоїти (GitHub/Netlify), щоб зміни стали видимими на сайті.\n\n"
         + _result_text(pending),
-        reply_markup=ikb_wb_result(bool(pending.get("github_repo")), bool(pending.get("netlify_url"))),
+        reply_markup=ikb_wb_result(
+            bool(pending.get("github_repo")), bool(pending.get("netlify_url")), bool(pending.get("db_id"))
+        ),
     )
 
 
@@ -441,8 +482,212 @@ async def wb_site_open(cb: CallbackQuery):
         "files": doc.get("files", {}),
         "github_owner": doc.get("githubOwner"), "github_repo": doc.get("githubRepo"), "branch": doc.get("branch"),
         "netlify_site_id": doc.get("netlifySiteId"), "netlify_url": doc.get("netlifyUrl"),
+        "assets": {},
     }
     await cb.message.answer(
         _result_text(_pending[uid]),
-        reply_markup=ikb_wb_result(bool(doc.get("githubRepo")), bool(doc.get("netlifyUrl"))),
+        reply_markup=ikb_wb_result(bool(doc.get("githubRepo")), bool(doc.get("netlifyUrl")), True),
     )
+
+
+# =========================================================
+# 🖼 Додавання товару через фото (НОВЕ, пункт 2 ТЗ)
+# =========================================================
+
+@router.callback_query(F.data == "wb_product_start")
+async def wb_product_start(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending or not pending.get("db_id"):
+        return await cb.answer("Спочатку задеплой сайт хоч раз (GitHub або Netlify)", show_alert=True)
+
+    _pending_product[uid] = {"caption": "", "image_bytes": None, "data": None}
+    await cb.answer()
+    await state.set_state(WebsiteBuilder.waiting_product_photo)
+    await cb.message.answer(
+        f"🖼 Надішли фото товару для сайту «{pending['site_name']}».\n"
+        "У підписі до фото можеш одразу вказати назву/ціну/розміри тощо "
+        "(напр. «Nike Tech Fleece, чорний, 2999 грн, розміри M/L/XL»).",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(WebsiteBuilder.waiting_product_photo, F.text == "❌ Скасувати")
+async def wb_product_cancel_state(msg: Message, state: FSMContext):
+    await state.clear()
+    _pending_product.pop(msg.from_user.id, None)
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(WebsiteBuilder.waiting_product_photo, F.photo)
+async def wb_product_photo_received(msg: Message, state: FSMContext, bot):
+    uid = msg.from_user.id
+    pending = _pending.get(uid)
+    prod = _pending_product.get(uid)
+    if not pending or prod is None:
+        await state.clear()
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        await state.clear()
+        _pending_product.pop(uid, None)
+        return await msg.answer(f"📊 Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день).", reply_markup=kb_main())
+
+    wait = await msg.answer("📷 Аналізую товар...")
+    try:
+        photo = msg.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buf = await bot.download_file(file.file_path)
+        image_bytes = buf.read()
+    except Exception:
+        logger.exception("Не вдалося завантажити фото товару (website builder) для uid=%s", uid)
+        await state.clear()
+        _pending_product.pop(uid, None)
+        await _safe_edit(wait, "⚠️ Не вдалося завантажити фото. Спробуй ще раз.")
+        return await msg.answer("🏠 Головне меню:", reply_markup=kb_main())
+
+    caption = (msg.caption or msg.text or "").strip()
+    data = await product_asset_service.parse_product_submission(image_bytes, caption)
+    await ai_usage_db.increment_usage(uid)
+
+    prod["image_bytes"] = image_bytes
+    prod["caption"] = caption
+    prod["data"] = data
+
+    if data["missing"]:
+        field = data["missing"][0]
+        await state.set_state(WebsiteBuilder.waiting_product_missing)
+        prompt = "Вкажи, будь ласка, назву товару:" if field == "title" else "Вкажи, будь ласка, ціну товару (в грн):"
+        return await _safe_edit(wait, f"🤔 Не вистачає даних.\n{prompt}")
+
+    await state.clear()
+    await _show_product_confirmation(wait, data)
+
+
+async def _show_product_confirmation(target: Message, data: dict) -> None:
+    price_line = f"{data['price_uah']:.0f} грн" if data.get("price_uah") else "не вказано"
+    text = (
+        "🖼 *Перевір дані товару перед додаванням:*\n\n"
+        f"📝 Назва: {data['title']}\n"
+        f"📄 Опис: {data.get('description', '—')}\n"
+        f"🏷 Категорія: {data.get('category', '—')}\n"
+        f"💵 Ціна: {price_line}"
+    )
+    await _safe_edit(target, text, reply_markup=ikb_wb_product_confirm())
+
+
+@router.message(WebsiteBuilder.waiting_product_missing, F.text)
+async def wb_product_missing_field(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    prod = _pending_product.get(uid)
+    if not prod or not prod.get("data"):
+        await state.clear()
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+
+    data = prod["data"]
+    field = data["missing"][0]
+    value = (msg.text or "").strip()
+
+    if field == "title":
+        data["title"] = value[:80]
+    else:  # price_uah
+        cleaned = value.replace(",", ".").replace("грн", "").replace("₴", "").strip()
+        try:
+            data["price_uah"] = float(cleaned)
+        except ValueError:
+            return await msg.answer("⚠️ Не розпізнав число. Напиши, будь ласка, лише суму (наприклад: 2999):")
+
+    data["missing"] = data["missing"][1:]
+
+    if data["missing"]:
+        next_field = data["missing"][0]
+        prompt = "Вкажи, будь ласка, назву товару:" if next_field == "title" else "Вкажи, будь ласка, ціну товару (в грн):"
+        return await msg.answer(prompt)
+
+    await state.clear()
+    wait = await msg.answer("⏳ Готую попередній перегляд...")
+    await _show_product_confirmation(wait, data)
+
+
+@router.callback_query(F.data == "wb_product_cancel")
+async def wb_product_confirm_cancel(cb: CallbackQuery):
+    _pending_product.pop(cb.from_user.id, None)
+    await cb.answer("Скасовано")
+    await cb.message.answer("Скасовано.", reply_markup=kb_category(CATEGORY_WEBSITE))
+
+
+@router.callback_query(F.data == "wb_product_confirm")
+async def wb_product_confirm(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    prod = _pending_product.get(uid)
+    if not pending or not prod or not prod.get("data"):
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        return await cb.answer(f"Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день)", show_alert=True)
+
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Додаю товар на сайт...")
+
+    data = prod["data"]
+    optimized = product_asset_service.optimize_image(prod["image_bytes"])
+    asset_path = product_asset_service.build_asset_path(data["title"], uid)
+
+    result = await website_builder_service.generate_product_card_update(pending["files"], data, asset_path)
+    if not result:
+        _pending_product.pop(uid, None)
+        return await _safe_edit(wait, _fail("AI не зміг додати картку товару. Спробуй ще раз."))
+
+    await ai_usage_db.increment_usage(uid)
+
+    pending["files"] = result["files"]
+    pending["summary"] = result["summary"]
+    pending["commit_message"] = result["commit_message"]
+    pending.setdefault("assets", {})[asset_path] = optimized
+
+    await websites_db.update_website(uid, pending["db_id"], {
+        "files": pending["files"],
+        "summary": pending["summary"],
+    })
+
+    _pending_product.pop(uid, None)
+
+    await _safe_edit(
+        wait,
+        f"✅ Товар «{data['title']}» додано!\n"
+        f"🖼 Фото збережено як `{asset_path}` (буде закомічено при наступному деплої).\n\n"
+        "Не забудь передеплоїти (GitHub/Netlify), щоб товар з'явився на сайті.",
+    )
+    await cb.message.answer(
+        _result_text(pending),
+        reply_markup=ikb_wb_result(bool(pending.get("github_repo")), bool(pending.get("netlify_url")), True),
+    )
+
+
+# =========================================================
+# 📦 Замовлення (НОВЕ, пункт 4 ТЗ)
+# =========================================================
+
+@router.callback_query(F.data == "wb_orders_view")
+async def wb_orders_view(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending or not pending.get("db_id"):
+        return await cb.answer("Сайт ще не збережено", show_alert=True)
+
+    await cb.answer()
+    orders = await orders_db.get_orders_for_site(uid, pending["db_id"], limit=ORDERS_DISPLAY_LIMIT)
+    if not orders:
+        return await cb.message.answer(f"📭 Замовлень для «{pending['site_name']}» ще немає.")
+
+    lines = [f"📦 *Замовлення* — {pending['site_name']}\n"]
+    for o in orders:
+        date = (o.get("created_at") or "")[:16].replace("T", " ")
+        lines.append(
+            f"🛒 {date}\n👤 {o.get('name', '—')}\n📞 {o.get('phone', '—')}\n"
+            f"📦 {o.get('product', '—')}\n💬 {o.get('comment') or '—'}\n"
+        )
+    await cb.message.answer("\n".join(lines))

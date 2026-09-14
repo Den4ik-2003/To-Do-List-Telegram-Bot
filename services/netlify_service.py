@@ -1,19 +1,12 @@
 """
-НОВИЙ ФАЙЛ: services/netlify_service.py
+ЗМІНЕНИЙ ФАЙЛ: services/netlify_service.py
 
-Тонка обгортка над Netlify REST API. Жодних нових залежностей — zip
-збирається стандартним zipfile, HTTP через уже наявний aiohttp.
-
-Використовується ОДИН спільний Netlify-акаунт (токен у налаштуваннях
-сервера, NETLIFY_TOKEN) — так вирішили свідомо, а не "кожен юзер свій
-токен", щоб не ускладнювати onboarding для фічі Website Builder.
-
-Дві дії:
-- deploy_new_site(...)  — створює НОВИЙ сайт на Netlify і одразу деплоїть
-  у нього файли (Netlify підтримує "create+deploy" одним запитом: POST
-  /sites з тілом = zip-архів).
-- redeploy_site(...)    — деплоїть оновлені файли в УЖЕ існуючий сайт
-  (POST /sites/{site_id}/deploys), URL сайту не змінюється.
+Єдина зміна відносно попередньої версії: _build_zip() тепер приймає
+dict[str, str | bytes] замість dict[str, str] — бінарний контент (фото
+товару, services/product_asset_service.py) пишеться в архів як є, без
+utf-8 кодування; рядковий контент (html/css/js) кодується ЯК І РАНІШЕ.
+Усі існуючі виклики deploy_new_site/redeploy_site з чистими текстовими
+файлами поводяться ІДЕНТИЧНО попередній версії — нічого не зламано.
 """
 
 import io
@@ -32,11 +25,12 @@ def _headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _build_zip(files: dict[str, str]) -> bytes:
+def _build_zip(files: dict[str, "str | bytes"]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path, content in files.items():
-            zf.writestr(path, content.encode("utf-8"))
+            data = content if isinstance(content, bytes) else content.encode("utf-8")
+            zf.writestr(path, data)
     return buf.getvalue()
 
 
@@ -49,10 +43,7 @@ def _extract_site_info(data: dict) -> dict:
     }
 
 
-async def deploy_new_site(token: str, files: dict[str, str], desired_name: str | None = None) -> dict | None:
-    """Створює новий сайт на Netlify і одразу деплоїть у нього files.
-    desired_name — бажаний піддомен (best-effort, якщо зайнятий — Netlify
-    сам дасть випадковий, це не помилка)."""
+async def deploy_new_site(token: str, files: dict[str, "str | bytes"], desired_name: str | None = None) -> dict | None:
     zip_bytes = _build_zip(files)
     async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:
         async with session.post(
@@ -80,15 +71,12 @@ async def deploy_new_site(token: str, files: dict[str, str], desired_name: str |
                         renamed = await rename_resp.json()
                         info = _extract_site_info(renamed)
             except Exception:
-                # Ім'я зайняте або інша дрібна помилка — не критично,
-                # сайт уже живий на автоматично згенерованому домені.
                 logger.info("Netlify rename to %r failed, keeping auto-generated domain", desired_name)
 
         return info
 
 
-async def redeploy_site(token: str, site_id: str, files: dict[str, str]) -> dict | None:
-    """Деплоїть новий вміст у вже існуючий сайт (той самий URL)."""
+async def redeploy_site(token: str, site_id: str, files: dict[str, "str | bytes"]) -> dict | None:
     zip_bytes = _build_zip(files)
     async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:
         async with session.post(

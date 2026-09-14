@@ -106,4 +106,11 @@ AI_CLEANER_STALE_DAYS = int(os.environ.get("AI_CLEANER_STALE_DAYS", "30"))
 AI_CLEANER_WEEKDAY = os.environ.get("AI_CLEANER_WEEKDAY", "mon")
 AI_CLEANER_TIME = os.environ.get("AI_CLEANER_TIME", "10:00")
 
-NETLIFY_TOKEN = os.getenv("NETLIFY_TOKEN", "")
+# --- AI Website Builder: розширення (редагування/фото-товар/замовлення) ---
+NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN", "")
+GITHUB_TOKEN_ENCRYPTION_KEY = os.environ.get("GITHUB_TOKEN_ENCRYPTION_KEY", "")
+
+ORDER_WEBHOOK_BASE_URL = os.environ.get("ORDER_WEBHOOK_BASE_URL", "")  # напр. https://mybot.up.railway.app
+MAX_PRODUCT_IMAGE_BYTES = int(os.environ.get("MAX_PRODUCT_IMAGE_BYTES", str(1_200_000)))
+PRODUCT_IMAGE_MAX_DIM = int(os.environ.get("PRODUCT_IMAGE_MAX_DIM", "1280"))
+ORDERS_DISPLAY_LIMIT = int(os.environ.get("ORDERS_DISPLAY_LIMIT", "20"))

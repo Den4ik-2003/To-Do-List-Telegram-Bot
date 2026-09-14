@@ -59,6 +59,10 @@ github_credentials_col = None
 # handlers/website_builder.py, database/websites.py)
 websites_col = None
 
+# НОВЕ: колекція для заявок з форм замовлення AI-Website-Builder-сайтів
+# (main.py handle_order, database/orders.py)
+orders_col = None
+
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
@@ -77,6 +81,7 @@ async def init_mongo(mongo_uri: str):
     global shop_drafts_col, shop_published_posts_col, shop_articles_col, shop_thread_ideas_col
     global github_projects_col, github_credentials_col
     global websites_col
+    global orders_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -142,10 +147,13 @@ async def init_mongo(mongo_uri: str):
 
     websites_col = db["websites"]
 
+    orders_col = db["orders"]
+
     await ping()
     await _ensure_shop_indexes()
     await _ensure_github_indexes()
     await _ensure_websites_indexes()
+    await _ensure_orders_indexes()
     return db
 
 
@@ -181,6 +189,15 @@ async def _ensure_websites_indexes():
         await websites_col.create_index([("uid", 1), ("updatedAt", -1)], name="uid_updated_idx")
     except Exception:
         logger.exception("Failed to ensure websites indexes")
+
+
+async def _ensure_orders_indexes():
+    """Індекси для заявок з форм замовлення (database/orders.py)."""
+    try:
+        await orders_col.create_index([("site_id", 1), ("created_at", -1)], name="site_created_idx")
+        await orders_col.create_index([("owner_uid", 1), ("created_at", -1)], name="owner_created_idx")
+    except Exception:
+        logger.exception("Failed to ensure orders indexes")
 
 
 async def close_mongo() -> None:

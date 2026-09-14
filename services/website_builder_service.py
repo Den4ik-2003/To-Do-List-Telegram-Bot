@@ -1,19 +1,22 @@
 """
-НОВИЙ ФАЙЛ: services/website_builder_service.py
+ЗМІНЕНИЙ ФАЙЛ: services/website_builder_service.py
 
-Логіка фічі "🌐 AI Website Builder". Нічого не дублює:
-- GitHub-токен і запис у репозиторій — services/github_api.py
-  (deploy_files — той самий шлях, що й Deploy ZIP / AI Developer;
-  create_repo/repo_exists — НОВІ функції, їх треба додати в github_api.py,
-  див. окремий snippet).
-- Netlify — services/netlify_service.py (новий, ізольований файл).
-- AI-виклики — services/ai_service.generate_json (той самий клієнт, що
-  й у ai_developer_service/planner_service).
+Додано відносно попередньої версії:
+1. _ORDER_FORM_RULES — інструкція для AI вбудовувати форму замовлення +
+   JS, що шле POST на ORDER_WEBHOOK_BASE_URL/order/{site_id} (новий
+   webhook у main.py). Додається до generate_landing_from_scratch/
+   generate_clone_redesign (там, де site_id ще невідомий на момент
+   генерації, підставляється плейсхолдер "__SITE_ID__", який хендлер
+   підміняє на реальний db_id ПІСЛЯ першого збереження в БД — див.
+   handlers/website_builder.py._inject_site_id()).
+2. generate_product_card_update() — спеціалізований refine під фото
+   товару (пункт 2 ТЗ): на відміну від refine_site() тут AI явно
+   інструктовано ТІЛЬКИ додати картку товару з готовими даними й шляхом
+   до вже завантаженого зображення, не чіпаючи решту сайту.
 
-Ключове архітектурне рішення: AI ЗАВЖДИ повертає ПОВНИЙ набір файлів
-сайту (а не diff/патч). Це свідомо спрощує деплой — і на GitHub, і на
-Netlify щоразу йде весь актуальний набір файлів, без злиття "старе +
-нове". Для лендінгів на кілька файлів (html/css/js) це дешево і надійно.
+Публічні сигнатури старих функцій (fetch_source_reference,
+generate_landing_from_scratch, generate_clone_redesign, refine_site,
+slugify) НЕ змінені.
 """
 
 import logging
@@ -22,10 +25,11 @@ import re
 import aiohttp
 
 from services import ai_service
+from config.settings import ORDER_WEBHOOK_BASE_URL
 
 logger = logging.getLogger("tasks_bot")
 
-MAX_SOURCE_HTML_CHARS = 12000   # скільки символів HTML-джерела дати AI як референс стилю
+MAX_SOURCE_HTML_CHARS = 12000
 MAX_FILES = 15
 MAX_FILE_CHARS = 40000
 MAX_TOTAL_CHARS = 250000
@@ -51,9 +55,6 @@ def _sanitize_path(path: str) -> str | None:
 
 
 def _parse_site_response(data: dict | None) -> dict | None:
-    """Валідує та санітизує JSON-відповідь AI у форматі:
-    {"summary": str, "site_name": str, "commit_message": str,
-     "files": {"index.html": "...", "style.css": "...", ...}}"""
     if not data or not isinstance(data.get("files"), dict) or not data["files"]:
         return None
 
@@ -70,7 +71,7 @@ def _parse_site_response(data: dict | None) -> dict | None:
         total_chars += len(text)
 
     if "index.html" not in files:
-        return None  # без index.html сайт неможливо задеплоїти як лендінг
+        return None
 
     return {
         "summary": str(data.get("summary", "")).strip()[:500] or "Сайт згенеровано AI.",
@@ -101,12 +102,30 @@ _RESPONSE_FORMAT_RULES = """
 - Семантичний HTML, сучасний, охайний дизайн (нормальні відступи, читабельна типографіка).
 """
 
+# НОВЕ: інструкція про форму замовлення. __SITE_ID__ — плейсхолдер,
+# підміняється в handlers/website_builder.py одразу після першого
+# збереження сайту в БД (коли з'являється реальний db_id).
+_ORDER_FORM_RULES = f"""
+Обов'язково додай на сторінку форму замовлення (наприклад секцію "Замовити"
+або кнопку "Купити" біля кожного товару, що відкриває форму) з полями:
+ім'я (name), телефон (phone), товар (product — якщо товарів кілька, підстав
+назву конкретного товару як значення за замовчуванням або приховане поле),
+коментар (comment, необов'язкове).
+
+Форма НЕ повинна перезавантажувати сторінку. Додай у script.js обробник, що
+при відправці робить:
+fetch("{ORDER_WEBHOOK_BASE_URL}/order/__SITE_ID__", {{
+  method: "POST",
+  headers: {{"Content-Type": "application/json"}},
+  body: JSON.stringify({{name, phone, product, comment}})
+}})
+і показує користувачу повідомлення про успішне надсилання (просто текст на
+сторінці, без alert()). __SITE_ID__ лишай ЯК Є буквально в коді (це
+плейсхолдер, який підставить сервер) — НЕ вигадуй замість нього значення.
+"""
+
 
 async def fetch_source_reference(url: str) -> dict | None:
-    """Тягне HTML стороннього сайту як РЕФЕРЕНС стилю/структури для AI.
-    Це НЕ контент майбутнього сайту — далі AI явно проінструктовано не
-    копіювати текст/зображення/код звідти, а лише орієнтуватись на
-    загальну структуру (шапка/hero/сітка товарів/футер тощо)."""
     try:
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -131,7 +150,8 @@ async def generate_landing_from_scratch(description: str) -> dict | None:
 
 Створи повноцінний, візуально привабливий лендінг під цей опис (стиль обери сам,
 якщо не вказано явно — сучасний, преміальний, з акуратною типографікою).
-{_RESPONSE_FORMAT_RULES}"""
+{_RESPONSE_FORMAT_RULES}
+{_ORDER_FORM_RULES}"""
     data = await ai_service.generate_json(prompt, temperature=0.6)
     return _parse_site_response(data)
 
@@ -153,14 +173,12 @@ async def generate_clone_redesign(source_ref: dict, description: str) -> dict | 
   назви блоків, логотип (текстовий, якщо іншого нема), контент, тематику.
 
 Референс (структура/стиль, НЕ контент для копіювання):
-```
-{source_ref['html_excerpt']}
-```
 
 Завдання користувача (продукт + побажання по стилю):
 "{description}"
 
-{_RESPONSE_FORMAT_RULES}"""
+{_RESPONSE_FORMAT_RULES}
+{_ORDER_FORM_RULES}"""
     data = await ai_service.generate_json(prompt, temperature=0.6)
     return _parse_site_response(data)
 
@@ -179,9 +197,58 @@ async def refine_site(current_files: dict[str, str], instruction: str) -> dict |
 "{instruction}"
 
 Внеси потрібні зміни. Поверни ПОВНИЙ оновлений набір файлів — тобто ВСІ файли
-сайту (і змінені, і незмінені), а не тільки ті, що торкнулись правки.
+сайту (і змінені, і незмінені), а не тільки ті, що торкнулись правки. Якщо на
+сайті вже є форма замовлення зі скриптом fetch(...) — НЕ видаляй і не ламай її,
+навіть якщо завдання користувача її прямо не стосується.
 {_RESPONSE_FORMAT_RULES}"""
     data = await ai_service.generate_json(prompt, temperature=0.4)
+    result = _parse_site_response(data)
+    if result and not result.get("site_name"):
+        result["site_name"] = None
+    return result
+
+
+# ============================================================
+# НОВЕ: Додавання товару з фото (пункт 2 ТЗ)
+# ============================================================
+
+async def generate_product_card_update(
+    current_files: dict[str, str], product: dict, image_path: str,
+) -> dict | None:
+    """Додає картку товару на вже готовий сайт. На відміну від refine_site
+    тут завдання ЖОРСТКО обмежене — тільки додати картку з переданими
+    даними, нічого іншого на сайті не міняти."""
+    files_block = "\n\n".join(
+        f"### {path}\n```\n{content}\n```" for path, content in current_files.items()
+    )
+    price_text = f"{product['price_uah']:.0f} грн" if product.get("price_uah") else "ціну уточнити"
+    prompt = f"""Ти — AI-розробник, що додає ОДНУ нову картку товару в каталог/сітку товарів
+на вже готовому сайті (HTML/CSS/JS). Відповідай українською (крім самого коду).
+
+Поточний вміст сайту:
+
+{files_block}
+
+Новий товар для додавання:
+- Назва: {product['title']}
+- Опис: {product.get('description', '')}
+- Категорія: {product.get('category', '')}
+- Ціна: {price_text}
+- Шлях до вже завантаженого фото (використай ЯК Є, не вигадуй інший шлях): {image_path}
+
+Завдання:
+- Знайди на сторінці секцію/сітку товарів (якщо її ще немає — створи мінімальну
+  секцію "Товари" перед формою замовлення).
+- Додай ОДНУ нову картку товару з фото (<img src="{image_path}">), назвою, ціною
+  і коротким описом, у тому ж стилі, що й інші картки (якщо вони є).
+- Кнопка/посилання картки має підставляти назву товару в поле "product" форми
+  замовлення (якщо форма замовлення вже є на сторінці — не створюй другу форму).
+- НІЧОГО ІНШОГО на сайті не міняй: не переписуй тексти, не міняй кольори,
+  не видаляй існуючі товари чи секції.
+
+Поверни ПОВНИЙ оновлений набір файлів (усі файли сайту, не тільки змінені).
+{_RESPONSE_FORMAT_RULES}"""
+    data = await ai_service.generate_json(prompt, temperature=0.3)
     result = _parse_site_response(data)
     if result and not result.get("site_name"):
         result["site_name"] = None

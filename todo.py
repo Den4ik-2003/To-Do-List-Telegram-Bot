@@ -2,6 +2,9 @@ import asyncio
 import logging
 import sys
 
+from database import orders as orders_db
+from database import websites as websites_db
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -16,20 +19,80 @@ from database.users import load_authorized_uids
 logger = logging.getLogger("tasks_bot")
 
 
+async def handle_order(request: web.Request) -> web.Response:
+    """Webhook для форм замовлення, вбудованих AI-Website-Builder-сайтами
+    (services/website_builder_service._ORDER_FORM_RULES). site_id береться
+    з шляху /order/{site_id}, тому кожен сайт шле заявки, прив'язані ЛИШЕ
+    до себе — навіть якщо кілька сайтів належать одному й тому самому uid."""
+    site_id = request.match_info.get("site_id", "")
+    if not site_id:
+        return web.json_response({"ok": False, "error": "missing site_id"}, status=400)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    # CORS: форма шле fetch() з чужого домену (Netlify/GitHub Pages) на бота
+    headers = {"Access-Control-Allow-Origin": "*"}
+
+    website = await websites_db.get_website_by_id_any_owner(site_id)  # див. нижче
+    if not website:
+        return web.json_response({"ok": False, "error": "site not found"}, status=404, headers=headers)
+
+    order_id = await orders_db.create_order(
+        site_id=site_id,
+        owner_uid=website["uid"],
+        site_name=website.get("siteName", ""),
+        name=str(payload.get("name", ""))[:200],
+        phone=str(payload.get("phone", ""))[:50],
+        product=str(payload.get("product", ""))[:300],
+        comment=str(payload.get("comment", ""))[:1000],
+    )
+
+    try:
+        bot = request.app["bot"]
+        text = (
+            "🛒 *Нове замовлення*\n"
+            f"🌐 Сайт: {website.get('siteName', '—')}\n"
+            f"👤 Ім'я: {payload.get('name', '—')}\n"
+            f"📞 Телефон: {payload.get('phone', '—')}\n"
+            f"📦 Товар: {payload.get('product', '—')}\n"
+            f"💬 Коментар: {payload.get('comment') or '—'}"
+        )
+        await bot.send_message(website["uid"], text)
+    except Exception:
+        logger.exception("Не вдалося надіслати сповіщення про замовлення %s", order_id)
+
+    return web.json_response({"ok": True, "order_id": order_id}, headers=headers)
+
+
+async def handle_order_options(request: web.Request) -> web.Response:
+    """Preflight для CORS (браузер шле OPTIONS перед POST з чужого домену)."""
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    })
+
+
 async def health_check(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def start_health_server() -> web.AppRunner:
+async def start_health_server(bot: Bot) -> web.AppRunner:
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+    app.router.add_post("/order/{site_id}", handle_order)
+    app.router.add_options("/order/{site_id}", handle_order_options)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logger.info("Health-check server started on port %s", PORT)
+    logger.info("Health-check + orders webhook server started on port %s", PORT)
     return runner
 
 
@@ -152,7 +215,7 @@ async def main() -> None:
 
     register_routers(dp)
 
-    health_runner = await start_health_server()
+    health_runner = await start_health_server(bot)
 
     from scheduler.daily_jobs import register_scheduler_jobs
     register_scheduler_jobs(bot)
