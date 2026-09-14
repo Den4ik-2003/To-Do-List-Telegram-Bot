@@ -1,30 +1,38 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: services/ai_service.py
 
-КОРІНЬ ПРОБЛЕМИ "⚠️ AI не відповів вчасно": зовнішній тайм-аут у
-handlers/ai_planner.py (AI_PLAN_TIMEOUT_SECONDS=45) МЕНШИЙ, ніж
-найгірший сценарій усередині цього файлу. Один логічний виклик
-generate_json() міг займати:
-  - json_mode: до (MAX_TRANSIENT_RETRIES+1)=2 спроби × 45с = 90с
-  - якщо JSON не розпарсився — ЩЕ текстовий fallback-прохід:
-    знову до 2 спроб × 45с = 90с
-  = до ~180с у найгіршому разі, тоді як ai_planner.py чекав лише 45с.
-Тобто зовнішній тайм-аут спрацьовував ЗАДОВГО до того, як AI взагалі
-встигав відповісти, навіть якщо відповідь була б успішною.
+КОРІНЬ ПРОБЛЕМИ "AI не зміг сформувати сайт із цього опису": генерація
+повного лендінгу (HTML+CSS+JS одним запитом, label="generate") — важка
+задача для безкоштовної моделі, і вона регулярно НЕ встигала вкластись у
+той самий 30-секундний таймаут, що використовувався для ЛЕГКИХ запитів
+(chat, розбір чека тощо). Додатково, поверх внутрішнього retry цього
+файлу, у services/website_builder_service.py був доданий ЩЕ ОДИН,
+зовнішній retry — разом це давало до 4 повних мережевих спроб по ~30с,
+і кожна впадала в таймаут, а користувач чекав ~2.5 хв і однаково
+отримував відмову.
 
 ЗМІНИ:
-1. AI_REQUEST_TIMEOUT_SECONDS: 45 → 30 (все ще з запасом для звичайної
-   відповіді моделі; більшість реальних відповідей у логах приходили за
-   1-27с).
-2. Доданий параметр allow_retry у _chat_completion()/_complete() —
-   текстовий fallback-прохід у generate_json() тепер робить ЛИШЕ ОДНУ
-   спробу на модель (allow_retry=False), а не дві. Основний json_mode-
-   прохід і далі має свій один retry (allow_retry=True за замовчуванням) —
-   там повтор виправдовує себе найбільше (порожні відповіді в json-режимі
-   найчастіші).
-3. Найгірший сценарій тепер: 2×30с (json_mode) + 1×30с (fallback) = ~90с
-   для ОДНІЄЇ моделі. Якщо в AI_FALLBACK_MODELS налаштовано ще моделі —
-   час пропорційно зростає на кожну; про це є коментар нижче.
+1. AI_GENERATE_TIMEOUT_SECONDS = 60 — окремий, довший таймаут ЛИШЕ для
+   label="generate" (генерація сайту). Інші лейбли (chat,
+   extract_receipt, analyze_product_photo) і далі використовують
+   AI_REQUEST_TIMEOUT_SECONDS=30 — там довші відповіді не потрібні, і
+   немає сенсу змушувати користувача чекати довше.
+2. AI_CLIENT_TIMEOUT_SECONDS: 40 → 90. Це таймаут самого HTTP-клієнта
+   OpenAI SDK — він має бути БІЛЬШИМ за найбільший з наших власних
+   asyncio.wait_for(...), інакше клієнт обірве з'єднання ще до того, як
+   спрацює наш таймаут, і ми ніколи не побачимо шансу на довшу, але
+   потенційно успішну відповідь.
+3. Для label="generate" прибрано внутрішній retry (тепер завжди 1 спроба
+   на модель, а не MAX_TRANSIENT_RETRIES+1=2) — натомість ця одна спроба
+   має вдвічі більше часу (60с замість 30с). Це свідомий трейд-офф:
+   краще одна спроба з реалістичним вікном часу, ніж дві короткі, жодна
+   з яких не встигає. Найгірший сценарій для generate_json() тепер:
+   60с (json_mode) + 60с (текстовий fallback) = ~120с на одну модель,
+   замість попередніх ~180с (тут) + подвоєння зовні в
+   website_builder_service.py.
+4. Легкі лейбли (chat/extract_receipt/analyze_product_photo) і далі
+   мають MAX_TRANSIENT_RETRIES=1 (тобто 2 спроби) при 30с — там короткий
+   retry виправдовує себе більше, ніж для важкої генерації.
 
 Публічні сигнатури (generate_text/generate_json/chat/chat_with_tools/
 extract_receipt/transcribe_voice/analyze_product_photo) НЕ змінені.
@@ -47,15 +55,24 @@ from config.settings import (
 
 logger = logging.getLogger("tasks_bot")
 
-# ЗМІНЕНО: 45 → 30. Один запит до ОДНІЄЇ моделі тепер обмежений 30с
-# замість 45с — це звужує найгірший сумарний час і дозволяє зовнішньому
-# тайм-ауту (ai_planner.py) реалістично його покривати.
+# Таймаут для ЗВИЧАЙНИХ (легких) запитів: chat, розбір чека, аналіз фото товару.
 AI_REQUEST_TIMEOUT_SECONDS = 30
-AI_CLIENT_TIMEOUT_SECONDS = 40
 
-# Скільки разів повторювати ОДНУ Й ТУ Ж модель при ТИМЧАСОВІЙ помилці
-# (таймаут / порожня відповідь). НЕ стосується 429 daily-limit — для нього
-# повтор тієї самої моделі безглуздий, одразу переходимо до fallback.
+# ЗМІНЕНО (нове): окремий, довший таймаут ЛИШЕ для label="generate" —
+# генерація повного сайту (HTML+CSS+JS) одним запитом об'єктивно триваліша,
+# ніж звичайні текстові/JSON відповіді, і 30с їй систематично не вистачало
+# (див. логи: "AI timeout ... label=generate" повторювався щоразу рівно
+# на позначці ~28-30с).
+AI_GENERATE_TIMEOUT_SECONDS = 60
+
+# ЗМІНЕНО: 40 → 90. Має залишатись БІЛЬШИМ за AI_GENERATE_TIMEOUT_SECONDS
+# з запасом — інакше HTTP-клієнт сам обірве з'єднання раніше, ніж наш
+# власний asyncio.wait_for(60с) встигне спрацювати.
+AI_CLIENT_TIMEOUT_SECONDS = 90
+
+# Скільки РАЗІВ ПОВТОРЮВАТИ ОДНУ Й ТУ Ж модель при ТИМЧАСОВІЙ помилці
+# (таймаут / порожня відповідь) — стосується лише ЛЕГКИХ лейблів.
+# Для label="generate" ретрай навмисно вимкнено (див. _effective_retry_budget).
 MAX_TRANSIENT_RETRIES = 1
 
 # Скільки секунд не звертатись до моделі, яка щойно впала з 429 (вичерпаний
@@ -100,11 +117,23 @@ def _model_list() -> list[str]:
     (AI_FALLBACK_MODELS), у порядку зазначення. Немає жорсткої прив'язки
     коду до конкретної назви моделі — все конфігурується через .env.
 
-    ⚠️ ВАЖЛИВО ПРО ТАЙМ-АУТИ: кожна додаткова fallback-модель у цьому
-    списку пропорційно збільшує найгірший сценарій часу відповіді
-    (кожна модель — це ще один цикл спроб). Якщо задаси AI_FALLBACK_MODELS
-    з кількома моделями, можливо, доведеться ще підняти
-    AI_PLAN_TIMEOUT_SECONDS у handlers/ai_planner.py."""
+    ⚠️ ВАЖЛИВО: наразі за замовчуванням AI_FALLBACK_MODELS порожній
+    (у логах видно "моделі=['openrouter/free']" — тобто лише ОДНА
+    модель). Це означає, що коли openrouter/free перевантажена, боту
+    просто немає на що переключитись. Якщо додати сюди хоча б одну
+    запасну модель через .env (AI_FALLBACK_MODELS), код автоматично
+    почне її використовувати при відмові першої — жодних змін коду для
+    цього більше не потрібно, лише конфігурація.
+
+    ⚠️ ПРО ТАЙМ-АУТИ: кожна додаткова fallback-модель у цьому списку
+    пропорційно збільшує найгірший сценарій часу відповіді (кожна
+    модель — це ще один цикл спроб). Якщо задаси AI_FALLBACK_MODELS з
+    кількома моделями, для label="generate" це буде +60с (json_mode) на
+    кожну додаткову модель — можливо, доведеться підняти зовнішній
+    тайм-аут очікування відповіді там, де викликається generate_json()
+    для сайтів (наразі в handlers/website_builder.py немає окремого
+    AI_PLAN_TIMEOUT_SECONDS-подібного обмеження, але якщо воно з'явиться —
+    врахуй це)."""
     models = [AI_MODEL] if AI_MODEL else []
     for m in AI_FALLBACK_MODELS:
         if m and m not in models:
@@ -144,6 +173,22 @@ def _strip_safety_noise(text: str) -> str:
     cleaned = _SAFETY_LINE_RE.sub("", text)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
+
+
+def _timeout_for_label(label: str) -> float:
+    """НОВЕ: важкі задачі (генерація сайту) отримують суттєво більше часу
+    на одну спробу, ніж легкі текстові/JSON запити."""
+    return AI_GENERATE_TIMEOUT_SECONDS if label == "generate" else AI_REQUEST_TIMEOUT_SECONDS
+
+
+def _effective_retry_budget(label: str, allow_retry: bool) -> int:
+    """НОВЕ: скільки РАЗІВ ПОВТОРИТИ одну й ту ж модель. Для важкого
+    label="generate" ретрай навмисно вимкнено (0) — краще одна спроба з
+    великим вікном часу (AI_GENERATE_TIMEOUT_SECONDS), ніж дві короткі,
+    жодна з яких не встигає. Для решти лейблів — як і раніше."""
+    if label == "generate":
+        return 0
+    return MAX_TRANSIENT_RETRIES if allow_retry else 0
 
 
 def is_available() -> bool:
@@ -238,13 +283,13 @@ def _build_content(prompt: str, images: list[str] | None):
     return content
 
 
-async def _call_once(model: str, messages: list[dict], temperature: float, json_mode: bool):
+async def _call_once(model: str, messages: list[dict], temperature: float, json_mode: bool, timeout: float):
     kwargs = {"temperature": temperature}
     if json_mode and model not in _no_json_support:
         kwargs["response_format"] = {"type": "json_object"}
     return await asyncio.wait_for(
         client.chat.completions.create(model=model, messages=messages, **kwargs),
-        timeout=AI_REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
 
@@ -256,11 +301,11 @@ async def _chat_completion(
     allow_retry: bool = True,
 ) -> str | None:
     """
-    ЗМІНЕНО: новий параметр allow_retry (за замовчуванням True — поведінка
-    як і раніше). Якщо False — на кожну модель робиться ЛИШЕ ОДНА спроба
-    замість MAX_TRANSIENT_RETRIES+1. Використовується для текстового
-    fallback-проходу в generate_json(), щоб не подвоювати й так уже
-    повторний запит ще одним внутрішнім retry-циклом.
+    ЗМІНЕНО: таймаут і бюджет ретраїв на одну модель тепер залежать від
+    label (див. _timeout_for_label / _effective_retry_budget) — важка
+    генерація сайту (label="generate") отримує довше вікно на спробу і
+    без внутрішнього повтору, легкі запити — як і раніше, коротке вікно
+    з одним повтором.
     """
     if not client:
         return None
@@ -270,7 +315,8 @@ async def _chat_completion(
         logger.error("Немає жодної налаштованої AI-моделі (AI_MODEL порожній) — label=%s", label)
         return None
 
-    max_retries = MAX_TRANSIENT_RETRIES if allow_retry else 0
+    timeout = _timeout_for_label(label)
+    max_retries = _effective_retry_budget(label, allow_retry)
 
     for model in models:
         if _is_unavailable(model):
@@ -279,11 +325,11 @@ async def _chat_completion(
 
         for attempt in range(max_retries + 1):
             try:
-                resp = await _call_once(model, messages, temperature, json_mode)
+                resp = await _call_once(model, messages, temperature, json_mode, timeout)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "AI timeout (model=%s, label=%s, спроба=%s/%s)",
-                    model, label, attempt + 1, max_retries + 1,
+                    "AI timeout (model=%s, label=%s, timeout=%.0fс, спроба=%s/%s)",
+                    model, label, timeout, attempt + 1, max_retries + 1,
                 )
                 if attempt < max_retries:
                     continue
@@ -347,11 +393,12 @@ async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
 
 
 async def generate_json(prompt: str, temperature: float = 0.7, images: list[str] | None = None) -> dict | None:
-    """Основний шлях: запит у json_mode (з retry — там порожні відповіді
-    найчастіші). Якщо результат не парситься як JSON-об'єкт, робимо ОДИН
-    додатковий запит у звичайному текстовому режимі БЕЗ retry
-    (allow_retry=False) — щоб не подвоювати й так уже додатковий прохід і
-    вкластися в реалістичний загальний бюджет часу."""
+    """Основний шлях: запит у json_mode. Якщо результат не парситься як
+    JSON-об'єкт, робимо ОДИН додатковий запит у звичайному текстовому
+    режимі. Обидва проходи для важкої генерації (label="generate")
+    використовують довший AI_GENERATE_TIMEOUT_SECONDS і без внутрішнього
+    повтору (див. _effective_retry_budget) — найгірший сценарій тепер
+    ~2×AI_GENERATE_TIMEOUT_SECONDS на одну модель, а не 3-4× як було."""
     raw = await _complete(prompt, temperature, json_mode=True, images=images)
     data = _try_parse_json_dict(raw)
     if data is not None:
