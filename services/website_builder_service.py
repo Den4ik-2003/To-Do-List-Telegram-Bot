@@ -13,12 +13,21 @@
    товару (пункт 2 ТЗ): на відміну від refine_site() тут AI явно
    інструктовано ТІЛЬКИ додати картку товару з готовими даними й шляхом
    до вже завантаженого зображення, не чіпаючи решту сайту.
+3. НОВЕ (стабільність генерації): _build_files_block() обрізає вміст
+   кожного файлу перед вставкою в промпт refine_site/
+   generate_product_card_update, щоб не роздувати запит до AI (великий
+   промпт підвищує шанс таймауту/порожньої відповіді від безкоштовної
+   моделі). _generate_with_retry() додає локальний повторний виклик
+   ai_service.generate_json, якщо той повернув None (а не лише коли
+   кинув виняток) — раніше такі випадки одразу призводили до провалу
+   генерації сайту з першої ж невдалої спроби.
 
 Публічні сигнатури старих функцій (fetch_source_reference,
 generate_landing_from_scratch, generate_clone_redesign, refine_site,
 slugify) НЕ змінені.
 """
 
+import asyncio
 import logging
 import re
 
@@ -33,6 +42,24 @@ MAX_SOURCE_HTML_CHARS = 12000
 MAX_FILES = 15
 MAX_FILE_CHARS = 40000
 MAX_TOTAL_CHARS = 250000
+
+# НОВЕ: обмеження на вміст файлів, які вставляються у ВХІДНИЙ промпт
+# (refine_site / generate_product_card_update). Це окреме, менше
+# обмеження від MAX_FILE_CHARS вище (те стосується файлів, які AI
+# ПОВЕРТАЄ у відповіді). Мета — не давати моделі занадто великий
+# контекст, бо це і сповільнює генерацію, і збільшує шанс таймауту чи
+# порожньої/обрізаної відповіді від безкоштовної моделі.
+MAX_INPUT_FILE_CHARS = 15000
+MAX_INPUT_TOTAL_CHARS = 45000
+
+# НОВЕ: скільки разів локально повторити виклик ai_service.generate_json,
+# якщо той повернув None (наприклад через таймаут або порожню відповідь
+# моделі, яку ai_service вже не зміг розпарсити навіть у текстовому
+# fallback-режимі). Це саме локальний retry поверх того, що вже є
+# всередині ai_service — тут ми просто пробуємо ще раз, а не одразу
+# показуємо користувачу помилку.
+_GENERATE_RETRIES = 2
+_GENERATE_RETRY_DELAY_SEC = 2
 
 _ALLOWED_EXT = {".html", ".css", ".js", ".json", ".svg", ".txt", ".md"}
 
@@ -81,6 +108,60 @@ def _parse_site_response(data: dict | None) -> dict | None:
     }
 
 
+def _build_files_block(current_files: dict[str, str]) -> str:
+    """Формує текстовий блок з поточними файлами сайту для вставки в
+    промпт, обрізаючи занадто великі файли, щоб не роздувати запит до
+    AI (див. MAX_INPUT_FILE_CHARS / MAX_INPUT_TOTAL_CHARS вище)."""
+    parts: list[str] = []
+    total_chars = 0
+    for path, content in current_files.items():
+        if total_chars >= MAX_INPUT_TOTAL_CHARS:
+            parts.append(f"### {path}\n```\n[файл пропущено — досягнуто ліміту розміру промпту]\n```")
+            continue
+        text = content or ""
+        truncated = len(text) > MAX_INPUT_FILE_CHARS
+        text = text[:MAX_INPUT_FILE_CHARS]
+        if truncated:
+            text += "\n/* ...обрізано, файл довший... */"
+        total_chars += len(text)
+        parts.append(f"### {path}\n```\n{text}\n```")
+    return "\n\n".join(parts)
+
+
+async def _generate_with_retry(prompt: str, temperature: float, retries: int = _GENERATE_RETRIES) -> dict | None:
+    """Обгортка над ai_service.generate_json з локальним повторним
+    викликом, якщо результат порожній (None). ai_service сам вміє
+    ретраїти окремий HTTP-запит, але якщо ВСІ його спроби провалились
+    (таймаут / порожня відповідь моделі навіть у текстовому fallback),
+    він повертає None — тут ми пробуємо запустити генерацію ще раз
+    з нуля, замість того щоб одразу здаватись."""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            data = await ai_service.generate_json(prompt, temperature=temperature)
+        except Exception as e:
+            last_error = e
+            logger.exception(
+                "website_builder_service: ai_service.generate_json кинув виняток (спроба=%s/%s)",
+                attempt, retries,
+            )
+            data = None
+
+        if data:
+            return data
+
+        logger.warning(
+            "website_builder_service: генерація повернула порожній результат (спроба=%s/%s)",
+            attempt, retries,
+        )
+        if attempt < retries:
+            await asyncio.sleep(_GENERATE_RETRY_DELAY_SEC)
+
+    if last_error:
+        logger.error("website_builder_service: усі спроби генерації провалились: %s", last_error)
+    return None
+
+
 _RESPONSE_FORMAT_RULES = """
 Поверни ВИКЛЮЧНО JSON без жодного тексту навколо, без markdown-розмітки, у форматі:
 {
@@ -93,35 +174,34 @@ _RESPONSE_FORMAT_RULES = """
     "script.js": "повний вміст файлу"
   }
 }
-Правила для самих файлів:
-- Чистий HTML/CSS/JS, БЕЗ збірки (без React/Vue/webpack) — файли мають одразу
-  відкриватись у браузері й коректно працювати на статичному хостингу (Netlify/GitHub Pages).
-- Обов'язково зроби index.html повністю адаптивним (мобільна версія теж).
-- Максимум 6 файлів. Стилі — окремим style.css, скрипти — окремим script.js
-  (підключені через <link>/<script src="">), inline лише по мінімуму.
-- Семантичний HTML, сучасний, охайний дизайн (нормальні відступи, читабельна типографіка).
+Правила для файлів: чистий HTML/CSS/JS без збірки (без React/Vue/webpack) —
+одразу відкриваються в браузері й працюють на статичному хостингу
+(Netlify/GitHub Pages). index.html — повністю адаптивний (і мобільна версія).
+Максимум 6 файлів. Стилі окремим style.css, скрипти окремим script.js
+(підключені через <link>/<script src="">), inline лише по мінімуму.
+Семантичний HTML, охайний сучасний дизайн.
 """
 
 # НОВЕ: інструкція про форму замовлення. __SITE_ID__ — плейсхолдер,
 # підміняється в handlers/website_builder.py одразу після першого
 # збереження сайту в БД (коли з'являється реальний db_id).
 _ORDER_FORM_RULES = f"""
-Обов'язково додай на сторінку форму замовлення (наприклад секцію "Замовити"
-або кнопку "Купити" біля кожного товару, що відкриває форму) з полями:
-ім'я (name), телефон (phone), товар (product — якщо товарів кілька, підстав
-назву конкретного товару як значення за замовчуванням або приховане поле),
-коментар (comment, необов'язкове).
+Додай на сторінку форму замовлення (секція "Замовити" або кнопка "Купити"
+біля товару, що відкриває форму) з полями: ім'я (name), телефон (phone),
+товар (product — якщо товарів кілька, підстав назву конкретного товару як
+значення за замовчуванням або приховане поле), коментар (comment,
+необов'язкове).
 
-Форма НЕ повинна перезавантажувати сторінку. Додай у script.js обробник, що
-при відправці робить:
+Форма не повинна перезавантажувати сторінку. У script.js додай обробник,
+що при відправці робить:
 fetch("{ORDER_WEBHOOK_BASE_URL}/order/__SITE_ID__", {{
   method: "POST",
   headers: {{"Content-Type": "application/json"}},
   body: JSON.stringify({{name, phone, product, comment}})
 }})
-і показує користувачу повідомлення про успішне надсилання (просто текст на
-сторінці, без alert()). __SITE_ID__ лишай ЯК Є буквально в коді (це
-плейсхолдер, який підставить сервер) — НЕ вигадуй замість нього значення.
+і показує повідомлення про успішне надсилання (текст на сторінці, без
+alert()). __SITE_ID__ лишай буквально як є (плейсхолдер підставить
+сервер) — не вигадуй замість нього значення.
 """
 
 
@@ -152,7 +232,7 @@ async def generate_landing_from_scratch(description: str) -> dict | None:
 якщо не вказано явно — сучасний, преміальний, з акуратною типографікою).
 {_RESPONSE_FORMAT_RULES}
 {_ORDER_FORM_RULES}"""
-    data = await ai_service.generate_json(prompt, temperature=0.6)
+    data = await _generate_with_retry(prompt, temperature=0.6)
     return _parse_site_response(data)
 
 
@@ -179,14 +259,12 @@ async def generate_clone_redesign(source_ref: dict, description: str) -> dict | 
 
 {_RESPONSE_FORMAT_RULES}
 {_ORDER_FORM_RULES}"""
-    data = await ai_service.generate_json(prompt, temperature=0.6)
+    data = await _generate_with_retry(prompt, temperature=0.6)
     return _parse_site_response(data)
 
 
 async def refine_site(current_files: dict[str, str], instruction: str) -> dict | None:
-    files_block = "\n\n".join(
-        f"### {path}\n```\n{content}\n```" for path, content in current_files.items()
-    )
+    files_block = _build_files_block(current_files)
     prompt = f"""Ти — AI-розробник, що вносить правки в уже готовий сайт (HTML/CSS/JS). Відповідай українською (крім самого коду).
 
 Поточний вміст сайту:
@@ -201,7 +279,7 @@ async def refine_site(current_files: dict[str, str], instruction: str) -> dict |
 сайті вже є форма замовлення зі скриптом fetch(...) — НЕ видаляй і не ламай її,
 навіть якщо завдання користувача її прямо не стосується.
 {_RESPONSE_FORMAT_RULES}"""
-    data = await ai_service.generate_json(prompt, temperature=0.4)
+    data = await _generate_with_retry(prompt, temperature=0.4)
     result = _parse_site_response(data)
     if result and not result.get("site_name"):
         result["site_name"] = None
@@ -218,9 +296,7 @@ async def generate_product_card_update(
     """Додає картку товару на вже готовий сайт. На відміну від refine_site
     тут завдання ЖОРСТКО обмежене — тільки додати картку з переданими
     даними, нічого іншого на сайті не міняти."""
-    files_block = "\n\n".join(
-        f"### {path}\n```\n{content}\n```" for path, content in current_files.items()
-    )
+    files_block = _build_files_block(current_files)
     price_text = f"{product['price_uah']:.0f} грн" if product.get("price_uah") else "ціну уточнити"
     prompt = f"""Ти — AI-розробник, що додає ОДНУ нову картку товару в каталог/сітку товарів
 на вже готовому сайті (HTML/CSS/JS). Відповідай українською (крім самого коду).
@@ -248,7 +324,7 @@ async def generate_product_card_update(
 
 Поверни ПОВНИЙ оновлений набір файлів (усі файли сайту, не тільки змінені).
 {_RESPONSE_FORMAT_RULES}"""
-    data = await ai_service.generate_json(prompt, temperature=0.3)
+    data = await _generate_with_retry(prompt, temperature=0.3)
     result = _parse_site_response(data)
     if result and not result.get("site_name"):
         result["site_name"] = None
