@@ -707,3 +707,42 @@ async def generate_cover_letter(vacancy: dict, profile: dict) -> str | None:
 і вимоги вакансії. Поверни ЛИШЕ текст листа."""
 
     return await ai_service.generate_text(prompt, temperature=0.6)
+
+# додати в кінець services/jobs_service.py
+
+# =========================================================
+# НОВЕ: 📨 Автоматична подача заявки (extension point)
+# =========================================================
+
+# Джерела, для яких технічно РЕАЛІЗОВАНА автоматична подача заявки.
+# Наразі — ЖОДНОГО: у Djinni/DOU/Work.ua/Robota.ua немає публічного API
+# подачі заявок, а форми на сайтах захищені логіном/JS-рендером/антиботом.
+# Обходити ці захисти заборонено (див. handlers/jobs.py._apply_send_final),
+# тому цей словник — єдине місце, куди в майбутньому додається реальна
+# інтеграція (напр. {"Djinni": _apply_via_djinni_api}), коли/якщо вона
+# з'явиться. Доки джерела нема тут — flow в handlers/jobs.py завжди чесно
+# падає в ручний режим (відкрити вакансію + скопіювати cover letter).
+_AUTO_APPLY_HANDLERS: dict = {}
+
+
+async def attempt_auto_apply(vacancy: dict, cover_letter: str) -> dict:
+    """Пробує автоматично подати заявку на вакансію, ЯКЩО для її джерела
+    є зареєстрований обробник у _AUTO_APPLY_HANDLERS. Повертає:
+    {"success": True/False, "reason": str}
+
+    ВАЖЛИВО: якщо success=False через reason="unsupported" — це означає
+    "сайт технічно не дозволяє автоматичну подачу", а НЕ помилку. Той, хто
+    викликає цю функцію, повинен у цьому випадку перейти в ручний режим
+    (показати cover letter + посилання на вакансію), а НЕ намагатися
+    обійти захист сайту."""
+    sources = vacancy.get("sources") or [vacancy.get("source", "")]
+    for source in sources:
+        handler = _AUTO_APPLY_HANDLERS.get(source)
+        if handler:
+            try:
+                return await handler(vacancy, cover_letter)
+            except Exception:
+                logger.exception("Auto-apply handler crashed for source=%s", source)
+                return {"success": False, "reason": "error"}
+
+    return {"success": False, "reason": "unsupported"}

@@ -1,31 +1,35 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/jobs.py
 
-Три виправлення:
+Додано флоу "📨 Відгукнутися" з ОБОВ'ЯЗКОВИМ подвійним підтвердженням
+(пункти 1-6 ТЗ):
 
-1. У прев'ю "🎯 Найкращі для тебе" (топ-3) тепер додається посилання на
-   кожну вакансію — раніше там була тільки назва й Match%, без url.
+1. jb_apply_start:{idx}    — AI готує Cover Letter (services.jobs_service.
+   generate_cover_letter) + короткий match-аналіз (з уже наявного
+   score_vacancy). Показує вакансію+компанію+Match%+аналіз+Cover Letter
+   з кнопками "Відправити відгук"/"Змінити Cover Letter"/
+   "Згенерувати заново"/"Скасувати".
+2. jb_edit_cover:{idx}     — переводить у стан очікування нового тексту
+   Cover Letter від користувача (JobApply.editing_cover_letter).
+3. jb_regen_cover:{idx}    — повторний виклик generate_cover_letter.
+4. jb_send_confirm:{idx}   — ДРУГЕ (фінальне) підтвердження: "Готово до
+   відправлення? Вакансія: X Компанія: Y" + "Так, відправити"/"Скасувати".
+5. jb_send_final:{idx}     — ЛИШЕ після цього натискання бот намагається
+   щось відправити. Спочатку jobs_service.attempt_auto_apply() — якщо
+   конкретний сайт технічно підтримує автоподачу (наразі ЖОДЕН не
+   підтримує, див. jobs_service._AUTO_APPLY_HANDLERS). Якщо ні —
+   ЧЕСНО показує це користувачу, дає посилання на вакансію й Cover
+   Letter для ручного копіювання (ikb_apply_manual), БЕЗ спроб обійти
+   CAPTCHA/антибот.
+6. jb_mark_applied:{idx}   — користувач сам підтверджує, що подав заявку
+   вручну; тоді і тільки тоді статус вакансії позначається "applied"
+   (database.jobs.mark_applied).
 
-2. "Match None%": v['_score'].get('match_percent', '?') підставляє
-   дефолт '?' ЛИШЕ якщо ключа немає в словнику — а ключ там Є, просто
-   зі значенням None (коли профіль не заповнений, score_vacancy() чесно
-   повертає match_percent=None). Тепер явна перевірка на None замість
-   покладання на .get()-дефолт.
+У ЖОДНОМУ з цих кроків заявка/Cover Letter не йде роботодавцю без явного
+натискання "✅ Так, відправити" на кроці 4.
 
-3. КРИТИЧНЕ: додано екранування Markdown-спецсимволів (_, *, `, [) у
-   ВСІХ полях, що приходять із зовнішніх джерел (назва вакансії,
-   компанія, локація, зарплата, досвід, AI-текст аналізу/cover letter).
-   Без цього непередбачуваний підкреслення/зірочка в реальній назві
-   вакансії чи описі ламає Markdown-парсинг усього повідомлення —
-   Telegram кидає TelegramBadRequest, він ніде не ловиться локально й
-   вилітає до зовнішнього except Exception в _run_search(), показуючи
-   користувачу загальне "Сталася помилка під час пошуку вакансій" уже
-   ПІСЛЯ того, як частина результатів встигла показатись. Додатково
-   для картки вакансії й топ-3 введено safe-фолбек: якщо навіть після
-   екранування Telegram не зміг розпарсити повідомлення — воно
-   надсилається повторно вже БЕЗ форматування, а не губиться зовсім.
-
-Решта файлу — без змін.
+Решта файлу (пошук, картки вакансій, фільтри, статистика, стара
+✉️ Cover Letter кнопка jb_cover) — БЕЗ ЗМІН.
 """
 
 import logging
@@ -46,6 +50,7 @@ from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.jobs import (
     ikb_vacancy_card, ikb_not_interested_reasons, ikb_filters_menu,
     ikb_saved_item, ikb_watch_item, ikb_empty_search,
+    ikb_apply_review, ikb_apply_final_confirm, ikb_apply_manual,
 )
 from handlers.common import require_auth
 
@@ -56,17 +61,22 @@ _results_cache: dict[int, list[dict]] = {}
 _criteria_cache: dict[int, dict] = {}
 _position_cache: dict[int, int] = {}
 
+# НОВЕ: uid -> {"idx": int, "vacancy": dict, "cover_letter": str}
+# Живе в пам'яті процесу на час флоу "📨 Відгукнутися" — так само, як
+# _results_cache/_criteria_cache/_position_cache для решти фічі.
+_apply_cache: dict[int, dict] = {}
+
 
 class JobSearch(StatesGroup):
     waiting_query = State()
 
 
+class JobApply(StatesGroup):
+    editing_cover_letter = State()
+
+
 _WORK_FORMAT_LABELS = {"remote": "Remote", "office": "Офіс", "hybrid": "Гібрид"}
 
-# НОВЕ: екранування Markdown-спецсимволів для будь-якого зовнішнього/сирого
-# тексту (назви вакансій, компанії, описи зі скрапінгу, AI-текст) —
-# інакше непарний "_" чи "*" у реальних даних ламає весь Markdown-парсинг
-# повідомлення в Telegram.
 _MD_SPECIAL_RE = re.compile(r"([_*`\[])")
 
 
@@ -77,18 +87,11 @@ def _md_escape(value) -> str:
 
 
 def _fmt_match_line(score: dict) -> str:
-    """ЗМІНЕНО: явна перевірка на None замість .get(key, '?') — інакше
-    коли ключ ІСНУЄ зі значенням None (профіль не заповнений), .get()
-    повертає саме None, а не дефолт '?', і в повідомленні з'являється
-    буквально "Match None%"."""
     mp = score.get("match_percent")
     return f"Match {mp}%" if mp is not None else "Match: н/д (заповни профіль)"
 
 
 async def _answer_safe(target: Message, text: str, **kwargs) -> Message:
-    """Надсилає повідомлення; якщо Telegram не зміг розпарсити Markdown
-    (навіть після екранування — напр. якщо десь пропустили поле), не
-    падає з помилкою на весь пошук, а повторює без форматування."""
     try:
         return await target.answer(text, **kwargs)
     except TelegramBadRequest:
@@ -121,9 +124,6 @@ def _fmt_vacancy_card(v: dict, total_shown: int, position: int) -> str:
 
     sources = v.get("sources") or [v.get("source", "")]
     lines.append(f"\n🌐 Джерело: {_md_escape(' · '.join(s for s in sources if s))}")
-    # URL навмисно НЕ екранується — це просто посилання, Telegram сам
-    # підсвітить його як клікабельне, а екранування підкреслень у ньому
-    # додало б видимі зворотні слеші прямо в лінк.
     lines.append(f"🔗 {v.get('url','')}")
 
     if score.get("advice"):
@@ -189,9 +189,6 @@ async def _run_search_inner(msg: Message, uid: int, query_text: str):
     _results_cache[uid] = scored
     _position_cache[uid] = 0
 
-    # ЗМІНЕНО: додано посилання на кожну вакансію (v.get("url")) і
-    # виправлено формування рядка Match через _fmt_match_line() замість
-    # .get(key, '?'), а назва — через _md_escape().
     top3 = "\n\n".join(
         f"{i+1}. {_md_escape(v.get('title',''))} — {_fmt_match_line(v['_score'])}\n🔗 {v.get('url','')}"
         for i, v in enumerate(scored[:3])
@@ -309,9 +306,6 @@ async def jobs_analyze_cb(cb: CallbackQuery):
         if not analysis:
             return await _safe_edit(wait_msg, AI_ERROR_TEXT)
 
-        # ЗМІНЕНО: назва вакансії й текст аналізу екрановані — обидва
-        # можуть містити скраплений/AI-згенерований текст із символами,
-        # що ламають Markdown.
         await _safe_edit(
             wait_msg,
             f"🤖 *AI аналіз вакансії*\n*{_md_escape(v.get('title',''))}*\n\n{_md_escape(analysis)}",
@@ -343,6 +337,9 @@ async def jobs_reason_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("jb_cover:"))
 async def jobs_cover_cb(cb: CallbackQuery):
+    """Стара, легка дія — просто показати Cover Letter із кнопкою
+    копіювання, без флоу відправки. Залишена БЕЗ ЗМІН — нова кнопка
+    "📨 Відгукнутися" (jb_apply_start) це не замінює, а доповнює."""
     uid = cb.from_user.id
     idx = int(cb.data.split(":", 1)[1])
     results = _results_cache.get(uid) or []
@@ -372,8 +369,6 @@ async def jobs_cover_cb(cb: CallbackQuery):
         InlineKeyboardButton(text="🔄 Перегенерувати", callback_data=f"jb_cover:{idx}"),
         InlineKeyboardButton(text="📋 Скопіювати", callback_data=f"jb_copy_noop"),
     ]])
-    # ЗМІНЕНО: letter екранований — це AI-текст, який може містити
-    # довільні символи з вимог вакансії, процитовані дослівно.
     await _answer_safe(cb.message, f"✉️ *Cover Letter:*\n\n{_md_escape(letter)}", reply_markup=kb)
 
 
@@ -437,7 +432,6 @@ async def jobs_saved_list(msg: Message, state: FSMContext):
 
     for v in saved:
         status = v.get("status", "saved")
-        # ЗМІНЕНО: назва/компанія екрановані.
         text = (
             f"⭐ *{_md_escape(v.get('title',''))}*\n🏢 {_md_escape(v.get('company')) or '—'}\n"
             f"📌 Статус: {status}\n🔗 {v.get('url','')}"
@@ -479,8 +473,6 @@ async def jobs_watches_list(msg: Message, state: FSMContext):
         criteria = w.get("criteria", {})
         active = w.get("active", True)
         status_icon = "🔔" if active else "🔕"
-        # ЗМІНЕНО: значення з criteria (profession/city — можуть містити
-        # довільний текст із запиту користувача) тепер екрановані.
         text = f"{status_icon} {_md_escape(criteria.get('profession',''))} | {_md_escape(criteria.get('city')) or 'будь-де'}"
         await _answer_safe(msg, text, reply_markup=ikb_watch_item(str(w["_id"]), active))
 
@@ -532,3 +524,242 @@ async def jobs_stats(msg: Message, state: FSMContext):
         lines += [f"• {_md_escape(c)} ({n})" for c, n in stats["top_companies"]]
 
     await _answer_safe(msg, "\n".join(lines))
+
+
+# =========================================================
+# НОВЕ: 📨 Відгукнутися — флоу з двома підтвердженнями
+# =========================================================
+
+def _fmt_apply_review(vacancy: dict, cover_letter: str) -> str:
+    score = vacancy.get("_score") or {}
+    lines = [
+        f"💼 *{_md_escape(vacancy.get('title',''))}*",
+        f"🏢 {_md_escape(vacancy.get('company')) or '—'}",
+    ]
+    if score.get("match_percent") is not None:
+        lines.append(f"🎯 Match: *{score['match_percent']}%*")
+    if score.get("advice"):
+        lines.append(f"\n🤖 *Короткий аналіз:* {_md_escape(score['advice'])}")
+    fits = score.get("fits") or []
+    if fits:
+        lines.append(f"🟢 Підходить: {_md_escape(', '.join(fits[:4]))}")
+    lines.append(f"\n✉️ *Cover Letter:*\n{_md_escape(cover_letter)}")
+    return "\n".join(lines)
+
+
+async def _show_apply_review(target: Message, idx: int, vacancy: dict, cover_letter: str) -> None:
+    await _answer_safe(
+        target, _fmt_apply_review(vacancy, cover_letter), reply_markup=ikb_apply_review(idx)
+    )
+
+
+@router.callback_query(F.data.startswith("jb_apply_start:"))
+async def jobs_apply_start_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    results = _results_cache.get(uid) or []
+    if idx >= len(results):
+        return await cb.answer("Застаріло", show_alert=True)
+
+    profile = await job_profile_db.get_profile(uid)
+    if not profile:
+        await cb.answer()
+        return await cb.message.answer(
+            "⚠️ Спочатку заповни «👤 Мої дані для пошуку» — без цього я не зможу підготувати "
+            "персональний Cover Letter для відгуку."
+        )
+
+    if not jobs_service.ai_service.is_available():
+        await cb.answer()
+        return await cb.message.answer(AI_ERROR_TEXT)
+
+    await cb.answer()
+    wait = await cb.message.answer("🤖 Готую Cover Letter і аналіз вакансії перед відгуком...")
+
+    v = results[idx]
+    try:
+        if v.get("_score") is None:
+            v["_score"] = await jobs_service.score_vacancy(v, profile)
+        letter = await jobs_service.generate_cover_letter(v, profile)
+    except Exception:
+        logger.exception("Apply-flow prep crashed for uid=%s idx=%s", uid, idx)
+        letter = None
+
+    if not letter:
+        return await _safe_edit(wait, AI_ERROR_TEXT)
+
+    _apply_cache[uid] = {"idx": idx, "vacancy": v, "cover_letter": letter}
+
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    await _show_apply_review(cb.message, idx, v, letter)
+
+
+@router.callback_query(F.data.startswith("jb_regen_cover:"))
+async def jobs_apply_regen_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    profile = await job_profile_db.get_profile(uid)
+    await cb.answer("Перегенеровую...")
+
+    try:
+        letter = await jobs_service.generate_cover_letter(apply_state["vacancy"], profile)
+    except Exception:
+        logger.exception("Cover letter regen crashed for uid=%s idx=%s", uid, idx)
+        letter = None
+
+    if not letter:
+        return await cb.message.answer(AI_ERROR_TEXT)
+
+    apply_state["cover_letter"] = letter
+    await _show_apply_review(cb.message, idx, apply_state["vacancy"], letter)
+
+
+@router.callback_query(F.data.startswith("jb_edit_cover:"))
+async def jobs_apply_edit_start_cb(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    await cb.answer()
+    await state.set_state(JobApply.editing_cover_letter)
+    await state.update_data(apply_idx=idx)
+    await cb.message.answer(
+        "✏️ Надішли новий текст Cover Letter (повністю, він замінить поточний):",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(JobApply.editing_cover_letter, F.text == "❌ Скасувати")
+async def jobs_apply_edit_cancel(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("apply_idx")
+    await state.clear()
+    uid = msg.from_user.id
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await msg.answer("Скасовано.", reply_markup=kb_main())
+    await msg.answer("Скасовано, залишаю попередній текст.")
+    await _show_apply_review(msg, idx, apply_state["vacancy"], apply_state["cover_letter"])
+
+
+@router.message(JobApply.editing_cover_letter)
+async def jobs_apply_edit_apply(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("apply_idx")
+    await state.clear()
+    uid = msg.from_user.id
+
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+
+    new_text = (msg.text or "").strip()
+    if not new_text:
+        await state.set_state(JobApply.editing_cover_letter)
+        await state.update_data(apply_idx=idx)
+        return await msg.answer("⚠️ Текст не може бути порожнім. Надішли текст Cover Letter:")
+
+    apply_state["cover_letter"] = new_text
+    await _show_apply_review(msg, idx, apply_state["vacancy"], new_text)
+
+
+@router.callback_query(F.data.startswith("jb_send_confirm:"))
+async def jobs_apply_send_confirm_cb(cb: CallbackQuery):
+    """ПЕРШЕ підтвердження пройдено (Cover Letter затверджено). Показуємо
+    ДРУГЕ, фінальне підтвердження — саме тут, а не раніше, користувач
+    остаточно вирішує, чи відправляти заявку."""
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    v = apply_state["vacancy"]
+    await cb.answer()
+    await cb.message.answer(
+        "❓ *Готово до відправлення?*\n\n"
+        f"Вакансія: {_md_escape(v.get('title',''))}\n"
+        f"Компанія: {_md_escape(v.get('company')) or '—'}\n\n"
+        "Відправити заявку?",
+        reply_markup=ikb_apply_final_confirm(idx),
+    )
+
+
+@router.callback_query(F.data.startswith("jb_send_final:"))
+async def jobs_apply_send_final_cb(cb: CallbackQuery):
+    """ЛИШЕ тут (після другого підтвердження) бот може щось фактично
+    відправити. Спершу пробує jobs_service.attempt_auto_apply — якщо
+    джерело вакансії технічно підтримує автоподачу. Якщо ні (наразі —
+    завжди так, жоден job-борд у стеку цього не підтримує) — чесно
+    повідомляє про це й переходить у РУЧНИЙ режим: посилання на вакансію
+    + Cover Letter для копіювання, БЕЗ спроб обійти захист сайту."""
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    v = apply_state["vacancy"]
+    letter = apply_state["cover_letter"]
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Перевіряю можливість автоматичної подачі...")
+
+    try:
+        result = await jobs_service.attempt_auto_apply(v, letter)
+    except Exception:
+        logger.exception("attempt_auto_apply crashed for uid=%s idx=%s", uid, idx)
+        result = {"success": False, "reason": "error"}
+
+    if result.get("success"):
+        await jobs_db.mark_applied(uid, v)
+        _apply_cache.pop(uid, None)
+        return await _safe_edit(
+            wait,
+            f"✅ Заявку відправлено автоматично!\n💼 {_md_escape(v.get('title',''))}",
+        )
+
+    # Автоподача недоступна для цього сайту — ручний режим.
+    await _safe_edit(
+        wait,
+        "ℹ️ Автоматична подача заявки на цьому сайті наразі технічно неможлива "
+        "(немає публічного API / форма захищена від ботів).\n\n"
+        "Відкрий вакансію за посиланням нижче, скопіюй Cover Letter і надішли "
+        "заявку вручну. Коли зробиш це — натисни «Я відгукнувся вручну».",
+    )
+    await cb.message.answer(
+        f"✉️ *Cover Letter для копіювання:*\n\n{_md_escape(letter)}",
+        reply_markup=ikb_apply_manual(idx, v.get("url", "")),
+    )
+
+
+@router.callback_query(F.data.startswith("jb_mark_applied:"))
+async def jobs_apply_mark_manual_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split(":", 1)[1])
+    apply_state = _apply_cache.get(uid)
+    if not apply_state or apply_state["idx"] != idx:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+
+    await jobs_db.mark_applied(uid, apply_state["vacancy"])
+    _apply_cache.pop(uid, None)
+    await cb.answer("Позначено як 'Відгукнувся' ✅", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("jb_apply_cancel:"))
+async def jobs_apply_cancel_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    _apply_cache.pop(uid, None)
+    await cb.answer("Скасовано")
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass

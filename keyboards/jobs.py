@@ -1,3 +1,20 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: keyboards/jobs.py
+
+Додано клавіатури для флоу "📨 Відгукнутися" з двома підтвердженнями:
+- ikb_vacancy_card(): додано кнопку "📨 Відгукнутися" (jb_apply_start:{idx}).
+- ikb_apply_review(): перший екран (cover letter + аналіз) — "Відправити
+  відгук" / "Змінити Cover Letter" / "Згенерувати заново" / "Скасувати".
+- ikb_apply_final_confirm(): друге, фінальне підтвердження перед
+  фактичною відправкою — "Так, відправити" / "Скасувати".
+- ikb_apply_manual(): якщо автоматична подача на конкретному сайті
+  технічно неможлива (наразі — завжди, див. services/jobs_service.
+  attempt_auto_apply) — кнопка відкрити вакансію вручну + позначити
+  "відгукнувся" самостійно.
+
+Решта функцій файлу — без змін.
+"""
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 STATUS_ORDER = ["saved", "applied", "response", "interview", "hired", "rejected"]
@@ -19,6 +36,7 @@ def ikb_vacancy_card(idx: int, url: str, saved: bool = False) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Відкрити вакансію", url=url)],
         [InlineKeyboardButton(text="🤖 AI аналіз", callback_data=f"jb_analyze:{idx}"), save_btn],
+        [InlineKeyboardButton(text="📨 Відгукнутися", callback_data=f"jb_apply_start:{idx}")],
         [InlineKeyboardButton(text="✉️ Cover Letter", callback_data=f"jb_cover:{idx}")],
         [InlineKeyboardButton(text="❌ Не показувати такі", callback_data=f"jb_notint:{idx}")],
         [InlineKeyboardButton(text="➡️ Наступна", callback_data="jb_next")],
@@ -60,8 +78,6 @@ def ikb_search_result_header() -> InlineKeyboardMarkup:
 
 
 def ikb_empty_search() -> InlineKeyboardMarkup:
-    """Показується, коли пошук не дав жодного результату — дозволяє
-    зберегти критерії як автопошук (🔔) замість того, щоб просто здатися."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Зберегти пошук і чекати нових", callback_data="jb_watch_empty")],
     ])
@@ -86,3 +102,32 @@ def ikb_watch_item(watch_id: str, active: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb),
         InlineKeyboardButton(text="🗑 Видалити", callback_data=f"jbw_del:{watch_id}"),
     ]])
+
+
+# =========================================================
+# НОВЕ: 📨 Відгукнутися — флоу з двома підтвердженнями
+# =========================================================
+
+def ikb_apply_review(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Відправити відгук", callback_data=f"jb_send_confirm:{idx}")],
+        [
+            InlineKeyboardButton(text="✏️ Змінити Cover Letter", callback_data=f"jb_edit_cover:{idx}"),
+            InlineKeyboardButton(text="🔄 Згенерувати заново", callback_data=f"jb_regen_cover:{idx}"),
+        ],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"jb_apply_cancel:{idx}")],
+    ])
+
+
+def ikb_apply_final_confirm(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, відправити", callback_data=f"jb_send_final:{idx}")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"jb_apply_cancel:{idx}")],
+    ])
+
+
+def ikb_apply_manual(idx: int, url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Відкрити вакансію", url=url)],
+        [InlineKeyboardButton(text="✅ Я відгукнувся вручну", callback_data=f"jb_mark_applied:{idx}")],
+    ])

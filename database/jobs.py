@@ -1,3 +1,18 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: database/jobs.py
+
+Додано:
+- save_vacancy(): новий опціональний параметр status (за замовчуванням
+  "saved", як і раніше — старі виклики save_vacancy(uid, vacancy) без
+  status поводяться ІДЕНТИЧНО попередній версії).
+- mark_applied(): позначає вакансію як "applied" — якщо вона вже була
+  збережена раніше, просто оновлює статус; якщо ще ні, зберігає одразу
+  зі статусом "applied". Використовується в handlers/jobs.py після
+  фактичної (авто- або підтвердженої вручну) подачі заявки.
+
+Решта функцій — без змін.
+"""
+
 from datetime import datetime
 from collections import Counter
 
@@ -6,7 +21,7 @@ from bson import ObjectId
 from database.mongo import job_saved_col, job_searches_col, job_feedback_col, db_call
 
 
-async def save_vacancy(uid: int, vacancy: dict) -> str:
+async def save_vacancy(uid: int, vacancy: dict, status: str = "saved") -> str:
     doc = {
         "uid": uid,
         "title": vacancy.get("title"),
@@ -19,7 +34,7 @@ async def save_vacancy(uid: int, vacancy: dict) -> str:
         "sources": vacancy.get("sources") or [vacancy.get("source")],
         "match_percent": vacancy.get("match_percent"),
         "cover_letter": vacancy.get("cover_letter"),
-        "status": "saved",
+        "status": status,
         "saved_at": datetime.now().isoformat(),
     }
     result = await db_call(job_saved_col.insert_one(doc))
@@ -139,3 +154,21 @@ async def get_stats(uid: int) -> dict:
         "top_companies": companies.most_common(3),
         "top_titles": professions.most_common(3),
     }
+
+
+# =========================================================
+# НОВЕ: 📨 Відгукнутися
+# =========================================================
+
+async def mark_applied(uid: int, vacancy: dict) -> None:
+    """Позначає вакансію як 'applied'. Якщо вона вже збережена (⭐) —
+    оновлює її статус; якщо ні — зберігає одразу зі статусом 'applied'.
+    Викликається ТІЛЬКИ після фактичної подачі заявки (автоматичної або
+    підтвердженої користувачем вручну) — ніколи заздалегідь."""
+    existing = await db_call(
+        job_saved_col.find_one({"uid": uid, "url": vacancy.get("url")}), raise_on_fail=False
+    )
+    if existing:
+        await update_status(str(existing["_id"]), uid, "applied")
+    else:
+        await save_vacancy(uid, vacancy, status="applied")
