@@ -4,6 +4,7 @@ import sys
 
 from database import orders as orders_db
 from database import websites as websites_db
+from services import order_notify_service
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -20,10 +21,6 @@ logger = logging.getLogger("tasks_bot")
 
 
 async def handle_order(request: web.Request) -> web.Response:
-    """Webhook для форм замовлення, вбудованих AI-Website-Builder-сайтами
-    (services/website_builder_service._ORDER_FORM_RULES). site_id береться
-    з шляху /order/{site_id}, тому кожен сайт шле заявки, прив'язані ЛИШЕ
-    до себе — навіть якщо кілька сайтів належать одному й тому самому uid."""
     site_id = request.match_info.get("site_id", "")
     if not site_id:
         return web.json_response({"ok": False, "error": "missing site_id"}, status=400)
@@ -33,42 +30,45 @@ async def handle_order(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
-    # CORS: форма шле fetch() з чужого домену (Netlify/GitHub Pages) на бота
     headers = {"Access-Control-Allow-Origin": "*"}
 
-    website = await websites_db.get_website_by_id_any_owner(site_id)  # див. нижче
+    website = await websites_db.get_website_by_id_any_owner(site_id)
     if not website:
         return web.json_response({"ok": False, "error": "site not found"}, status=404, headers=headers)
+
+    name = str(payload.get("name", "")).strip()[:200]
+    phone = str(payload.get("phone", "")).strip()[:50]
+    if not name or not phone:
+        return web.json_response({"ok": False, "error": "missing fields"}, status=400, headers=headers)
+
+    product = str(payload.get("product", ""))[:300]
+    comment = str(payload.get("comment", ""))[:1000]
 
     order_id = await orders_db.create_order(
         site_id=site_id,
         owner_uid=website["uid"],
         site_name=website.get("siteName", ""),
-        name=str(payload.get("name", ""))[:200],
-        phone=str(payload.get("phone", ""))[:50],
-        product=str(payload.get("product", ""))[:300],
-        comment=str(payload.get("comment", ""))[:1000],
+        name=name,
+        phone=phone,
+        product=product,
+        comment=comment,
     )
 
-    try:
-        bot = request.app["bot"]
-        text = (
-            "🛒 *Нове замовлення*\n"
-            f"🌐 Сайт: {website.get('siteName', '—')}\n"
-            f"👤 Ім'я: {payload.get('name', '—')}\n"
-            f"📞 Телефон: {payload.get('phone', '—')}\n"
-            f"📦 Товар: {payload.get('product', '—')}\n"
-            f"💬 Коментар: {payload.get('comment') or '—'}"
-        )
-        await bot.send_message(website["uid"], text)
-    except Exception:
-        logger.exception("Не вдалося надіслати сповіщення про замовлення %s", order_id)
+    bot = request.app["bot"]
+    config = await websites_db.get_notification_config(site_id)
+    order = {"name": name, "phone": phone, "product": product, "comment": comment}
 
-    return web.json_response({"ok": True, "order_id": order_id}, headers=headers)
+    delivered, error = await order_notify_service.deliver_order_notification(config, order, bot)
+    if delivered:
+        await orders_db.mark_delivered(order_id)
+    else:
+        await orders_db.mark_delivery_failed(order_id, error or "unknown_error")
+        logger.error("Не вдалося доставити замовлення %s в Telegram: %s", order_id, error)
+
+    return web.json_response({"ok": True, "order_id": order_id, "delivered": delivered}, headers=headers)
 
 
 async def handle_order_options(request: web.Request) -> web.Response:
-    """Preflight для CORS (браузер шле OPTIONS перед POST з чужого домену)."""
     return web.Response(headers={
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -152,11 +152,6 @@ def register_routers(dp: Dispatcher) -> None:
 
     dp.include_router(start.router)
     dp.include_router(tasks.router)
-    # ВАЖЛИВО: voice_task.router МАЄ бути зареєстрований ДО voice.router —
-    # у voice_task є state-специфічний обробник F.voice (тільки в стані
-    # VoiceTaskFlow.waiting_voice), а voice.router ловить F.voice без
-    # прив'язки до стану. Якщо стан не waiting_voice — voice_task пропускає
-    # повідомлення далі, і воно коректно потрапляє в voice.router як і раніше.
     dp.include_router(voice_task.router)
     dp.include_router(kitchen.router)
     dp.include_router(worktime.router)
@@ -189,11 +184,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(shop_articles.router)
     dp.include_router(posts.router)
     dp.include_router(github_deploy.router)
-    # AI Developer відкривається з картки проєкту в github_deploy.py
-    # (кнопка "aidev_open:{pid}") — тому реєструємо одразу поруч.
     dp.include_router(ai_developer.router)
-    # AI Website Builder — окрема категорія головного меню
-    # (CATEGORY_WEBSITE у keyboards/main_menu.py).
     dp.include_router(website_builder.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
