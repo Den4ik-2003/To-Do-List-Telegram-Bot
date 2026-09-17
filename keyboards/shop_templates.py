@@ -17,18 +17,6 @@ def kb_sticker_step() -> ReplyKeyboardMarkup:
     ], resize_keyboard=True)
 
 
-def kb_article_more() -> ReplyKeyboardMarkup:
-    """Клавіатура для циклу додавання/пошуку артикулів:
-    дозволяє ввести наступний артикул або завершити."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Готово")],
-            [KeyboardButton(text="❌ Скасувати")],
-        ],
-        resize_keyboard=True,
-    )
-
-
 def ikb_templates_list(shop_id: str, templates: list) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=f"📄 {t.get('name','')}", callback_data=f"tplopen:{t['_id']}")] for t in templates]
     rows.append([InlineKeyboardButton(text="➕ Додати шаблон", callback_data=f"tpladd:{shop_id}")])

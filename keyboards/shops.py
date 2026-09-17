@@ -69,6 +69,18 @@ def kb_cancel_article() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Скасувати")]], resize_keyboard=True)
 
 
+def kb_article_more() -> ReplyKeyboardMarkup:
+    """Клавіатура для циклу додавання/пошуку артикулів:
+    дозволяє одразу ввести наступний артикул або завершити сесію."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Готово")],
+            [KeyboardButton(text="❌ Скасувати")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def ikb_article_add_duplicate(shop_id: str, article_id: str) -> InlineKeyboardMarkup:
     """Клавіатура для випадку дубліката при СТАНДАЛОН-додаванні артикула
     (окремо від флоу створення поста — там своя клавіатура в keyboards/posts.py)."""
