@@ -15,6 +15,15 @@ AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
+# --- НОВЕ: резервний AI-провайдер/ключ ---
+# Якщо основний AI_API_KEY недоступний (помилка авторизації, вичерпана
+# квота, 5xx від провайдера тощо), сервіс може автоматично перейти
+# на ці резервні дані. Якщо AI_API_KEY_BACKUP не задано — резерву немає,
+# і система працює як раніше.
+AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
+AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL)
+AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", AI_MODEL)
+
 WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY") or AI_API_KEY
 WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL") or AI_BASE_URL
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-1")
