@@ -1,41 +1,33 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/jobs.py
 
-Додано флоу "📨 Відгукнутися" з ОБОВ'ЯЗКОВИМ подвійним підтвердженням
-(пункти 1-6 ТЗ):
+Додано відносно попередньої версії (флоу "📨 Відгукнутися" з подвійним
+підтвердженням — БЕЗ ЗМІН, як і раніше):
 
-1. jb_apply_start:{idx}    — AI готує Cover Letter (services.jobs_service.
-   generate_cover_letter) + короткий match-аналіз (з уже наявного
-   score_vacancy). Показує вакансію+компанію+Match%+аналіз+Cover Letter
-   з кнопками "Відправити відгук"/"Змінити Cover Letter"/
-   "Згенерувати заново"/"Скасувати".
-2. jb_edit_cover:{idx}     — переводить у стан очікування нового тексту
-   Cover Letter від користувача (JobApply.editing_cover_letter).
-3. jb_regen_cover:{idx}    — повторний виклик generate_cover_letter.
-4. jb_send_confirm:{idx}   — ДРУГЕ (фінальне) підтвердження: "Готово до
-   відправлення? Вакансія: X Компанія: Y" + "Так, відправити"/"Скасувати".
-5. jb_send_final:{idx}     — ЛИШЕ після цього натискання бот намагається
-   щось відправити. Спочатку jobs_service.attempt_auto_apply() — якщо
-   конкретний сайт технічно підтримує автоподачу (наразі ЖОДЕН не
-   підтримує, див. jobs_service._AUTO_APPLY_HANDLERS). Якщо ні —
-   ЧЕСНО показує це користувачу, дає посилання на вакансію й Cover
-   Letter для ручного копіювання (ikb_apply_manual), БЕЗ спроб обійти
-   CAPTCHA/антибот.
-6. jb_mark_applied:{idx}   — користувач сам підтверджує, що подав заявку
-   вручну; тоді і тільки тоді статус вакансії позначається "applied"
-   (database.jobs.mark_applied).
-
-У ЖОДНОМУ з цих кроків заявка/Cover Letter не йде роботодавцю без явного
-натискання "✅ Так, відправити" на кроці 4.
-
-Решта файлу (пошук, картки вакансій, фільтри, статистика, стара
-✉️ Cover Letter кнопка jb_cover) — БЕЗ ЗМІН.
+НОВЕ: 🌙 Автопошук вакансій (майстер створення + вечірній дайджест):
+1. AutosearchWizard — покроковий діалог створення автопошуку: назва →
+   посада/ключові слова → місто → формат роботи (кнопки) → досвід
+   (кнопки) → зарплата → підтвердження. Результат — jobs_db.
+   add_search_watch(uid, criteria, seen_ids=[], title=name), тобто той
+   самий механізм "watch", що вже використовувався для jb_watch/
+   jb_watch_empty (без змін), просто тепер з людською назвою і
+   структурованими критеріями замість вільного тексту.
+2. jobs_watches_list (🔔 Мої монітори вакансій) — тепер показує title
+   автопошуку (з фолбеком на criteria.profession для старих watch,
+   створених через jb_watch), і додає кнопку "➕ Створити автопошук".
+3. send_autosearch_digest(bot, uid, searches) — ПУБЛІЧНА функція,
+   викликається планувальником (scheduler/jobs_watch_jobs.py) увечері.
+   Формує текстовий підсумок по кожному активному автопошуку і пушить
+   усі знайдені за день вакансії в _results_cache[uid], надсилаючи їх
+   ТИМИ Ж інтерактивними картками (Зберегти/AI аналіз/📨 Відгукнутися),
+   що й ручний пошук — тому "📨 Відгукнутися" одразу працює і з карток
+   дайджесту, без дублювання логіки флоу відгуку.
 """
 
 import logging
 import re
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
@@ -51,6 +43,8 @@ from keyboards.jobs import (
     ikb_vacancy_card, ikb_not_interested_reasons, ikb_filters_menu,
     ikb_saved_item, ikb_watch_item, ikb_empty_search,
     ikb_apply_review, ikb_apply_final_confirm, ikb_apply_manual,
+    ikb_autosearch_list_header, ikb_autosearch_remote, ikb_autosearch_level,
+    ikb_autosearch_confirm,
 )
 from handlers.common import require_auth
 
@@ -61,9 +55,6 @@ _results_cache: dict[int, list[dict]] = {}
 _criteria_cache: dict[int, dict] = {}
 _position_cache: dict[int, int] = {}
 
-# НОВЕ: uid -> {"idx": int, "vacancy": dict, "cover_letter": str}
-# Живе в пам'яті процесу на час флоу "📨 Відгукнутися" — так само, як
-# _results_cache/_criteria_cache/_position_cache для решти фічі.
 _apply_cache: dict[int, dict] = {}
 
 
@@ -73,6 +64,15 @@ class JobSearch(StatesGroup):
 
 class JobApply(StatesGroup):
     editing_cover_letter = State()
+
+
+class AutosearchWizard(StatesGroup):
+    waiting_name = State()
+    waiting_position = State()
+    waiting_city = State()
+    waiting_remote = State()
+    waiting_level = State()
+    waiting_salary = State()
 
 
 _WORK_FORMAT_LABELS = {"remote": "Remote", "office": "Офіс", "hybrid": "Гібрид"}
@@ -461,19 +461,35 @@ async def jobs_delete_cb(cb: CallbackQuery):
             pass
 
 
+# =========================================================
+# 🔔 Мої монітори вакансій → 🌙 Мої автопошуки (розширено)
+# =========================================================
+
 @router.message(F.text == "🔔 Мої монітори вакансій")
 async def jobs_watches_list(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
     watches = await jobs_db.get_user_watches(msg.from_user.id)
-    if not watches:
-        return await msg.answer("📭 Немає активних моніторів вакансій.", reply_markup=kb_main())
+
+    intro = (
+        "🔔 *Мої автопошуки вакансій*\n\n"
+        "Кожен автопошук самостійно шукає вакансії ДВІЧІ на день (в обід і "
+        "ввечері) і надсилає підсумок увечері."
+        if watches else
+        "📭 Ще немає жодного автопошуку.\n\n"
+        "Створи перший — і я сам шукатиму для тебе двічі на день і "
+        "пришлю підсумок увечері."
+    )
+    await msg.answer(intro, reply_markup=ikb_autosearch_list_header())
 
     for w in watches:
-        criteria = w.get("criteria", {})
+        title = w.get("title") or w.get("criteria", {}).get("profession") or "Без назви"
         active = w.get("active", True)
         status_icon = "🔔" if active else "🔕"
-        text = f"{status_icon} {_md_escape(criteria.get('profession',''))} | {_md_escape(criteria.get('city')) or 'будь-де'}"
+        criteria = w.get("criteria", {})
+        subtitle_bits = [x for x in [criteria.get("city"), criteria.get("work_format")] if x]
+        subtitle = f" ({', '.join(subtitle_bits)})" if subtitle_bits else ""
+        text = f"{status_icon} *{_md_escape(title)}*{_md_escape(subtitle)}"
         await _answer_safe(msg, text, reply_markup=ikb_watch_item(str(w["_id"]), active))
 
 
@@ -527,7 +543,7 @@ async def jobs_stats(msg: Message, state: FSMContext):
 
 
 # =========================================================
-# НОВЕ: 📨 Відгукнутися — флоу з двома підтвердженнями
+# 📨 Відгукнутися — флоу з двома підтвердженнями (БЕЗ ЗМІН)
 # =========================================================
 
 def _fmt_apply_review(vacancy: dict, cover_letter: str) -> str:
@@ -674,9 +690,6 @@ async def jobs_apply_edit_apply(msg: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("jb_send_confirm:"))
 async def jobs_apply_send_confirm_cb(cb: CallbackQuery):
-    """ПЕРШЕ підтвердження пройдено (Cover Letter затверджено). Показуємо
-    ДРУГЕ, фінальне підтвердження — саме тут, а не раніше, користувач
-    остаточно вирішує, чи відправляти заявку."""
     uid = cb.from_user.id
     idx = int(cb.data.split(":", 1)[1])
     apply_state = _apply_cache.get(uid)
@@ -696,12 +709,6 @@ async def jobs_apply_send_confirm_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("jb_send_final:"))
 async def jobs_apply_send_final_cb(cb: CallbackQuery):
-    """ЛИШЕ тут (після другого підтвердження) бот може щось фактично
-    відправити. Спершу пробує jobs_service.attempt_auto_apply — якщо
-    джерело вакансії технічно підтримує автоподачу. Якщо ні (наразі —
-    завжди так, жоден job-борд у стеку цього не підтримує) — чесно
-    повідомляє про це й переходить у РУЧНИЙ режим: посилання на вакансію
-    + Cover Letter для копіювання, БЕЗ спроб обійти захист сайту."""
     uid = cb.from_user.id
     idx = int(cb.data.split(":", 1)[1])
     apply_state = _apply_cache.get(uid)
@@ -727,7 +734,6 @@ async def jobs_apply_send_final_cb(cb: CallbackQuery):
             f"✅ Заявку відправлено автоматично!\n💼 {_md_escape(v.get('title',''))}",
         )
 
-    # Автоподача недоступна для цього сайту — ручний режим.
     await _safe_edit(
         wait,
         "ℹ️ Автоматична подача заявки на цьому сайті наразі технічно неможлива "
@@ -763,3 +769,205 @@ async def jobs_apply_cancel_cb(cb: CallbackQuery):
         await cb.message.delete()
     except Exception:
         pass
+
+
+# =========================================================
+# НОВЕ: 🌙 Автопошук — майстер створення
+# =========================================================
+
+@router.callback_query(F.data == "jb_autosearch_new")
+async def autosearch_new_cb(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(AutosearchWizard.waiting_name)
+    await cb.message.answer(
+        "➕ *Новий автопошук*\n\n"
+        "Придумай коротку назву (наприклад: «Frontend Developer», "
+        "«Remote / Online робота», «Junior Developer», «Робота в Польщі»):",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(AutosearchWizard.waiting_name, F.text == "❌ Скасувати")
+@router.message(AutosearchWizard.waiting_position, F.text == "❌ Скасувати")
+@router.message(AutosearchWizard.waiting_city, F.text == "❌ Скасувати")
+@router.message(AutosearchWizard.waiting_salary, F.text == "❌ Скасувати")
+async def autosearch_wizard_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(AutosearchWizard.waiting_name)
+async def autosearch_name_received(msg: Message, state: FSMContext):
+    name = (msg.text or "").strip()[:80]
+    if not name:
+        return await msg.answer("⚠️ Назва не може бути порожньою. Спробуй ще раз:")
+    await state.update_data(name=name)
+    await state.set_state(AutosearchWizard.waiting_position)
+    await msg.answer(
+        "Яку посаду шукати? Можна кілька через кому.\n"
+        "Наприклад: «Frontend Developer, React, Junior» або «Водій категорії B»:"
+    )
+
+
+@router.message(AutosearchWizard.waiting_position)
+async def autosearch_position_received(msg: Message, state: FSMContext):
+    position = (msg.text or "").strip()[:200]
+    if not position:
+        return await msg.answer("⚠️ Напиши, будь ласка, посаду або ключові слова:")
+    await state.update_data(position=position)
+    await state.set_state(AutosearchWizard.waiting_city)
+    await msg.answer("Місто чи країна? Напиши «будь-де», якщо не важливо:")
+
+
+@router.message(AutosearchWizard.waiting_city)
+async def autosearch_city_received(msg: Message, state: FSMContext):
+    await state.update_data(city=(msg.text or "").strip()[:100])
+    await state.set_state(AutosearchWizard.waiting_remote)
+    await msg.answer("Формат роботи?", reply_markup=ikb_autosearch_remote())
+
+
+@router.message(AutosearchWizard.waiting_remote)
+@router.message(AutosearchWizard.waiting_level)
+async def autosearch_wizard_need_buttons(msg: Message):
+    await msg.answer("Будь ласка, обери варіант кнопкою вище ⬆️")
+
+
+@router.callback_query(AutosearchWizard.waiting_remote, F.data.startswith("aws_remote:"))
+async def autosearch_remote_cb(cb: CallbackQuery, state: FSMContext):
+    value = cb.data.split(":", 1)[1]
+    await state.update_data(work_format=value)
+    await state.set_state(AutosearchWizard.waiting_level)
+    await cb.answer()
+    await cb.message.answer("Рівень досвіду?", reply_markup=ikb_autosearch_level())
+
+
+@router.callback_query(AutosearchWizard.waiting_level, F.data.startswith("aws_level:"))
+async def autosearch_level_cb(cb: CallbackQuery, state: FSMContext):
+    value = cb.data.split(":", 1)[1]
+    await state.update_data(level=value)
+    await state.set_state(AutosearchWizard.waiting_salary)
+    await cb.answer()
+    await cb.message.answer(
+        "Мінімальна бажана зарплата? Напиши число (напр. 30000 або 1500$) "
+        "або «пропустити»:",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(AutosearchWizard.waiting_salary)
+async def autosearch_salary_received(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    salary_min = None
+    salary_currency = "UAH"
+    if raw.lower() not in ("пропустити", "skip", "-", ""):
+        digits = re.sub(r"[^\d]", "", raw)
+        if digits:
+            salary_min = int(digits)
+        salary_currency = "USD" if "$" in raw else "UAH"
+
+    await state.update_data(salary_min=salary_min, salary_currency=salary_currency)
+    data = await state.get_data()
+
+    criteria = jobs_service.build_criteria_from_wizard(data)
+    await state.update_data(criteria=criteria)
+    await state.set_state(None)  # далі чекаємо лише callback-підтвердження (aws_confirm/aws_cancel)
+
+    level_labels = {"no_exp": "без досвіду", "junior": "Junior", "middle": "Middle", "senior": "Senior", "any": "будь-який"}
+    format_labels = {"remote": "Remote", "office": "Офіс", "hybrid": "Гібрид", "any": "не важливо"}
+    summary = (
+        f"📋 *Перевір автопошук:*\n\n"
+        f"📝 Назва: {_md_escape(data['name'])}\n"
+        f"💼 Посада/ключові слова: {_md_escape(data['position'])}\n"
+        f"📍 Локація: {_md_escape(data.get('city') or 'будь-де')}\n"
+        f"💻 Формат: {format_labels.get(data.get('work_format', 'any'), 'не важливо')}\n"
+        f"📊 Досвід: {level_labels.get(data.get('level', 'any'), 'будь-який')}\n"
+        f"💰 Зарплата від: {salary_min if salary_min else 'не вказано'} {salary_currency if salary_min else ''}\n\n"
+        "Автопошук працюватиме двічі на день і надсилатиме підсумок увечері."
+    )
+    await _answer_safe(msg, summary, reply_markup=ikb_autosearch_confirm())
+
+
+@router.callback_query(F.data == "aws_confirm")
+async def autosearch_confirm_cb(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    criteria = data.get("criteria")
+    name = data.get("name")
+    if not criteria or not name:
+        await state.clear()
+        return await cb.answer("Сесія застаріла, почни заново", show_alert=True)
+
+    await jobs_db.add_search_watch(cb.from_user.id, criteria, seen_ids=[], title=name)
+    await state.clear()
+    await cb.answer()
+    await cb.message.answer(
+        f"✅ Автопошук «{_md_escape(name)}» створено! Шукатиму двічі на день "
+        "і надсилатиму підсумок увечері.",
+        reply_markup=kb_main(),
+    )
+
+
+@router.callback_query(F.data == "aws_cancel")
+async def autosearch_cancel_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer("Скасовано")
+    await cb.message.answer("Скасовано.", reply_markup=kb_main())
+
+
+# =========================================================
+# НОВЕ: 🌙 Вечірній дайджест — виклик з планувальника
+# =========================================================
+
+async def send_autosearch_digest(bot: Bot, uid: int, searches: list[dict]) -> None:
+    """Викликається ЛИШЕ scheduler/jobs_watch_jobs.py (run_autosearches_evening)
+    раз на день. searches: [{"title": str, "vacancies": [vacancy_with_score, ...]}, ...]
+    — по одному запису на кожен активний автопошук користувача.
+
+    Надсилає текстовий підсумок по кожному автопошуку, а потім — ТІ Ж САМІ
+    інтерактивні картки (Зберегти/AI аналіз/📨 Відгукнутися/❌ Не показувати
+    такі), що й у ручному пошуку, тому кнопка "📨 Відгукнутися" з дайджесту
+    одразу веде в уже готовий флоу з подвійним підтвердженням, без дублювання
+    логіки. Гарантовано показує хоча б одну вакансію повною карткою, якщо
+    хоч один автопошук щось знайшов за день."""
+    lines = ["🌙 *Вечірній підсумок автопошуку вакансій*\n"]
+    all_vacancies: list[dict] = []
+    seen_urls: set[str] = set()
+    any_found = False
+
+    for entry in searches:
+        title = entry["title"]
+        vacancies = entry["vacancies"]
+        if vacancies:
+            any_found = True
+            lines.append(f"🔍 *{_md_escape(title)}* — знайдено {len(vacancies)} нових вакансій")
+            for v in vacancies:
+                if v["url"] not in seen_urls:
+                    seen_urls.add(v["url"])
+                    all_vacancies.append(v)
+        else:
+            lines.append(f"🔍 *{_md_escape(title)}* — нічого нового сьогодні")
+
+    if not any_found:
+        lines.append("\nСьогодні по жодному з твоїх автопошуків нічого нового не знайшлось 😔")
+
+    text = "\n".join(lines)
+    try:
+        await bot.send_message(uid, text)
+    except TelegramBadRequest:
+        await bot.send_message(uid, text, parse_mode=None)
+
+    if not all_vacancies:
+        return
+
+    all_vacancies.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
+
+    _results_cache[uid] = all_vacancies
+    _position_cache[uid] = 0
+
+    for i, v in enumerate(all_vacancies):
+        saved = await jobs_db.is_saved(uid, v["url"])
+        card_text = _fmt_vacancy_card(v, len(all_vacancies), i)
+        kb = ikb_vacancy_card(i, v["url"], saved=saved)
+        try:
+            await bot.send_message(uid, card_text, reply_markup=kb)
+        except TelegramBadRequest:
+            await bot.send_message(uid, card_text, reply_markup=kb, parse_mode=None)

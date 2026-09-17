@@ -1,14 +1,18 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: database/jobs.py
 
-Додано:
-- save_vacancy(): новий опціональний параметр status (за замовчуванням
-  "saved", як і раніше — старі виклики save_vacancy(uid, vacancy) без
-  status поводяться ІДЕНТИЧНО попередній версії).
-- mark_applied(): позначає вакансію як "applied" — якщо вона вже була
-  збережена раніше, просто оновлює статус; якщо ще ні, зберігає одразу
-  зі статусом "applied". Використовується в handlers/jobs.py після
-  фактичної (авто- або підтвердженої вручну) подачі заявки.
+Додано відносно попередньої версії (для фічі "🌙 Автопошук вакансій"):
+- add_search_watch(): новий опціональний параметр title — людська назва
+  автопошуку (напр. "Frontend Developer", "Робота в Польщі"). Старі
+  виклики add_search_watch(uid, criteria, seen_ids) без title і далі
+  працюють ІДЕНТИЧНО — title просто буде None, і хендлер показує
+  criteria.profession як запасний варіант назви.
+- get_watch(): отримати один автопошук за id (опціонально з перевіркою
+  власника).
+- append_pending_digest() / get_and_clear_pending_digest(): накопичення
+  знайдених за день вакансій прямо в документі автопошуку — обідній
+  прогін лише додає туди знахідки, вечірній дістає й ОЧИЩАЄ (атомарно),
+  щоб сформувати єдиний вечірній підсумок без повторів.
 
 Решта функцій — без змін.
 """
@@ -17,6 +21,7 @@ from datetime import datetime
 from collections import Counter
 
 from bson import ObjectId
+from pymongo import ReturnDocument
 
 from database.mongo import job_saved_col, job_searches_col, job_feedback_col, db_call
 
@@ -75,16 +80,25 @@ async def delete_saved(saved_id, uid: int) -> bool:
     return result.deleted_count > 0
 
 
-async def add_search_watch(uid: int, criteria: dict, seen_ids: list[str]) -> str:
+async def add_search_watch(uid: int, criteria: dict, seen_ids: list[str], title: str | None = None) -> str:
     doc = {
         "uid": uid,
+        "title": title,
         "criteria": criteria,
         "seen_ids": seen_ids,
+        "pending_digest": [],
         "active": True,
         "created_at": datetime.now().isoformat(),
     }
     result = await db_call(job_searches_col.insert_one(doc))
     return str(result.inserted_id)
+
+
+async def get_watch(watch_id, uid: int | None = None) -> dict | None:
+    query = {"_id": ObjectId(watch_id)}
+    if uid is not None:
+        query["uid"] = uid
+    return await db_call(job_searches_col.find_one(query), raise_on_fail=False)
 
 
 async def get_user_watches(uid: int) -> list[dict]:
@@ -156,10 +170,6 @@ async def get_stats(uid: int) -> dict:
     }
 
 
-# =========================================================
-# НОВЕ: 📨 Відгукнутися
-# =========================================================
-
 async def mark_applied(uid: int, vacancy: dict) -> None:
     """Позначає вакансію як 'applied'. Якщо вона вже збережена (⭐) —
     оновлює її статус; якщо ні — зберігає одразу зі статусом 'applied'.
@@ -172,3 +182,54 @@ async def mark_applied(uid: int, vacancy: dict) -> None:
         await update_status(str(existing["_id"]), uid, "applied")
     else:
         await save_vacancy(uid, vacancy, status="applied")
+
+
+# =========================================================
+# НОВЕ: 🌙 Автопошук — накопичення знахідок для вечірнього дайджесту
+# =========================================================
+
+_PENDING_DIGEST_CAP = 20
+_PENDING_DIGEST_FIELDS = (
+    "id", "url", "title", "company", "location", "work_format",
+    "salary", "experience", "requirements", "source", "sources",
+)
+
+
+def _strip_vacancy_for_storage(v: dict) -> dict:
+    """Зберігаємо в pending_digest лише поля, потрібні для показу картки
+    ввечері (без _score — його рахуємо заново під час формування
+    дайджесту, бо профіль користувача міг змінитись між обідом і вечором)."""
+    return {k: v.get(k) for k in _PENDING_DIGEST_FIELDS}
+
+
+async def append_pending_digest(watch_id, vacancies: list[dict]) -> None:
+    """Додає нові вакансії в pending_digest автопошуку, дедуплікуючи по
+    url із тим, що вже там накопичено (напр. з обіднього прогону)."""
+    if not vacancies:
+        return
+    doc = await db_call(job_searches_col.find_one({"_id": ObjectId(watch_id)}), raise_on_fail=False)
+    existing = (doc or {}).get("pending_digest") or []
+    seen_urls = {v.get("url") for v in existing}
+    for v in vacancies:
+        if v.get("url") not in seen_urls:
+            existing.append(_strip_vacancy_for_storage(v))
+            seen_urls.add(v.get("url"))
+    existing = existing[-_PENDING_DIGEST_CAP:]
+    await db_call(
+        job_searches_col.update_one({"_id": ObjectId(watch_id)}, {"$set": {"pending_digest": existing}}),
+        raise_on_fail=False,
+    )
+
+
+async def get_and_clear_pending_digest(watch_id) -> list[dict]:
+    """Атомарно дістає накопичені за день вакансії й одразу очищає поле —
+    щоб наступний день не показав їх повторно у вечірньому дайджесті."""
+    doc = await db_call(
+        job_searches_col.find_one_and_update(
+            {"_id": ObjectId(watch_id)},
+            {"$set": {"pending_digest": []}},
+            return_document=ReturnDocument.BEFORE,
+        ),
+        raise_on_fail=False,
+    )
+    return (doc or {}).get("pending_digest") or []

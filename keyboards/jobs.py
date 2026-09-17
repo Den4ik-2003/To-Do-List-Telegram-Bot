@@ -1,16 +1,14 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: keyboards/jobs.py
 
-Додано клавіатури для флоу "📨 Відгукнутися" з двома підтвердженнями:
-- ikb_vacancy_card(): додано кнопку "📨 Відгукнутися" (jb_apply_start:{idx}).
-- ikb_apply_review(): перший екран (cover letter + аналіз) — "Відправити
-  відгук" / "Змінити Cover Letter" / "Згенерувати заново" / "Скасувати".
-- ikb_apply_final_confirm(): друге, фінальне підтвердження перед
-  фактичною відправкою — "Так, відправити" / "Скасувати".
-- ikb_apply_manual(): якщо автоматична подача на конкретному сайті
-  технічно неможлива (наразі — завжди, див. services/jobs_service.
-  attempt_auto_apply) — кнопка відкрити вакансію вручну + позначити
-  "відгукнувся" самостійно.
+Додано клавіатури для флоу "📨 Відгукнутися" (без змін відносно
+попередньої версії) ТА, НОВЕ, для майстра створення автопошуку
+(handlers/jobs.py AutosearchWizard):
+- ikb_autosearch_list_header(): кнопка "➕ Створити автопошук" над
+  списком "🔔 Мої монітори вакансій".
+- ikb_autosearch_remote() / ikb_autosearch_level(): вибір формату роботи
+  і рівня досвіду кнопками (замість вільного тексту).
+- ikb_autosearch_confirm(): фінальне підтвердження створення автопошуку.
 
 Решта функцій файлу — без змін.
 """
@@ -105,7 +103,7 @@ def ikb_watch_item(watch_id: str, active: bool) -> InlineKeyboardMarkup:
 
 
 # =========================================================
-# НОВЕ: 📨 Відгукнутися — флоу з двома підтвердженнями
+# 📨 Відгукнутися — флоу з двома підтвердженнями
 # =========================================================
 
 def ikb_apply_review(idx: int) -> InlineKeyboardMarkup:
@@ -130,4 +128,42 @@ def ikb_apply_manual(idx: int, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Відкрити вакансію", url=url)],
         [InlineKeyboardButton(text="✅ Я відгукнувся вручну", callback_data=f"jb_mark_applied:{idx}")],
+    ])
+
+
+# =========================================================
+# НОВЕ: 🌙 Автопошук — майстер створення
+# =========================================================
+
+def ikb_autosearch_list_header() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Створити автопошук", callback_data="jb_autosearch_new")],
+    ])
+
+
+def ikb_autosearch_remote() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Remote", callback_data="aws_remote:remote")],
+        [InlineKeyboardButton(text="🏢 Офіс", callback_data="aws_remote:office")],
+        [InlineKeyboardButton(text="🔀 Гібрид", callback_data="aws_remote:hybrid")],
+        [InlineKeyboardButton(text="🤷 Не важливо", callback_data="aws_remote:any")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="aws_cancel")],
+    ])
+
+
+def ikb_autosearch_level() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆕 Без досвіду", callback_data="aws_level:no_exp")],
+        [InlineKeyboardButton(text="🌱 Junior", callback_data="aws_level:junior")],
+        [InlineKeyboardButton(text="🌿 Middle", callback_data="aws_level:middle")],
+        [InlineKeyboardButton(text="🌳 Senior", callback_data="aws_level:senior")],
+        [InlineKeyboardButton(text="🤷 Будь-який", callback_data="aws_level:any")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="aws_cancel")],
+    ])
+
+
+def ikb_autosearch_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Створити автопошук", callback_data="aws_confirm")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="aws_cancel")],
     ])
