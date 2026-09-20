@@ -1,37 +1,4 @@
-"""
-services/ai_service.py
 
-ЩО ЗМІНЕНО В ЦЬОМУ ПРОХОДІ (безкоштовні моделі OpenRouter "вмирають" постійно):
-
-1. Мертва модель більше не вбиває запит. 404 ("model unavailable for free",
-   "No endpoints found") → модель одразу йде на паузу на 6 годин, без
-   traceback і без повторних спроб, і бот переходить до наступної.
-   Так само коротко обробляються 402/403 (немає кредитів/прав) та 5xx.
-2. Авто-добір живих безкоштовних моделей. Для провайдерів на openrouter.ai
-   раз на AI_FREE_MODELS_REFRESH_SECONDS завантажується публічний каталог
-   /models, з нього беруться моделі з нульовою ціною, і вони ранжуються
-   (розмір, контекст, підтримка JSON-режиму). Моделі з AI_MODEL /
-   AI_FALLBACK_MODELS пробуються ПЕРШИМИ, далі — авто-список, в кінці —
-   роутер openrouter/free. Тобто навіть зі старими слагами в env бот
-   самолікується. Вимкнути: AI_AUTO_FREE_MODELS=false.
-3. Генерація сайту йде стрімінгом (label="generate"). Замість одного
-   жорсткого таймауту на всю відповідь — таймаут "мовчання" (AI_STREAM_
-   IDLE_TIMEOUT_SECONDS) + загальна стеля AI_GENERATE_TIMEOUT_SECONDS. Повільна,
-   але жива модель встигає дописати довгий сайт, а зависла відсікається за 60с.
-4. Обрізана відповідь (finish_reason=length) або зламаний JSON не
-   вважається успіхом — бот пробує наступну модель, а не віддає "битий" сайт.
-   Для генерації виставляється max_tokens (з каталогу моделі), парсинг JSON
-   толерантний до переносів рядків усередині рядків (strict=False), а
-   <think>…</think> зі "міркуючих" моделей вирізається.
-5. Ліміт моделей на запит: AI_MAX_MODELS_PER_REQUEST рахує лише ПОВІЛЬНІ
-   відмови (таймаут/порожньо/обрізано/зламаний JSON), миттєві (404/429/401)
-   не рахуються. Для запитів із фото обираються моделі з підтримкою зображень.
-6. Дубльований провайдер (той самий ключ+URL) не викликається двічі за запит.
-
-Публічні сигнатури (generate_text / generate_json / chat / chat_with_tools /
-extract_receipt / transcribe_voice / analyze_product_photo / is_available /
-voice_available / verify_model) НЕ змінені.
-"""
 
 import asyncio
 import base64
@@ -67,6 +34,7 @@ AUTH_ERROR_COOLDOWN_SECONDS = 1800
 MODEL_GONE_COOLDOWN_SECONDS = 6 * 3600     # 404: модель зникла / більше не безкоштовна
 ACCESS_ERROR_COOLDOWN_SECONDS = 1800       # 402/403: немає кредитів або прав
 SERVER_ERROR_COOLDOWN_SECONDS = 90         # 5xx / помилка в тілі відповіді
+BAD_REQUEST_COOLDOWN_SECONDS = 600         # 400 навіть без json_mode: модель не підходить
 
 FREE_MODELS_RETRY_SECONDS = 120            # не долбити каталог, якщо він недоступний
 MAX_IMAGES_PER_REQUEST = 10
@@ -183,6 +151,58 @@ def _cooldown_from_error(exc: Exception) -> float | None:
         return None
 
 
+# Денний ліміт безкоштовних запитів АКАУНТА OpenRouter: коли він вичерпаний,
+# ВСІ ":free" моделі дають 429 з однаковим часом скидання (до 00:00 UTC).
+# Тоді немає сенсу перебирати їх по одній — ставимо на паузу весь безкоштовний
+# пул цього ключа, платні моделі (якщо є) працюють далі.
+ACCOUNT_LIMIT_MIN_COOLDOWN_SECONDS = 3600
+_account_limited_until: dict[tuple[str, str], float] = {}
+
+
+def _is_free_model(model: str) -> bool:
+    return model.endswith(":free") or model == "openrouter/free" or model in _model_meta
+
+
+def _account_limited(provider) -> bool:
+    return _account_limited_until.get(provider.identity, 0.0) > time.monotonic()
+
+
+def free_quota_hint() -> str | None:
+    """Людський опис, якщо безкоштовний денний ліміт вичерпано (для повідомлень у боті)."""
+    now = time.monotonic()
+    waits = [until - now for until in _account_limited_until.values() if until > now]
+    if not waits:
+        return None
+    hours = max(min(waits) / 3600.0, 0.1)
+    return (
+        f"Денний ліміт безкоштовних AI-запитів вичерпано, він відновиться приблизно через "
+        f"{hours:.0f} год (о 00:00 UTC)."
+    )
+
+
+def _register_rate_limit(provider, key: tuple[str, str], exc: Exception, label: str) -> float:
+    cooldown = _cooldown_from_error(exc) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    msg = _short_error(exc).lower()
+    daily = cooldown >= ACCOUNT_LIMIT_MIN_COOLDOWN_SECONDS or "per-day" in msg or "per day" in msg
+    if daily and _is_free_model(key[1]):
+        already = _account_limited(provider)
+        _account_limited_until[provider.identity] = time.monotonic() + cooldown
+        if not already:
+            logger.error(
+                "Вичерпано ДЕННИЙ ліміт безкоштовних запитів для ключа провайдера %s: усі :free моделі "
+                "на паузі ~%.1f год (до 00:00 UTC). Щоб працювало зараз — поповни баланс OpenRouter "
+                "або додай резервний провайдер (напр. Google AI Studio). Відповідь провайдера: %s",
+                provider.name, cooldown / 3600.0, _short_error(exc),
+            )
+        return cooldown
+    _mark_unavailable(key, cooldown)
+    logger.warning(
+        "AI 429 (ліміт) на %s/%s, пауза %.0fс, пробую наступну модель (label=%s)",
+        provider.name, key[1], cooldown, label,
+    )
+    return cooldown
+
+
 def _short_error(exc: Exception) -> str:
     msg = getattr(exc, "message", None) or str(exc)
     return str(msg).replace("\n", " ")[:220]
@@ -193,12 +213,15 @@ def _short_error(exc: Exception) -> str:
 # ---------------------------------------------------------------
 _free_ranked: list[str] = []
 _model_meta: dict[str, dict] = {}
-_free_models_fetched_at = 0.0
-_free_models_last_attempt = 0.0
+_free_models_fetched_at = float("-inf")
+_free_models_last_attempt = float("-inf")
 _free_models_lock = asyncio.Lock()
 
 _SIZE_RE = re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])")
-_SKIP_ID_PARTS = ("embed", "guard", "moderation")
+_SKIP_ID_PARTS = (
+    "embed", "guard", "moderation", "rerank",
+    "lyria", "imagen", "veo", "tts", "whisper", "music", "audio",
+)
 
 
 def _is_zero(value) -> bool:
@@ -243,9 +266,13 @@ def _parse_free_models(payload: dict) -> tuple[list[str], dict[str, dict]]:
                 continue
             arch = m.get("architecture") or {}
             out_mods = arch.get("output_modalities") or ["text"]
-            if "text" not in out_mods:
+            # Лише ЧИСТО текстові на виході: моделі, що генерують аудіо/картинки/відео
+            # (напр. Lyria), для сайтів непридатні.
+            if set(out_mods) != {"text"}:
                 continue
             in_mods = arch.get("input_modalities") or ["text"]
+            if "text" not in in_mods:
+                continue
             ctx = int(m.get("context_length") or 0)
             if ctx and ctx < AI_FREE_MODELS_MIN_CONTEXT:
                 continue
@@ -372,7 +399,10 @@ def _candidates(provider: _Provider, needs_vision: bool = False, needs_tools: bo
         ][:AI_FREE_MODELS_MAX]
         names += auto
         names.append("openrouter/free")
-    return [m for m in _dedup(names) if _meta_ok(m, needs_vision, needs_tools)]
+    result = [m for m in _dedup(names) if _meta_ok(m, needs_vision, needs_tools)]
+    if _account_limited(provider):
+        result = [m for m in result if not _is_free_model(m)]
+    return result
 
 
 # ---------------------------------------------------------------
@@ -624,12 +654,7 @@ async def _run_model(
             _mark_unavailable((provider.name, "openrouter/free"), AUTH_ERROR_COOLDOWN_SECONDS)
             return None, _PROVIDER_DOWN
         except openai.RateLimitError as e:
-            cooldown = _cooldown_from_error(e) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-            _mark_unavailable(key, cooldown)
-            logger.warning(
-                "AI 429 (ліміт) на %s/%s, пауза %.0fс, пробую наступну модель (label=%s)",
-                provider.name, model, cooldown, label,
-            )
+            _register_rate_limit(provider, key, e, label)
             return None, _INSTANT
         except openai.NotFoundError as e:
             _mark_unavailable(key, MODEL_GONE_COOLDOWN_SECONDS)
@@ -648,17 +673,27 @@ async def _run_model(
                     provider.name, model, label,
                 )
                 continue
+            _mark_unavailable(key, BAD_REQUEST_COOLDOWN_SECONDS)
             logger.warning(
-                "AI 400 (provider=%s, model=%s, label=%s): %s", provider.name, model, label, _short_error(e),
+                "AI 400 (provider=%s, model=%s, label=%s, пауза %.0fс): %s",
+                provider.name, model, label, BAD_REQUEST_COOLDOWN_SECONDS, _short_error(e),
             )
             return None, _INSTANT
         except openai.APIStatusError as e:
             status = getattr(e, "status_code", 0) or 0
-            if status in (402, 403):
+            if status == 403:
+                # Напр. "only available on agentic harnesses" — модель закрита для нас надовго.
+                _mark_unavailable(key, MODEL_GONE_COOLDOWN_SECONDS)
+                logger.warning(
+                    "AI 403 на %s/%s (модель закрита, пауза %.0f год): %s",
+                    provider.name, model, MODEL_GONE_COOLDOWN_SECONDS / 3600, _short_error(e),
+                )
+                return None, _INSTANT
+            if status == 402:
                 _mark_unavailable(key, ACCESS_ERROR_COOLDOWN_SECONDS)
                 logger.warning(
-                    "AI %s на %s/%s (немає кредитів/прав?), пауза %.0fс: %s",
-                    status, provider.name, model, ACCESS_ERROR_COOLDOWN_SECONDS, _short_error(e),
+                    "AI 402 на %s/%s (немає кредитів?), пауза %.0fс: %s",
+                    provider.name, model, ACCESS_ERROR_COOLDOWN_SECONDS, _short_error(e),
                 )
                 return None, _INSTANT
             if status >= 500 or status == 408:
@@ -667,6 +702,14 @@ async def _run_model(
                 return None, _INSTANT
             logger.warning("AI HTTP %s (provider=%s, model=%s): %s", status, provider.name, model, _short_error(e))
             return None, _INSTANT
+        except openai.APIError as e:
+            # Помилка посеред стріму (напр. PROHIBITED_CONTENT), обрив з'єднання тощо.
+            _mark_unavailable(key, ACCESS_ERROR_COOLDOWN_SECONDS)
+            logger.warning(
+                "AI помилка під час відповіді (provider=%s, model=%s, label=%s, пауза %.0fс): %s",
+                provider.name, model, label, ACCESS_ERROR_COOLDOWN_SECONDS, _short_error(e),
+            )
+            return None, _SLOW
         except Exception:
             logger.exception("AI request failed (provider=%s, model=%s, label=%s)", provider.name, model, label)
             return None, _SLOW
@@ -743,6 +786,8 @@ async def _chat_completion(
             if ident in tried:
                 continue
             key = (provider.name, model)
+            if _account_limited(provider) and _is_free_model(model):
+                continue   # денний ліміт безкоштовних запитів щойно вичерпано
             if _is_unavailable(key):
                 logger.info("%s/%s на паузі, пропускаю (label=%s)", provider.name, model, label)
                 continue
@@ -761,8 +806,8 @@ async def _chat_completion(
             break
 
     logger.error(
-        "Усі AI-провайдери/моделі недоступні для запиту (label=%s, спроб з повільною відмовою=%s, провайдери=%s)",
-        label, slow_used, [p.name for p in _providers],
+        "Усі AI-провайдери/моделі недоступні для запиту (label=%s, спроб з повільною відмовою=%s, провайдери=%s). %s",
+        label, slow_used, [p.name for p in _providers], free_quota_hint() or "",
     )
     return None
 
@@ -815,6 +860,8 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
             key = (provider.name, model)
             if ident in tried or _is_unavailable(key):
                 continue
+            if _account_limited(provider) and _is_free_model(model):
+                continue
             tried.add(ident)
             try:
                 resp = await asyncio.wait_for(
@@ -839,9 +886,7 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
                     _mark_unavailable((provider.name, m), AUTH_ERROR_COOLDOWN_SECONDS)
                 break
             except openai.RateLimitError as e:
-                cooldown = _cooldown_from_error(e) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-                _mark_unavailable(key, cooldown)
-                logger.warning("AI chat_with_tools 429 (provider=%s, model=%s)", provider.name, model)
+                _register_rate_limit(provider, key, e, "chat_with_tools")
                 continue
             except openai.NotFoundError as e:
                 _mark_unavailable(key, MODEL_GONE_COOLDOWN_SECONDS)
