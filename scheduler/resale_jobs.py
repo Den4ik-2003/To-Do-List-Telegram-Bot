@@ -1,97 +1,82 @@
-"""
-scheduler/resale_jobs.py
 
-Фонова перевірка активних AI-моніторингів "🔥 Знайти перепродаж".
-Джоба тепер тікає раз на добу (о RESALE_CHECK_TIME) для всіх активних
-моніторингів одразу, замість частого interval-тіку з власним
-check_interval_minutes у кожного моніторингу.
-"""
 
 import logging
-from datetime import datetime
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import (
-    RESALE_MIN_SCORE_THRESHOLD,
-    RESALE_MAX_NOTIFY_PER_CYCLE,
-    RESALE_CHECK_TIME,
-)
 from database import resale as resale_db
 from services import resale_service
 
 logger = logging.getLogger("tasks_bot")
 
 
-def _is_due(monitor: dict) -> bool:
-    last = monitor.get("last_checked_at")
-    interval = monitor.get("check_interval_minutes") or 180
-    if not last:
-        return True
+async def _collect(monitor: dict) -> dict:
+    res = await resale_service.scan_monitor(monitor)
+    logger.info(
+        "resale collect monitor=%s: scanned=%s analyzed=%s selected=%s error=%s",
+        monitor.get("_id"), res["scanned"], res["analyzed"], res["selected"], res["error"],
+    )
+    return res
+
+
+async def _process_midday(monitor: dict):
+    await _collect(monitor)
+
+
+async def _process_evening(bot: Bot, monitor: dict):
+    error = None
     try:
-        minutes_since = (datetime.now() - datetime.fromisoformat(last)).total_seconds() / 60
-    except ValueError:
-        return True
-    return minutes_since >= interval
-
-
-async def _check_monitor(bot: Bot, monitor: dict):
-    if not _is_due(monitor):
-        return
-
-    try:
-        opportunities, error = await resale_service.scan_monitor(monitor)
+        await resale_service.recheck_candidates(monitor)
     except Exception:
-        logger.exception("resale monitor scan failed for monitor=%s", monitor.get("_id"))
-        return
-    finally:
-        await resale_db.touch_monitor_checked(monitor["_id"])
-
-    if error or not opportunities:
-        return
-
-    urls = []
-    sent = 0
-    for opp in opportunities:
-        url = opp["listing"].get("url")
-        if url:
-            urls.append(url)
-        if opp["score"] < RESALE_MIN_SCORE_THRESHOLD or sent >= RESALE_MAX_NOTIFY_PER_CYCLE:
-            continue
-        pending_id = resale_service.register_pending(monitor["_id"], opp)
-        try:
-            await bot.send_message(
-                monitor["uid"],
-                resale_service.format_notification(opp),
-                reply_markup=resale_service.ikb_notification(pending_id, url),
-            )
-        except Exception:
-            logger.exception("resale: не вдалось надіслати сповіщення uid=%s", monitor["uid"])
-            continue
-        sent += 1
-
-    if urls:
-        await resale_db.mark_seen(monitor["_id"], urls)
-    await resale_db.increment_stat(monitor["_id"], "found", len(opportunities))
+        logger.exception("resale: recheck упав для monitor=%s", monitor.get("_id"))
+    try:
+        res = await _collect(monitor)
+        error = res.get("error")
+    except Exception:
+        logger.exception("resale: вечірній збір упав для monitor=%s", monitor.get("_id"))
+    try:
+        await resale_service.send_report(bot, monitor, error=error)
+    except Exception:
+        logger.exception("resale: не вдалось надіслати звіт uid=%s", monitor.get("uid"))
 
 
-async def check_all_resale_monitors(bot: Bot):
+async def _run_phase(bot: Bot, phase: str):
     monitors = await resale_db.get_all_active_monitors()
+    logger.info("resale %s: активних автопошуків %s", phase, len(monitors))
     for m in monitors:
+        mid = str(m["_id"])
+        if not resale_service.try_acquire(mid):
+            continue  # цей автопошук саме зараз виконується вручну
         try:
-            await _check_monitor(bot, m)
+            if phase == "midday":
+                await _process_midday(m)
+            else:
+                await _process_evening(bot, m)
         except Exception:
-            logger.exception("resale monitor check failed for monitor=%s", m.get("_id"))
+            logger.exception("resale %s: збій автопошуку monitor=%s", phase, mid)
+        finally:
+            resale_service.release(mid)
+    if phase == "evening":
+        await resale_db.cleanup_candidates(14)
+
+
+async def midday_resale_scan(bot: Bot):
+    await _run_phase(bot, "midday")
+
+
+async def evening_resale_report(bot: Bot):
+    await _run_phase(bot, "evening")
 
 
 def register_resale_jobs(scheduler: AsyncIOScheduler, bot: Bot):
-    hour, minute = (int(x) for x in RESALE_CHECK_TIME.split(":"))
+    (mh, mm), (eh, em) = resale_service.schedule_times()
     scheduler.add_job(
-        check_all_resale_monitors,
-        CronTrigger(hour=hour, minute=minute),
-        args=[bot],
-        id="resale_check",
-        replace_existing=True,
+        midday_resale_scan, CronTrigger(hour=mh, minute=mm), args=[bot],
+        id="resale_midday", replace_existing=True, misfire_grace_time=3600, coalesce=True,
+    )
+    scheduler.add_job(
+        evening_resale_report, CronTrigger(hour=eh, minute=em), args=[bot],
+        id="resale_evening", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )

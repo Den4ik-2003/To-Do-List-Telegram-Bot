@@ -28,8 +28,7 @@ CURRENCY_MAP = {
 }
 
 DOMAIN_CONFIG = {
-    "olx.ua": {"list_path": "/uk/list/q-", "referer": "https://www.olx.ua/", "default_currency": "UAH"},
-    "olx.pl": {"list_path": "/oferty/q-", "referer": "https://www.olx.pl/", "default_currency": "PLN"},
+    "olx.ua": {"list_path": "/uk/list/q-", "referer": "https://www.olx.ua/", "default_currency": "UAH"}
 }
 
 CONDITION_PARAM_MAP = {"used": "used", "new": "new"}
