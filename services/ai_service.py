@@ -1,67 +1,46 @@
 """
-ЗМІНЕНИЙ ФАЙЛ: services/ai_service.py
+services/ai_service.py
 
-КОРІНЬ ПРОБЛЕМИ "AI не зміг сформувати сайт із цього опису": генерація
-повного лендінгу (HTML+CSS+JS одним запитом, label="generate") — важка
-задача для безкоштовної моделі, і вона регулярно НЕ встигала вкластись у
-той самий 30-секундний таймаут, що використовувався для ЛЕГКИХ запитів
-(chat, розбір чека тощо). Додатково, поверх внутрішнього retry цього
-файлу, у services/website_builder_service.py був доданий ЩЕ ОДИН,
-зовнішній retry — разом це давало до 4 повних мережевих спроб по ~30с,
-і кожна впадала в таймаут, а користувач чекав ~2.5 хв і однаково
-отримував відмову.
+ЩО ЗМІНЕНО В ЦЬОМУ ПРОХОДІ (безкоштовні моделі OpenRouter "вмирають" постійно):
 
-ЗМІНИ (попередній прохід):
-1. AI_GENERATE_TIMEOUT_SECONDS = 60 — окремий, довший таймаут ЛИШЕ для
-   label="generate" (генерація сайту). Інші лейбли (chat,
-   extract_receipt, analyze_product_photo) і далі використовують
-   AI_REQUEST_TIMEOUT_SECONDS=30 — там довші відповіді не потрібні, і
-   немає сенсу змушувати користувача чекати довше.
-2. AI_CLIENT_TIMEOUT_SECONDS: 40 → 90. Це таймаут самого HTTP-клієнта
-   OpenAI SDK — він має бути БІЛЬШИМ за найбільший з наших власних
-   asyncio.wait_for(...), інакше клієнт обірве з'єднання ще до того, як
-   спрацює наш таймаут, і ми ніколи не побачимо шансу на довшу, але
-   потенційно успішну відповідь.
-3. Для label="generate" прибрано внутрішній retry (тепер завжди 1 спроба
-   на модель, а не MAX_TRANSIENT_RETRIES+1=2) — натомість ця одна спроба
-   має вдвічі більше часу (60с замість 30с).
-4. Легкі лейбли (chat/extract_receipt/analyze_product_photo) і далі
-   мають MAX_TRANSIENT_RETRIES=1 (тобто 2 спроби) при 30с.
+1. Мертва модель більше не вбиває запит. 404 ("model unavailable for free",
+   "No endpoints found") → модель одразу йде на паузу на 6 годин, без
+   traceback і без повторних спроб, і бот переходить до наступної.
+   Так само коротко обробляються 402/403 (немає кредитів/прав) та 5xx.
+2. Авто-добір живих безкоштовних моделей. Для провайдерів на openrouter.ai
+   раз на AI_FREE_MODELS_REFRESH_SECONDS завантажується публічний каталог
+   /models, з нього беруться моделі з нульовою ціною, і вони ранжуються
+   (розмір, контекст, підтримка JSON-режиму). Моделі з AI_MODEL /
+   AI_FALLBACK_MODELS пробуються ПЕРШИМИ, далі — авто-список, в кінці —
+   роутер openrouter/free. Тобто навіть зі старими слагами в env бот
+   самолікується. Вимкнути: AI_AUTO_FREE_MODELS=false.
+3. Генерація сайту йде стрімінгом (label="generate"). Замість одного
+   жорсткого таймауту на всю відповідь — таймаут "мовчання" (AI_STREAM_
+   IDLE_TIMEOUT_SECONDS) + загальна стеля AI_GENERATE_TIMEOUT_SECONDS. Повільна,
+   але жива модель встигає дописати довгий сайт, а зависла відсікається за 60с.
+4. Обрізана відповідь (finish_reason=length) або зламаний JSON не
+   вважається успіхом — бот пробує наступну модель, а не віддає "битий" сайт.
+   Для генерації виставляється max_tokens (з каталогу моделі), парсинг JSON
+   толерантний до переносів рядків усередині рядків (strict=False), а
+   <think>…</think> зі "міркуючих" моделей вирізається.
+5. Ліміт моделей на запит: AI_MAX_MODELS_PER_REQUEST рахує лише ПОВІЛЬНІ
+   відмови (таймаут/порожньо/обрізано/зламаний JSON), миттєві (404/429/401)
+   не рахуються. Для запитів із фото обираються моделі з підтримкою зображень.
+6. Дубльований провайдер (той самий ключ+URL) не викликається двічі за запит.
 
-НОВЕ (цей прохід): резервний AI-провайдер (AI_API_KEY_BACKUP).
-- Раніше весь модуль працював з ОДНИМ клієнтом (`client`) і одним списком
-  моделей (AI_MODEL + AI_FALLBACK_MODELS). Тепер це узагальнено до списку
-  "провайдерів" (_Provider): спершу основний (AI_API_KEY/AI_BASE_URL,
-  з усіма його fallback-моделями), і, якщо він заданий, — резервний
-  (AI_API_KEY_BACKUP/AI_BASE_URL_BACKUP/AI_MODEL_BACKUP).
-- Порядок спроб: усі моделі основного провайдера підряд (як і раніше) →
-  якщо ЖОДНА не відповіла (таймаут/429/помилка авторизації/порожня
-  відповідь) → усі моделі резервного провайдера.
-- Якщо AI_API_KEY_BACKUP не задано — резервного провайдера просто немає
-  в списку, і поведінка ідентична попередній версії.
-- "Пауза" моделі після 429 (_unavailable_until) і позначка "не підтримує
-  json_mode" (_no_json_support) тепер прив'язані до пари
-  (провайдер, модель), а не лише до назви моделі — це важливо, якщо
-  основний і резервний провайдер використовують модель з однаковою
-  назвою (наприклад, той самий Gemini-фліт, але інший акаунт/ключ):
-  пауза одного провайдера не повинна впливати на інший.
-- Явно ловиться openai.AuthenticationError: якщо ключ провайдера
-  невалідний/протермінований, весь цей провайдер одразу позначається
-  недоступним (а не перебирається модель за моделлю з тим самим 401),
-  і бот одразу переходить до наступного провайдера.
-- Публічні сигнатури (generate_text/generate_json/chat/chat_with_tools/
-  extract_receipt/transcribe_voice/analyze_product_photo/is_available)
-  НЕ змінені — увесь fallback на резервний ключ прихований усередині
-  модуля.
+Публічні сигнатури (generate_text / generate_json / chat / chat_with_tools /
+extract_receipt / transcribe_voice / analyze_product_photo / is_available /
+voice_available / verify_model) НЕ змінені.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import time
-import base64
 
+import aiohttp
 import openai
 from openai import AsyncOpenAI
 
@@ -69,37 +48,34 @@ from config.settings import (
     AI_API_KEY, AI_BASE_URL, AI_MODEL, AI_FALLBACK_MODELS,
     AI_API_KEY_BACKUP, AI_BASE_URL_BACKUP, AI_MODEL_BACKUP,
     WHISPER_API_KEY, WHISPER_BASE_URL, WHISPER_MODEL,
+    AI_REQUEST_TIMEOUT_SECONDS, AI_GENERATE_TIMEOUT_SECONDS, AI_STREAM_IDLE_TIMEOUT_SECONDS,
+    AI_GENERATE_MAX_TOKENS, AI_MAX_MODELS_PER_REQUEST,
+    AI_AUTO_FREE_MODELS, AI_FREE_MODELS_REFRESH_SECONDS, AI_FREE_MODELS_MAX,
+    AI_FREE_MODELS_MIN_CONTEXT,
 )
 
 logger = logging.getLogger("tasks_bot")
 
-# Таймаут для ЗВИЧАЙНИХ (легких) запитів: chat, розбір чека, аналіз фото товару.
-AI_REQUEST_TIMEOUT_SECONDS = 30
+# HTTP-клієнт має жити довше за найдовшу нашу власну спробу.
+AI_CLIENT_TIMEOUT_SECONDS = AI_GENERATE_TIMEOUT_SECONDS + 30
 
-# Окремий, довший таймаут ЛИШЕ для label="generate" — генерація повного
-# сайту (HTML+CSS+JS) одним запитом об'єктивно триваліша, ніж звичайні
-# текстові/JSON відповіді, і 30с їй систематично не вистачало.
-AI_GENERATE_TIMEOUT_SECONDS = 60
-
-# Має залишатись БІЛЬШИМ за AI_GENERATE_TIMEOUT_SECONDS з запасом —
-# інакше HTTP-клієнт сам обірве з'єднання раніше, ніж наш власний
-# asyncio.wait_for(60с) встигне спрацювати.
-AI_CLIENT_TIMEOUT_SECONDS = 90
-
-# Скільки РАЗІВ ПОВТОРЮВАТИ ОДНУ Й ТУ Ж модель при ТИМЧАСОВІЙ помилці
-# (таймаут / порожня відповідь) — стосується лише ЛЕГКИХ лейблів.
-# Для label="generate" ретрай навмисно вимкнено (див. _effective_retry_budget).
+# Повторів ТІЄЇ Ж моделі при тимчасовій помилці (лише легкі лейбли).
 MAX_TRANSIENT_RETRIES = 1
 
-# Скільки секунд не звертатись до моделі, яка щойно впала з 429 (вичерпаний
-# денний ліміт), якщо провайдер не підказав точний час скидання ліміту.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 600
-
-# Скільки секунд не звертатись до ВСЬОГО провайдера після помилки
-# авторизації (невірний/протермінований ключ) — довше, ніж звичайний
-# rate-limit cooldown, бо сама причина інша й навряд чи "розсмокчеться"
-# за 10 хвилин.
 AUTH_ERROR_COOLDOWN_SECONDS = 1800
+MODEL_GONE_COOLDOWN_SECONDS = 6 * 3600     # 404: модель зникла / більше не безкоштовна
+ACCESS_ERROR_COOLDOWN_SECONDS = 1800       # 402/403: немає кредитів або прав
+SERVER_ERROR_COOLDOWN_SECONDS = 90         # 5xx / помилка в тілі відповіді
+
+FREE_MODELS_RETRY_SECONDS = 120            # не долбити каталог, якщо він недоступний
+MAX_IMAGES_PER_REQUEST = 10
+
+# Результати спроби однієї моделі.
+_OK = "ok"
+_INSTANT = "instant"            # миттєва відмова (404/429/…): не рахується в ліміт моделей
+_SLOW = "slow"                  # повільна відмова (таймаут/порожньо/обрізано/…)
+_PROVIDER_DOWN = "provider_down"
 
 
 def _dedup(models: list[str | None]) -> list[str]:
@@ -111,19 +87,26 @@ def _dedup(models: list[str | None]) -> list[str]:
 
 
 class _Provider:
-    """Один AI-провайдер: свій ключ, свій base_url, свій список моделей
-    (перша — основна, решта — fallback у межах ЦЬОГО провайдера)."""
+    """Один AI-провайдер: ключ, base_url, список моделей із конфігурації
+    (перша — основна). Для OpenRouter додатково працює авто-добір
+    безкоштовних моделей (auto_free)."""
 
-    __slots__ = ("name", "base_url", "models", "client")
+    __slots__ = ("name", "base_url", "api_key", "models", "client", "auto_free")
 
     def __init__(self, name: str, api_key: str, base_url: str, models: list[str]):
         self.name = name
         self.base_url = base_url
+        self.api_key = api_key
         self.models = models
+        self.auto_free = bool(AI_AUTO_FREE_MODELS and "openrouter.ai" in (base_url or "").lower())
         self.client: AsyncOpenAI | None = (
             AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=AI_CLIENT_TIMEOUT_SECONDS, max_retries=0)
-            if api_key and models else None
+            if api_key and (models or self.auto_free) else None
         )
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return ((self.base_url or "").rstrip("/"), self.api_key)
 
 
 _primary_provider = _Provider(
@@ -133,12 +116,17 @@ _backup_provider = _Provider(
     "backup", AI_API_KEY_BACKUP, AI_BASE_URL_BACKUP, _dedup([AI_MODEL_BACKUP])
 )
 
-# Порядок важливий: спершу основний провайдер (з усіма його fallback-
-# моделями), і лише якщо він ЦІЛКОМ не відповів — резервний.
+# Спершу основний провайдер, і лише якщо він ЦІЛКОМ не відповів — резервний.
 _providers: list[_Provider] = [p for p in (_primary_provider, _backup_provider) if p.client]
 
-# Збережено для зворотної сумісності з рештою коду (is_available(),
-# верифікація моделей тощо) — це клієнт ОСНОВНОГО провайдера.
+# Резервний провайдер з ТИМ САМИМ ключем і URL — це той самий акаунт: не
+# дублюємо запити, а просто додаємо його модель у список основного.
+if _backup_provider.client and _primary_provider.client and _backup_provider.identity == _primary_provider.identity:
+    _primary_provider.models = _dedup([*_primary_provider.models, *_backup_provider.models])
+    _providers = [_primary_provider]
+    _backup_provider.client = None
+
+# Для зворотної сумісності з рештою коду.
 client: AsyncOpenAI | None = _primary_provider.client
 whisper_client: AsyncOpenAI | None = (
     AsyncOpenAI(api_key=WHISPER_API_KEY, base_url=WHISPER_BASE_URL, timeout=AI_CLIENT_TIMEOUT_SECONDS, max_retries=0)
@@ -149,8 +137,7 @@ if not _primary_provider.client:
     logger.warning("AI_API_KEY не задано — AI-функції вимкнено, решта бота працює як завжди")
 if _backup_provider.client:
     logger.info(
-        "Резервний AI-провайдер підключено (backup моделі=%s, base_url=%s) — "
-        "буде використано, якщо основний провайдер повністю недоступний",
+        "Резервний AI-провайдер підключено (backup моделі=%s, base_url=%s)",
         _backup_provider.models, _backup_provider.base_url,
     )
 if not whisper_client:
@@ -162,17 +149,10 @@ _SAFETY_LINE_RE = re.compile(
     r"^\s*(user|response|input|output|prompt)\s*safety\s*:\s*\S+\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
-
-MAX_IMAGES_PER_REQUEST = 10
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 # ---------------------------------------------------------------
-# Стан по (провайдер, модель) — in-memory, на весь час життя процесу:
-# - _unavailable_until: які пари зараз "на паузі" (після 429 або 401) і
-#   до якого моменту;
-# - _no_json_support: які пари, як з'ясувалось емпірично, не приймають
-#   response_format=json_object — щоб не тестувати це щоразу заново.
-# Ключ — tuple (provider_name, model), щоб пауза одного провайдера не
-# впливала на модель з такою самою назвою в іншого провайдера.
+# Стан по (провайдер, модель) — in-memory
 # ---------------------------------------------------------------
 _unavailable_until: dict[tuple[str, str], float] = {}
 _no_json_support: set[tuple[str, str]] = set()
@@ -188,8 +168,7 @@ def _is_unavailable(key: tuple[str, str]) -> bool:
 
 
 def _cooldown_from_error(exc: Exception) -> float | None:
-    """OpenRouter часто повертає X-RateLimit-Reset (epoch мс) у заголовках
-    помилки — якщо він є, чекаємо саме до цього моменту, а не навмання."""
+    """OpenRouter часто повертає X-RateLimit-Reset (epoch мс) — чекаємо до нього."""
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) if response else None
     if not headers:
@@ -204,70 +183,209 @@ def _cooldown_from_error(exc: Exception) -> float | None:
         return None
 
 
+def _short_error(exc: Exception) -> str:
+    msg = getattr(exc, "message", None) or str(exc)
+    return str(msg).replace("\n", " ")[:220]
+
+
+# ---------------------------------------------------------------
+# Авто-добір безкоштовних моделей OpenRouter
+# ---------------------------------------------------------------
+_free_ranked: list[str] = []
+_model_meta: dict[str, dict] = {}
+_free_models_fetched_at = 0.0
+_free_models_last_attempt = 0.0
+_free_models_lock = asyncio.Lock()
+
+_SIZE_RE = re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])")
+_SKIP_ID_PARTS = ("embed", "guard", "moderation")
+
+
+def _is_zero(value) -> bool:
+    try:
+        return float(value) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _guess_size_b(*texts: str) -> float | None:
+    """Розмір моделі в мільярдах параметрів із назви ('gpt-oss-120b' → 120)."""
+    for text in texts:
+        sizes = [float(x) for x in _SIZE_RE.findall((text or "").lower())]
+        if sizes:
+            return max(sizes)
+    return None
+
+
+def _score_free_model(size_b: float | None, ctx: int, params: set[str]) -> float:
+    size = size_b if size_b else 30.0
+    score = min(size, 250.0) / 10.0
+    score += min(ctx / 32768.0, 8.0)
+    if "response_format" in params or "structured_outputs" in params:
+        score += 10.0
+    if "reasoning" in params or "include_reasoning" in params:
+        score -= 3.0   # "міркуючі" моделі довше відповідають — для генерації гірше
+    return score
+
+
+def _parse_free_models(payload: dict) -> tuple[list[str], dict[str, dict]]:
+    scored: list[tuple[float, str]] = []
+    meta: dict[str, dict] = {}
+    for m in (payload.get("data") or []):
+        try:
+            mid = m.get("id")
+            if not mid or mid.startswith("openrouter/"):
+                continue
+            if any(part in mid.lower() for part in _SKIP_ID_PARTS):
+                continue
+            pricing = m.get("pricing") or {}
+            if not (_is_zero(pricing.get("prompt")) and _is_zero(pricing.get("completion"))):
+                continue
+            arch = m.get("architecture") or {}
+            out_mods = arch.get("output_modalities") or ["text"]
+            if "text" not in out_mods:
+                continue
+            in_mods = arch.get("input_modalities") or ["text"]
+            ctx = int(m.get("context_length") or 0)
+            if ctx and ctx < AI_FREE_MODELS_MIN_CONTEXT:
+                continue
+            raw_params = m.get("supported_parameters")
+            params = set(raw_params or [])
+            top = m.get("top_provider") or {}
+            max_comp = top.get("max_completion_tokens")
+            size_b = _guess_size_b(mid, m.get("name", ""))
+
+            meta[mid] = {
+                "ctx": ctx,
+                "max_completion": int(max_comp) if max_comp else None,
+                "vision": "image" in in_mods,
+                "json": None if raw_params is None else ("response_format" in params or "structured_outputs" in params),
+                "tools": None if raw_params is None else ("tools" in params),
+            }
+            scored.append((_score_free_model(size_b, ctx, params), mid))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [mid for _, mid in scored], meta
+
+
+async def _fetch_models_payload(base_url: str) -> dict | None:
+    url = base_url.rstrip("/") + "/models"
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={"Accept": "application/json"}) as resp:
+                if resp.status != 200:
+                    logger.warning("Каталог моделей %s повернув HTTP %s", url, resp.status)
+                    return None
+                data = await resp.json(content_type=None)
+                return data if isinstance(data, dict) else None
+    except Exception:
+        logger.warning("Не вдалося завантажити каталог моделей %s", url, exc_info=True)
+        return None
+
+
+def _openrouter_base_url() -> str | None:
+    for p in _providers:
+        if p.auto_free:
+            return p.base_url
+    return None
+
+
+async def _maybe_refresh_free_models(force: bool = False) -> None:
+    global _free_ranked, _model_meta, _free_models_fetched_at, _free_models_last_attempt
+    base = _openrouter_base_url()
+    if not base:
+        return
+
+    def _fresh() -> bool:
+        return bool(_free_ranked) and (time.monotonic() - _free_models_fetched_at) < AI_FREE_MODELS_REFRESH_SECONDS
+
+    if not force:
+        if _fresh():
+            return
+        if (time.monotonic() - _free_models_last_attempt) < FREE_MODELS_RETRY_SECONDS:
+            return
+
+    async with _free_models_lock:
+        if not force and _fresh():
+            return
+        _free_models_last_attempt = time.monotonic()
+        payload = await _fetch_models_payload(base)
+        if not payload:
+            return
+        ranked, meta = _parse_free_models(payload)
+        if not ranked:
+            logger.warning("У каталозі OpenRouter не знайдено безкоштовних моделей, що підходять")
+            return
+        _free_ranked, _model_meta, _free_models_fetched_at = ranked, meta, time.monotonic()
+        logger.info(
+            "Оновлено список безкоштовних моделей OpenRouter (%s шт.), топ-5: %s",
+            len(ranked), ranked[:5],
+        )
+
+
+def _meta_ok(model: str, needs_vision: bool, needs_tools: bool) -> bool:
+    meta = _model_meta.get(model)
+    if not meta:
+        return True   # невідома модель (напр. платна з env) — довіряємо конфігу
+    if needs_vision and not meta.get("vision"):
+        return False
+    if needs_tools and meta.get("tools") is False:
+        return False
+    return True
+
+
+def _json_allowed(key: tuple[str, str], model: str) -> bool:
+    if key in _no_json_support:
+        return False
+    meta = _model_meta.get(model)
+    if meta and meta.get("json") is False:
+        return False
+    return True
+
+
+def _max_tokens_for(model: str, label: str) -> int | None:
+    if label != "generate":
+        return None
+    meta = _model_meta.get(model)
+    if not meta:
+        return None
+    limit = meta.get("max_completion")
+    if limit:
+        return min(AI_GENERATE_MAX_TOKENS, int(limit))
+    ctx = meta.get("ctx")
+    if ctx:
+        return min(AI_GENERATE_MAX_TOKENS, max(int(ctx) // 4, 2048))
+    return None
+
+
+def _candidates(provider: _Provider, needs_vision: bool = False, needs_tools: bool = False) -> list[str]:
+    """Порядок: моделі з конфігу → авто-список живих безкоштовних →
+    роутер openrouter/free (лише для OpenRouter)."""
+    names = list(provider.models)
+    if provider.auto_free:
+        auto = [
+            m for m in _free_ranked
+            if _meta_ok(m, needs_vision, needs_tools) and not _is_unavailable((provider.name, m))
+        ][:AI_FREE_MODELS_MAX]
+        names += auto
+        names.append("openrouter/free")
+    return [m for m in _dedup(names) if _meta_ok(m, needs_vision, needs_tools)]
+
+
+# ---------------------------------------------------------------
+# Очищення й парсинг відповіді
+# ---------------------------------------------------------------
+
 def _strip_safety_noise(text: str) -> str:
     if not text:
         return text
-    cleaned = _SAFETY_LINE_RE.sub("", text)
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _SAFETY_LINE_RE.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
-
-
-def _timeout_for_label(label: str) -> float:
-    """Важкі задачі (генерація сайту) отримують суттєво більше часу на
-    одну спробу, ніж легкі текстові/JSON запити."""
-    return AI_GENERATE_TIMEOUT_SECONDS if label == "generate" else AI_REQUEST_TIMEOUT_SECONDS
-
-
-def _effective_retry_budget(label: str, allow_retry: bool) -> int:
-    """Скільки РАЗІВ ПОВТОРИТИ одну й ту ж модель. Для важкого
-    label="generate" ретрай навмисно вимкнено (0) — краще одна спроба з
-    великим вікном часу (AI_GENERATE_TIMEOUT_SECONDS), ніж дві короткі,
-    жодна з яких не встигає. Для решти лейблів — як і раніше."""
-    if label == "generate":
-        return 0
-    return MAX_TRANSIENT_RETRIES if allow_retry else 0
-
-
-def is_available() -> bool:
-    return bool(_providers)
-
-
-def voice_available() -> bool:
-    return whisper_client is not None
-
-
-async def verify_model() -> bool:
-    """Перевіряє список моделей у КОЖНОГО налаштованого провайдера
-    (основного і, якщо є, резервного)."""
-    global _model_verified
-    if not _providers:
-        return False
-    if _model_verified:
-        return True
-
-    all_ok = True
-    for provider in _providers:
-        try:
-            models = await asyncio.wait_for(provider.client.models.list(), timeout=AI_REQUEST_TIMEOUT_SECONDS)
-            slugs = {m.id for m in models.data}
-            missing = [m for m in provider.models if m not in slugs]
-            if missing:
-                logger.warning(
-                    "Провайдер %s: ці AI-моделі з конфігурації не знайдено у провайдера: %s",
-                    provider.name, missing,
-                )
-                all_ok = False
-            else:
-                logger.info(
-                    "Провайдер %s: усі налаштовані AI-моделі підтверджено провайдером: %s",
-                    provider.name, provider.models,
-                )
-        except Exception:
-            logger.exception("Не вдалося перевірити список моделей провайдера %s", provider.name)
-            all_ok = False
-
-    _model_verified = True
-    return all_ok
 
 
 def _strip_json_fence(raw: str) -> str:
@@ -277,9 +395,7 @@ def _strip_json_fence(raw: str) -> str:
 
 
 def _extract_json_object(raw: str) -> str | None:
-    """Шукає перший ЗБАЛАНСОВАНИЙ {...} блок у тексті — навіть якщо модель
-    додала пояснювальний текст до/після JSON (частий випадок у безкоштовних
-    моделей)."""
+    """Перший ЗБАЛАНСОВАНИЙ {...} блок — навіть якщо модель додала текст до/після."""
     start = raw.find("{")
     if start == -1:
         return None
@@ -308,16 +424,16 @@ def _extract_json_object(raw: str) -> str | None:
 
 
 def _try_parse_json_dict(raw: str | None) -> dict | None:
-    """Єдина точка парсингу JSON-словника з сирої відповіді моделі.
-    Повертає None замість того, щоб кидати виняток, якщо парсинг не вдався —
-    виклик generate_json вирішує, чи варто повторити запит інакше."""
+    """Єдина точка парсингу JSON-словника з відповіді моделі. strict=False
+    дозволяє переноси рядків усередині рядкових значень — слабкі моделі
+    постійно так ламають JSON із HTML."""
     if not raw or not raw.strip():
         return None
     candidate = _extract_json_object(raw) or _strip_json_fence(raw)
     if not candidate or not candidate.strip():
         return None
     try:
-        data = json.loads(candidate)
+        data = json.loads(candidate, strict=False)
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
@@ -332,22 +448,269 @@ def _build_content(prompt: str, images: list[str] | None):
     return content
 
 
-async def _call_once(
-    provider_client: AsyncOpenAI,
-    model: str,
-    messages: list[dict],
-    temperature: float,
-    json_mode: bool,
-    timeout: float,
-    key: tuple[str, str],
-):
-    kwargs = {"temperature": temperature}
-    if json_mode and key not in _no_json_support:
+def _timeout_for_label(label: str) -> float:
+    return AI_GENERATE_TIMEOUT_SECONDS if label == "generate" else AI_REQUEST_TIMEOUT_SECONDS
+
+
+def _effective_retry_budget(label: str, allow_retry: bool) -> int:
+    """Для важкого label="generate" повтор тієї ж моделі вимкнено —
+    краще перейти до наступної моделі."""
+    if label == "generate":
+        return 0
+    return MAX_TRANSIENT_RETRIES if allow_retry else 0
+
+
+def is_available() -> bool:
+    return bool(_providers)
+
+
+def voice_available() -> bool:
+    return whisper_client is not None
+
+
+async def verify_model() -> bool:
+    """Оновлює список безкоштовних моделей і перевіряє моделі з конфігурації."""
+    global _model_verified
+    if not _providers:
+        return False
+
+    await _maybe_refresh_free_models(force=True)
+
+    if _model_verified:
+        return True
+
+    all_ok = True
+    for provider in _providers:
+        if not provider.models:
+            continue
+        try:
+            models = await asyncio.wait_for(provider.client.models.list(), timeout=AI_REQUEST_TIMEOUT_SECONDS)
+            slugs: set[str] = set()
+            for m in models.data:
+                slugs.add(m.id)
+                slugs.add(m.id.removeprefix("models/"))
+            missing = [m for m in provider.models if m not in slugs]
+            if missing:
+                logger.warning(
+                    "Провайдер %s: ці AI-моделі з конфігурації не знайдено (пропущу їх, "
+                    "працюватиме авто-добір): %s", provider.name, missing,
+                )
+                all_ok = False
+            else:
+                logger.info("Провайдер %s: усі налаштовані AI-моделі підтверджено: %s", provider.name, provider.models)
+        except Exception:
+            logger.exception("Не вдалося перевірити список моделей провайдера %s", provider.name)
+            all_ok = False
+
+    _model_verified = True
+    return all_ok
+
+
+# ---------------------------------------------------------------
+# Виклик однієї моделі
+# ---------------------------------------------------------------
+
+def _describe_error(obj) -> str | None:
+    err = getattr(obj, "error", None)
+    if not err:
+        return None
+    return str(err).replace("\n", " ")[:200]
+
+
+async def _collect_stream(client: AsyncOpenAI, model: str, messages: list[dict], kwargs: dict, total_timeout: float):
+    """Читає відповідь стрімом. Таймаут — на "мовчання" між шматками
+    (і на очікування першого), плюс загальна стеля."""
+    deadline = time.monotonic() + total_timeout
+    idle = float(AI_STREAM_IDLE_TIMEOUT_SECONDS)
+    stream = await asyncio.wait_for(
+        client.chat.completions.create(model=model, messages=messages, stream=True, **kwargs),
+        timeout=min(idle, total_timeout),
+    )
+    parts: list[str] = []
+    finish: str | None = None
+    error: str | None = None
+    try:
+        iterator = stream.__aiter__()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=min(idle, remaining))
+            except StopAsyncIteration:
+                break
+            error = _describe_error(chunk)
+            if error:
+                finish = "error"
+                break
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            ch = choices[0]
+            delta = getattr(ch, "delta", None)
+            piece = getattr(delta, "content", None) if delta is not None else None
+            if piece:
+                parts.append(piece)
+            fr = getattr(ch, "finish_reason", None)
+            if fr:
+                finish = fr
+    finally:
+        try:
+            await stream.close()
+        except Exception:
+            pass
+    return "".join(parts), finish, error
+
+
+async def _call_model(
+    provider_client: AsyncOpenAI, model: str, messages: list[dict], temperature: float,
+    use_json: bool, timeout: float, max_tokens: int | None, stream: bool,
+) -> tuple[str, str | None, str | None]:
+    """Повертає (текст, finish_reason, помилка_в_тілі)."""
+    kwargs: dict = {"temperature": temperature}
+    if use_json:
         kwargs["response_format"] = {"type": "json_object"}
-    return await asyncio.wait_for(
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+
+    if stream:
+        return await _collect_stream(provider_client, model, messages, kwargs, timeout)
+
+    resp = await asyncio.wait_for(
         provider_client.chat.completions.create(model=model, messages=messages, **kwargs),
         timeout=timeout,
     )
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        return "", None, _describe_error(resp) or "порожній choices"
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    return (getattr(message, "content", None) or ""), getattr(choice, "finish_reason", None), None
+
+
+async def _run_model(
+    provider: _Provider, model: str, messages: list[dict], temperature: float,
+    json_mode: bool, expect_json: bool, label: str, allow_retry: bool,
+) -> tuple[str | None, str]:
+    key = (provider.name, model)
+    timeout = _timeout_for_label(label)
+    transient_left = _effective_retry_budget(label, allow_retry)
+    use_json = json_mode and _json_allowed(key, model)
+    max_tokens = _max_tokens_for(model, label)
+    stream = label == "generate"
+
+    while True:
+        try:
+            content, finish, body_error = await _call_model(
+                provider.client, model, messages, temperature, use_json, timeout, max_tokens, stream,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "AI timeout (provider=%s, model=%s, label=%s, ліміт=%.0fс)", provider.name, model, label, timeout,
+            )
+            if transient_left > 0:
+                transient_left -= 1
+                continue
+            return None, _SLOW
+        except openai.AuthenticationError:
+            logger.error(
+                "AI провайдер %s: помилка авторизації (невірний/протермінований ключ) — "
+                "пропускаю весь провайдер на %.0fс (label=%s)", provider.name, AUTH_ERROR_COOLDOWN_SECONDS, label,
+            )
+            for m in provider.models:
+                _mark_unavailable((provider.name, m), AUTH_ERROR_COOLDOWN_SECONDS)
+            for m in _free_ranked:
+                _mark_unavailable((provider.name, m), AUTH_ERROR_COOLDOWN_SECONDS)
+            _mark_unavailable((provider.name, "openrouter/free"), AUTH_ERROR_COOLDOWN_SECONDS)
+            return None, _PROVIDER_DOWN
+        except openai.RateLimitError as e:
+            cooldown = _cooldown_from_error(e) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+            _mark_unavailable(key, cooldown)
+            logger.warning(
+                "AI 429 (ліміт) на %s/%s, пауза %.0fс, пробую наступну модель (label=%s)",
+                provider.name, model, cooldown, label,
+            )
+            return None, _INSTANT
+        except openai.NotFoundError as e:
+            _mark_unavailable(key, MODEL_GONE_COOLDOWN_SECONDS)
+            logger.warning(
+                "AI 404: модель %s/%s недоступна (пауза %.0f год): %s",
+                provider.name, model, MODEL_GONE_COOLDOWN_SECONDS / 3600, _short_error(e),
+            )
+            return None, _INSTANT
+        except openai.BadRequestError as e:
+            if use_json:
+                # Найчастіша причина — модель не приймає response_format=json_object.
+                _no_json_support.add(key)
+                use_json = False
+                logger.info(
+                    "%s/%s не підтримує response_format=json_object, повторюю без нього (label=%s)",
+                    provider.name, model, label,
+                )
+                continue
+            logger.warning(
+                "AI 400 (provider=%s, model=%s, label=%s): %s", provider.name, model, label, _short_error(e),
+            )
+            return None, _INSTANT
+        except openai.APIStatusError as e:
+            status = getattr(e, "status_code", 0) or 0
+            if status in (402, 403):
+                _mark_unavailable(key, ACCESS_ERROR_COOLDOWN_SECONDS)
+                logger.warning(
+                    "AI %s на %s/%s (немає кредитів/прав?), пауза %.0fс: %s",
+                    status, provider.name, model, ACCESS_ERROR_COOLDOWN_SECONDS, _short_error(e),
+                )
+                return None, _INSTANT
+            if status >= 500 or status == 408:
+                _mark_unavailable(key, SERVER_ERROR_COOLDOWN_SECONDS)
+                logger.warning("AI %s на %s/%s: %s", status, provider.name, model, _short_error(e))
+                return None, _INSTANT
+            logger.warning("AI HTTP %s (provider=%s, model=%s): %s", status, provider.name, model, _short_error(e))
+            return None, _INSTANT
+        except Exception:
+            logger.exception("AI request failed (provider=%s, model=%s, label=%s)", provider.name, model, label)
+            return None, _SLOW
+
+        if body_error:
+            logger.warning(
+                "AI повернув помилку в тілі відповіді (provider=%s, model=%s, label=%s): %s",
+                provider.name, model, label, body_error,
+            )
+            _mark_unavailable(key, SERVER_ERROR_COOLDOWN_SECONDS)
+            return None, _SLOW
+
+        cleaned = _strip_safety_noise((content or "").strip())
+
+        if not cleaned:
+            logger.warning(
+                "AI повернув ПОРОЖНІЙ content (provider=%s, model=%s, label=%s, finish_reason=%s)",
+                provider.name, model, label, finish,
+            )
+            if use_json:
+                # Частина моделей у json_mode віддає порожньо — пробуємо ту саму модель без нього.
+                use_json = False
+                continue
+            if transient_left > 0:
+                transient_left -= 1
+                continue
+            return None, _SLOW
+
+        if expect_json:
+            if finish == "length":
+                logger.warning(
+                    "AI відповідь ОБРІЗАНА (finish_reason=length, provider=%s, model=%s, max_tokens=%s) — "
+                    "беру наступну модель", provider.name, model, max_tokens,
+                )
+                return None, _SLOW
+            if _try_parse_json_dict(cleaned) is None:
+                logger.warning(
+                    "AI повернув не-JSON (provider=%s, model=%s, label=%s). raw[:200]=%r",
+                    provider.name, model, label, cleaned[:200],
+                )
+                return None, _SLOW
+
+        logger.info("AI успішно відповів (provider=%s, model=%s, label=%s)", provider.name, model, label)
+        return cleaned, _OK
 
 
 async def _chat_completion(
@@ -356,89 +719,50 @@ async def _chat_completion(
     json_mode: bool,
     label: str = "request",
     allow_retry: bool = True,
+    expect_json: bool = False,
+    needs_vision: bool = False,
 ) -> str | None:
-    """
-    Перебирає провайдерів по черзі (основний, потім резервний, якщо
-    заданий), а всередині кожного — його моделі по черзі. Таймаут і
-    бюджет ретраїв на одну модель залежать від label (див.
-    _timeout_for_label / _effective_retry_budget).
-    """
+    """Перебирає провайдерів (основний → резервний) і їхні моделі:
+    конфіг → авто-список безкоштовних → openrouter/free. Зупиняється на
+    першій успішній відповіді або коли вичерпано ліміт "повільних" відмов."""
     if not _providers:
         return None
 
-    timeout = _timeout_for_label(label)
-    max_retries = _effective_retry_budget(label, allow_retry)
+    await _maybe_refresh_free_models()
+
+    slow_used = 0
+    tried: set[tuple[tuple[str, str], str]] = set()
+    limit_reached = False
 
     for provider in _providers:
-        for model in provider.models:
+        for model in _candidates(provider, needs_vision=needs_vision):
+            if slow_used >= AI_MAX_MODELS_PER_REQUEST:
+                limit_reached = True
+                break
+            ident = (provider.identity, model)
+            if ident in tried:
+                continue
             key = (provider.name, model)
             if _is_unavailable(key):
-                logger.info(
-                    "%s/%s на паузі, пропускаю (label=%s)", provider.name, model, label,
-                )
+                logger.info("%s/%s на паузі, пропускаю (label=%s)", provider.name, model, label)
                 continue
+            tried.add(ident)
 
-            for attempt in range(max_retries + 1):
-                try:
-                    resp = await _call_once(provider.client, model, messages, temperature, json_mode, timeout, key)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "AI timeout (provider=%s, model=%s, label=%s, timeout=%.0fс, спроба=%s/%s)",
-                        provider.name, model, label, timeout, attempt + 1, max_retries + 1,
-                    )
-                    if attempt < max_retries:
-                        continue
-                    break  # переходимо до наступної моделі/провайдера
-                except openai.AuthenticationError:
-                    logger.error(
-                        "AI провайдер %s відповів помилкою авторизації (невірний/протермінований "
-                        "ключ) — пропускаю весь провайдер на %.0fс (label=%s)",
-                        provider.name, AUTH_ERROR_COOLDOWN_SECONDS, label,
-                    )
-                    for m in provider.models:
-                        _mark_unavailable((provider.name, m), AUTH_ERROR_COOLDOWN_SECONDS)
-                    break
-                except openai.RateLimitError as e:
-                    cooldown = _cooldown_from_error(e) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-                    _mark_unavailable(key, cooldown)
-                    logger.warning(
-                        "AI 429 (rate limit) на %s/%s, пауза на %.0fс, пробую наступну модель/провайдера (label=%s)",
-                        provider.name, model, cooldown, label,
-                    )
-                    break  # НЕ повторюємо ту саму модель
-                except openai.BadRequestError:
-                    # Найчастіша причина — модель не приймає response_format=json_object.
-                    if json_mode and key not in _no_json_support:
-                        _no_json_support.add(key)
-                        logger.info(
-                            "%s/%s не підтримує response_format=json_object, повторюю без нього (label=%s)",
-                            provider.name, model, label,
-                        )
-                        continue  # той самий attempt-бюджет, той самий запит, але тепер без json
-                    logger.exception("AI BadRequestError (provider=%s, model=%s, label=%s)", provider.name, model, label)
-                    break
-                except Exception:
-                    logger.exception("AI request failed (provider=%s, model=%s, label=%s)", provider.name, model, label)
-                    break
+            text, outcome = await _run_model(
+                provider, model, messages, temperature, json_mode, expect_json, label, allow_retry,
+            )
+            if outcome == _OK:
+                return text
+            if outcome == _SLOW:
+                slow_used += 1
+            elif outcome == _PROVIDER_DOWN:
+                break
+        if limit_reached:
+            break
 
-                choice = resp.choices[0]
-                raw = (choice.message.content or "").strip()
-                if raw:
-                    logger.info("AI успішно відповів (provider=%s, model=%s, label=%s)", provider.name, model, label)
-                    return _strip_safety_noise(raw)
-
-                finish_reason = getattr(choice, "finish_reason", None)
-                logger.warning(
-                    "AI повернув ПОРОЖНІЙ content (provider=%s, model=%s, label=%s, finish_reason=%s, спроба=%s/%s)",
-                    provider.name, model, label, finish_reason, attempt + 1, max_retries + 1,
-                )
-                if attempt < max_retries:
-                    continue
-                break  # наступна модель/провайдер
-
-    provider_names = [p.name for p in _providers]
     logger.error(
-        "Усі AI-провайдери недоступні для запиту (label=%s, провайдери=%s)", label, provider_names,
+        "Усі AI-провайдери/моделі недоступні для запиту (label=%s, спроб з повільною відмовою=%s, провайдери=%s)",
+        label, slow_used, [p.name for p in _providers],
     )
     return None
 
@@ -449,10 +773,14 @@ async def _complete(
     json_mode: bool,
     images: list[str] | None = None,
     allow_retry: bool = True,
+    expect_json: bool = False,
 ) -> str | None:
     content = _build_content(prompt, images)
     messages = [{"role": "user", "content": content}]
-    return await _chat_completion(messages, temperature, json_mode, label="generate", allow_retry=allow_retry)
+    return await _chat_completion(
+        messages, temperature, json_mode, label="generate", allow_retry=allow_retry,
+        expect_json=expect_json, needs_vision=bool(images),
+    )
 
 
 async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
@@ -460,32 +788,14 @@ async def generate_text(prompt: str, temperature: float = 0.6) -> str | None:
 
 
 async def generate_json(prompt: str, temperature: float = 0.7, images: list[str] | None = None) -> dict | None:
-    """Основний шлях: запит у json_mode. Якщо результат не парситься як
-    JSON-об'єкт, робимо ОДИН додатковий запит у звичайному текстовому
-    режимі. Обидва проходи для важкої генерації (label="generate")
-    використовують довший AI_GENERATE_TIMEOUT_SECONDS і без внутрішнього
-    повтору (див. _effective_retry_budget)."""
-    raw = await _complete(prompt, temperature, json_mode=True, images=images)
+    """Кожна модель у ланцюжку перевіряється НА ВАЛІДНИЙ JSON: обрізана
+    відповідь або сміття означають перехід до наступної моделі. Тому
+    окремий "текстовий" другий прохід більше не потрібен."""
+    raw = await _complete(prompt, temperature, json_mode=True, images=images, expect_json=True)
     data = _try_parse_json_dict(raw)
-    if data is not None:
-        return data
-
-    if raw is not None:
-        logger.warning("AI повернув JSON, який не вдалось розпарсити (json_mode), пробую текстовий режим. raw[:300]=%r", raw[:300])
-    else:
-        logger.warning("AI не повернув відповіді в json_mode, пробую текстовий режим.")
-
-    raw_fallback = await _complete(prompt, temperature, json_mode=False, images=images, allow_retry=False)
-    data = _try_parse_json_dict(raw_fallback)
-    if data is not None:
-        logger.info("Текстовий fallback-запит дав валідний JSON.")
-        return data
-
-    if raw_fallback is not None:
-        logger.error("AI повернув некоректний JSON навіть у текстовому режимі: %s", raw_fallback[:300])
-    else:
-        logger.error("AI не відповів навіть у текстовому fallback-режимі.")
-    return None
+    if data is None:
+        logger.error("AI не повернув валідний JSON (усі моделі в ланцюжку відпали).")
+    return data
 
 
 async def chat(messages: list[dict], temperature: float = 0.7) -> str | None:
@@ -496,11 +806,16 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
     if not _providers:
         return None
 
+    await _maybe_refresh_free_models()
+    tried: set[tuple[tuple[str, str], str]] = set()
+
     for provider in _providers:
-        for model in provider.models:
+        for model in _candidates(provider, needs_tools=True):
+            ident = (provider.identity, model)
             key = (provider.name, model)
-            if _is_unavailable(key):
+            if ident in tried or _is_unavailable(key):
                 continue
+            tried.add(ident)
             try:
                 resp = await asyncio.wait_for(
                     provider.client.chat.completions.create(
@@ -508,14 +823,17 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
                     ),
                     timeout=AI_REQUEST_TIMEOUT_SECONDS,
                 )
-                return resp.choices[0].message
+                choices = getattr(resp, "choices", None)
+                if not choices:
+                    logger.warning("AI chat_with_tools: порожній choices (provider=%s, model=%s)", provider.name, model)
+                    continue
+                return choices[0].message
             except asyncio.TimeoutError:
                 logger.warning("AI chat_with_tools timeout (provider=%s, model=%s)", provider.name, model)
                 continue
             except openai.AuthenticationError:
                 logger.error(
-                    "AI chat_with_tools: провайдер %s відповів помилкою авторизації, пропускаю провайдер",
-                    provider.name,
+                    "AI chat_with_tools: провайдер %s — помилка авторизації, пропускаю провайдер", provider.name,
                 )
                 for m in provider.models:
                     _mark_unavailable((provider.name, m), AUTH_ERROR_COOLDOWN_SECONDS)
@@ -523,19 +841,30 @@ async def chat_with_tools(messages: list[dict], tools: list[dict], temperature: 
             except openai.RateLimitError as e:
                 cooldown = _cooldown_from_error(e) or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
                 _mark_unavailable(key, cooldown)
-                logger.warning("AI chat_with_tools 429 (provider=%s, model=%s), пробую наступну модель", provider.name, model)
+                logger.warning("AI chat_with_tools 429 (provider=%s, model=%s)", provider.name, model)
+                continue
+            except openai.NotFoundError as e:
+                _mark_unavailable(key, MODEL_GONE_COOLDOWN_SECONDS)
+                logger.warning(
+                    "AI chat_with_tools 404: %s/%s недоступна: %s", provider.name, model, _short_error(e),
+                )
                 continue
             except Exception:
-                logger.warning("Провайдер %s / модель %s не прийняла tools, пробую без них", provider.name, model, exc_info=True)
+                logger.warning(
+                    "Провайдер %s / модель %s не прийняла tools, пробую без них",
+                    provider.name, model, exc_info=True,
+                )
                 try:
                     resp = await asyncio.wait_for(
                         provider.client.chat.completions.create(model=model, messages=messages, temperature=temperature),
                         timeout=AI_REQUEST_TIMEOUT_SECONDS,
                     )
-                    return resp.choices[0].message
+                    choices = getattr(resp, "choices", None)
+                    if choices:
+                        return choices[0].message
                 except Exception:
                     logger.exception("AI chat_with_tools request failed (provider=%s, model=%s)", provider.name, model)
-                    continue
+                continue
 
     logger.error("Усі AI-провайдери недоступні для chat_with_tools")
     return None
@@ -564,13 +893,13 @@ async def extract_receipt(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
         ],
     }]
 
-    raw = await _chat_completion(messages, temperature=0.2, json_mode=True, label="extract_receipt")
+    raw = await _chat_completion(
+        messages, temperature=0.2, json_mode=True, label="extract_receipt", expect_json=True, needs_vision=True,
+    )
     data = _try_parse_json_dict(raw)
-    if data is not None:
-        return data
-    if raw is not None:
-        logger.error("AI повернув некоректний JSON для чека: %s", raw[:300])
-    return None
+    if data is None:
+        logger.error("AI не повернув валідний JSON для чека")
+    return data
 
 
 async def transcribe_voice(audio_bytes: bytes) -> str | None:
@@ -621,10 +950,11 @@ async def analyze_product_photo(image_bytes: bytes, mime_type: str = "image/jpeg
         ],
     }]
 
-    raw = await _chat_completion(messages, temperature=0.4, json_mode=True, label="analyze_product_photo")
+    raw = await _chat_completion(
+        messages, temperature=0.4, json_mode=True, label="analyze_product_photo",
+        expect_json=True, needs_vision=True,
+    )
     data = _try_parse_json_dict(raw)
-    if data is not None:
-        return data
-    if raw is not None:
-        logger.error("AI повернув некоректний JSON для товару: %s", raw[:300])
-    return None
+    if data is None:
+        logger.error("AI не повернув валідний JSON для товару")
+    return data

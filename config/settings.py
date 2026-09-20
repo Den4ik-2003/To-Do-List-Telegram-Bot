@@ -1,5 +1,3 @@
-
-
 import os
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -10,16 +8,40 @@ REMINDER_BEFORE_MINUTES = int(os.environ.get("REMINDER_BEFORE_MINUTES", "10"))
 DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "21:00")
 
 AI_API_KEY = os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1")
-AI_MODEL = os.environ.get("AI_MODEL", "google/gemini-2.0-flash-exp:free")
+AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1").strip()
+# Якщо AI_MODEL не задано (або задано порожнім) — беремо роутер безкоштовних
+# моделей OpenRouter. Головну роботу все одно робить авто-добір живих
+# безкоштовних моделей в services/ai_service.py (див. AI_AUTO_FREE_MODELS).
+AI_MODEL = os.environ.get("AI_MODEL", "").strip() or "openrouter/free"
 AI_DAILY_PLAN_TIME = os.environ.get("AI_DAILY_PLAN_TIME", "09:00")
 AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().lower() == "true"
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
 AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
-AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL)
-AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", AI_MODEL)
+AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL).strip()
+AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", "").strip() or AI_MODEL
+
+# --- НОВЕ: стійкість AI до "мертвих" безкоштовних моделей ---
+# Таймаут для ЛЕГКИХ запитів (chat, розбір чека, аналіз фото товару).
+AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("AI_REQUEST_TIMEOUT_SECONDS", "30"))
+# Максимальний ЗАГАЛЬНИЙ час однієї спроби генерації сайту (стрімінг).
+AI_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("AI_GENERATE_TIMEOUT_SECONDS", "240"))
+# Скільки секунд дозволено мовчати моделі, яка стрімить відповідь (і чекати
+# першого токена). Зависла модель відсікається за цей час, а не за 240с.
+AI_STREAM_IDLE_TIMEOUT_SECONDS = int(os.environ.get("AI_STREAM_IDLE_TIMEOUT_SECONDS", "60"))
+# Верхня межа довжини відповіді при генерації (реально застосовується
+# лише коли ліміт моделі відомий з каталогу OpenRouter).
+AI_GENERATE_MAX_TOKENS = int(os.environ.get("AI_GENERATE_MAX_TOKENS", "16000"))
+# Скільки МОДЕЛЕЙ максимум пробуємо на один запит, якщо вони "повільно
+# падають" (таймаут / порожньо / обрізано / зламаний JSON). Миттєві відмови
+# (404, 429, 401) у цей ліміт не входять.
+AI_MAX_MODELS_PER_REQUEST = int(os.environ.get("AI_MAX_MODELS_PER_REQUEST", "3"))
+# Авто-добір живих безкоштовних моделей з каталогу OpenRouter.
+AI_AUTO_FREE_MODELS = os.environ.get("AI_AUTO_FREE_MODELS", "true").strip().lower() == "true"
+AI_FREE_MODELS_REFRESH_SECONDS = int(os.environ.get("AI_FREE_MODELS_REFRESH_SECONDS", "3600"))
+AI_FREE_MODELS_MAX = int(os.environ.get("AI_FREE_MODELS_MAX", "8"))
+AI_FREE_MODELS_MIN_CONTEXT = int(os.environ.get("AI_FREE_MODELS_MIN_CONTEXT", "32768"))
 
 WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY") or AI_API_KEY
 WHISPER_BASE_URL = os.environ.get("WHISPER_BASE_URL") or AI_BASE_URL
@@ -98,6 +120,6 @@ MAX_PRODUCT_IMAGE_BYTES = int(os.environ.get("MAX_PRODUCT_IMAGE_BYTES", str(1_20
 PRODUCT_IMAGE_MAX_DIM = int(os.environ.get("PRODUCT_IMAGE_MAX_DIM", "1280"))
 ORDERS_DISPLAY_LIMIT = int(os.environ.get("ORDERS_DISPLAY_LIMIT", "20"))
 
-# --- НОВЕ: Cloudinary (unsigned upload) для фото товарів ---
+# --- Cloudinary (unsigned upload) для фото товарів ---
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "dbhdmnxlx")
 CLOUDINARY_UPLOAD_PRESET = os.environ.get("CLOUDINARY_UPLOAD_PRESET", "athelonImages")
