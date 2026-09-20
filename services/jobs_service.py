@@ -1,6 +1,16 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: services/jobs_service.py
 
+НОВЕ (збалансована видача з різних джерел):
+- interleave_by_source(): результати пошуку чергуються по джерелах
+  (Djinni → DOU → Work.ua → Robota.ua → знову Djinni ...), тому коли
+  handlers/jobs.py бере для оцінки лише перші N вакансій, у вибірці є по
+  кілька вакансій від КОЖНОГО джерела, а не лише від того, яке віддало
+  найбільше результатів (раніше Work.ua/Robota.ua лежали в кінці списку й
+  відрізались обмеженням).
+- _search_once() логує, скільки вакансій віддало кожне джерело (до і після
+  дедуплікації) — видно, якщо Work.ua/Robota.ua віддають 0.
+
 НОВЕ (розширений профіль + фільтр збігу):
 - Усі AI-промпти (parse_job_query, score_vacancy, analyze_vacancy_full,
   generate_cover_letter) тепер беруть профіль через
@@ -23,6 +33,7 @@ import json
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from difflib import SequenceMatcher
 from urllib.parse import quote, quote_plus
 
@@ -628,17 +639,48 @@ def apply_filters(vacancies: list[dict], filters: dict) -> list[dict]:
     return result
 
 
+def interleave_by_source(vacancies: list[dict]) -> list[dict]:
+    """Чергує вакансії по джерелах (round-robin): по одній від кожного
+    джерела по колу — Djinni, DOU, Work.ua, Robota.ua, знову Djinni ...
+    Порядок усередині кожного джерела зберігається. Завдяки цьому, коли
+    далі беруться лише перші N вакансій (handlers/jobs.py оцінює перші 15),
+    у вибірці є по кілька вакансій від КОЖНОГО джерела, а не лише від
+    того, яке віддало найбільше результатів."""
+    groups: dict[str, list[dict]] = {}
+    for v in vacancies:
+        groups.setdefault(v.get("source") or "", []).append(v)
+    if not groups:
+        return []
+
+    result: list[dict] = []
+    for i in range(max(len(g) for g in groups.values())):
+        for group in groups.values():
+            if i < len(group):
+                result.append(group[i])
+    return result
+
+
 async def _search_once(criteria: dict) -> list[dict]:
-    sources = [fetch_workua(criteria), fetch_robotaua(criteria)]
+    named_sources = [
+        ("Work.ua", fetch_workua(criteria)),
+        ("Robota.ua", fetch_robotaua(criteria)),
+    ]
     if criteria.get("is_it"):
-        sources = [fetch_djinni(criteria), fetch_dou(criteria)] + sources
+        named_sources = [
+            ("Djinni", fetch_djinni(criteria)),
+            ("DOU", fetch_dou(criteria)),
+        ] + named_sources
 
     all_results = []
-    for coro in sources:
+    raw_counts: dict[str, int] = {}
+    for name, coro in named_sources:
         try:
-            all_results.extend(await coro)
+            items = await coro
         except Exception:
-            logger.exception("A job source failed during search_vacancies")
+            logger.exception("A job source failed during search_vacancies: %s", name)
+            items = []
+        raw_counts[name] = len(items)
+        all_results.extend(items)
 
     seen_urls = set()
     unique_by_url = []
@@ -648,7 +690,13 @@ async def _search_once(criteria: dict) -> list[dict]:
         seen_urls.add(v["url"])
         unique_by_url.append(v)
 
-    return dedupe_vacancies(unique_by_url)
+    unique = dedupe_vacancies(unique_by_url)
+    logger.info(
+        "Пошук вакансій: віддали джерела %s; після дедуплікації %s (за джерелами: %s)",
+        raw_counts, len(unique), dict(Counter(v.get("source") for v in unique)),
+    )
+
+    return interleave_by_source(unique)
 
 
 async def search_vacancies(criteria: dict) -> list[dict]:
