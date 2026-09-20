@@ -1,6 +1,9 @@
 
+
 import base64
+import io
 import logging
+import zipfile
 
 import aiohttp
 from aiogram import Router, F
@@ -16,7 +19,7 @@ from database import websites as websites_db
 from database import templates as templates_db
 from database import orders as orders_db
 from services import ai_service, github_crypto, github_api, netlify_service, github_zip
-from services import website_builder_service, product_asset_service
+from services import website_builder_service, product_asset_service, cloudinary_service
 from services.website_builder_service import CloneFetchError
 from services.planner_service import check_ai_limit
 from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_WEBSITE
@@ -139,10 +142,6 @@ async def _apply_checklist_pipeline(uid: int, result: dict, checklist: list[str]
 
 
 async def _apply_quality_pipeline(uid: int, result: dict) -> dict:
-    """Після генерації/правок автоматично шукає технічні проблеми
-    (биті посилання, відсутній viewport, неробочі кнопки/форми тощо) і,
-    якщо знайдено, одразу виправляє — так, щоб користувач отримував уже
-    перевірений сайт, а не сирий код."""
     try:
         issues = await website_builder_service.run_quality_check(result["files"])
         await ai_usage_db.increment_usage(uid)
@@ -552,7 +551,7 @@ async def wb_scratch_description_received(msg: Message, state: FSMContext):
 
 
 # =========================================================
-# Спільний конвеєр: аналіз ТЗ → чекліст → уточнення → генерація → перевірка
+# Спільний конвеєр
 # =========================================================
 
 async def _start_requirements_check(
@@ -747,7 +746,7 @@ async def _generate_from_photos_and_show(
 
 
 # =========================================================
-# 👀 Переглянути / 🚀 Deploy GitHub / 🌐 Deploy Netlify
+# 👀 Переглянути / 📦 ZIP / 🚀 Deploy GitHub / 🌐 Deploy Netlify
 # =========================================================
 
 @router.callback_query(F.data == "wb_preview")
@@ -760,6 +759,37 @@ async def wb_preview(cb: CallbackQuery):
     for path, content in pending["files"].items():
         doc = BufferedInputFile(content.encode("utf-8"), filename=path.replace("/", "__"))
         await cb.message.answer_document(doc)
+
+
+@router.callback_query(F.data == "wb_download_zip")
+async def wb_download_zip(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending:
+        return await cb.answer("Немає активного сайту, почни заново", show_alert=True)
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Пакую ZIP...")
+
+    combined = _all_deploy_files(pending)
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path, content in combined.items():
+                data = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
+                zf.writestr(path, data)
+    except Exception:
+        logger.exception("wb_download_zip: не вдалося зібрати архів для uid=%s", uid)
+        return await _safe_edit(wait, _fail("Не вдалося зібрати ZIP. Спробуй ще раз."))
+
+    buf.seek(0)
+    filename = f"{(pending.get('site_name') or 'website')}.zip"
+    doc = BufferedInputFile(buf.read(), filename=filename)
+
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    await cb.message.answer_document(doc, caption=f"📦 {filename}")
 
 
 @router.callback_query(F.data == "wb_deploy_gh")
@@ -985,7 +1015,7 @@ async def wb_site_open(cb: CallbackQuery):
 
 
 # =========================================================
-# 🖼 Додавання товару через фото
+# 🖼 Додавання товару через фото — тепер із Cloudinary
 # =========================================================
 
 @router.callback_query(F.data == "wb_product_start")
@@ -1124,13 +1154,23 @@ async def wb_product_confirm(cb: CallbackQuery):
         return await cb.answer(f"Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день)", show_alert=True)
 
     await cb.answer()
-    wait = await cb.message.answer("⏳ Додаю товар на сайт...")
+    wait = await cb.message.answer("⏳ Завантажую фото в Cloudinary...")
 
     data = prod["data"]
     optimized = product_asset_service.optimize_image(prod["image_bytes"])
-    asset_path = product_asset_service.build_asset_path(data["title"], uid)
+    public_id = product_asset_service.build_public_id(data["title"], uid)
 
-    result = await website_builder_service.generate_product_card_update(pending["files"], data, asset_path)
+    image_url = await cloudinary_service.upload_image(optimized, public_id=public_id)
+    if not image_url:
+        _pending_product.pop(uid, None)
+        return await _safe_edit(wait, _fail(
+            "Не вдалося завантажити фото в Cloudinary. Перевір CLOUDINARY_CLOUD_NAME/"
+            "CLOUDINARY_UPLOAD_PRESET на сервері (і що preset увімкнено як unsigned) і спробуй ще раз."
+        ))
+
+    await _safe_edit(wait, "⏳ Додаю картку товару на сайт...")
+
+    result = await website_builder_service.generate_product_card_update(pending["files"], data, image_url)
     if not result:
         _pending_product.pop(uid, None)
         return await _safe_edit(wait, _fail("AI не зміг додати картку товару. Спробуй ще раз."))
@@ -1141,7 +1181,6 @@ async def wb_product_confirm(cb: CallbackQuery):
     pending["files"] = result["files"]
     pending["summary"] = result["summary"]
     pending["commit_message"] = result["commit_message"]
-    pending.setdefault("assets", {})[asset_path] = optimized
 
     await websites_db.update_website(uid, pending["db_id"], {
         "files": pending["files"],
@@ -1153,8 +1192,9 @@ async def wb_product_confirm(cb: CallbackQuery):
     await _safe_edit(
         wait,
         f"✅ Товар «{data['title']}» додано!\n"
-        f"🖼 Фото збережено як `{asset_path}` (буде закомічено при наступному деплої).\n\n"
-        "Не забудь передеплоїти (GitHub/Netlify), щоб товар з'явився на сайті.",
+        f"🖼 Фото вже назавжди доступне на Cloudinary: {image_url}\n\n"
+        "Саме фото деплоїти окремо не треба (воно вже онлайн), але щоб картка товару "
+        "зʼявилась на сайті — передеплой (GitHub/Netlify).",
     )
     await cb.message.answer(
         _result_text(pending),

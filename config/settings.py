@@ -1,3 +1,5 @@
+
+
 import os
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -15,7 +17,6 @@ AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
-# --- НОВЕ: резервний AI-провайдер/ключ ---
 AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
 AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL)
 AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", AI_MODEL)
@@ -39,7 +40,6 @@ THREADS_MORNING_TIME = os.environ.get("THREADS_MORNING_TIME", "08:30")
 
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
-# --- НОВЕ: 🌙 Вечірній план на завтра ---
 EVENING_PLAN_TIME = os.environ.get("EVENING_PLAN_TIME", "22:00")
 EVENING_PLAN_ENABLED = os.environ.get("EVENING_PLAN_ENABLED", "true").strip().lower() == "true"
 EVENING_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
@@ -97,3 +97,7 @@ ORDER_WEBHOOK_BASE_URL = os.environ.get("ORDER_WEBHOOK_BASE_URL", "")
 MAX_PRODUCT_IMAGE_BYTES = int(os.environ.get("MAX_PRODUCT_IMAGE_BYTES", str(1_200_000)))
 PRODUCT_IMAGE_MAX_DIM = int(os.environ.get("PRODUCT_IMAGE_MAX_DIM", "1280"))
 ORDERS_DISPLAY_LIMIT = int(os.environ.get("ORDERS_DISPLAY_LIMIT", "20"))
+
+# --- НОВЕ: Cloudinary (unsigned upload) для фото товарів ---
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "dbhdmnxlx")
+CLOUDINARY_UPLOAD_PRESET = os.environ.get("CLOUDINARY_UPLOAD_PRESET", "athelonImages")
