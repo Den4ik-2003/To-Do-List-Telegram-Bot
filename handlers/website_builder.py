@@ -1,3 +1,4 @@
+
 import base64
 import logging
 
@@ -12,14 +13,17 @@ from config.settings import AI_DAILY_LIMIT, NETLIFY_TOKEN, ORDERS_DISPLAY_LIMIT
 from database import ai_usage as ai_usage_db
 from database import github_projects as github_projects_db
 from database import websites as websites_db
+from database import templates as templates_db
 from database import orders as orders_db
-from services import ai_service, github_crypto, github_api, netlify_service
+from services import ai_service, github_crypto, github_api, netlify_service, github_zip
 from services import website_builder_service, product_asset_service
+from services.website_builder_service import CloneFetchError
 from services.planner_service import check_ai_limit
 from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_WEBSITE
 from keyboards.website_builder import (
     ikb_wb_result, ikb_wb_sites_list, ikb_wb_product_confirm, ikb_wb_delete_confirm,
     ikb_wb_history, ikb_wb_bot_manage, kb_photo_done,
+    ikb_wb_templates_list, ikb_wb_template_delete_confirm,
 )
 
 logger = logging.getLogger("tasks_bot")
@@ -30,6 +34,10 @@ _pending_product: dict[int, dict] = {}
 _pending_clarify: dict[int, dict] = {}
 _pending_photo: dict[int, dict] = {}
 _pending_bot: dict[int, dict] = {}
+_pending_template: dict[int, dict] = {}
+_pending_save_template: dict[int, dict] = {}
+
+MAX_QUALITY_FIX_ROUNDS = 1
 
 
 class WebsiteBuilder(StatesGroup):
@@ -44,6 +52,10 @@ class WebsiteBuilder(StatesGroup):
     waiting_photo_description = State()
     waiting_bot_token = State()
     waiting_bot_chat_id = State()
+    waiting_template_zip = State()
+    waiting_template_images = State()
+    waiting_template_description = State()
+    waiting_template_save_name = State()
 
 
 def _fail(reason: str) -> str:
@@ -79,6 +91,8 @@ def _result_text(pending: dict) -> str:
         lines.append(f"🌍 Netlify: {pending['netlify_url']}")
     if pending.get("checklist"):
         lines.append(f"\n📋 Пунктів ТЗ у чеклисті: {len(pending['checklist'])}")
+    if pending.get("quality_fixed"):
+        lines.append(f"🔧 Автоматично виправлено проблем якості: {pending['quality_fixed']}")
     if pending.get("db_id"):
         bot_status = "🔌 підключено" if pending.get("notify_bot_connected") else "🔕 не підключено (заявки йдуть напряму в цей бот)"
         lines.append(f"📨 Бот для замовлень: {bot_status}")
@@ -121,6 +135,33 @@ async def _apply_checklist_pipeline(uid: int, result: dict, checklist: list[str]
         result["commit_message"] = fixed["commit_message"]
         if fixed.get("site_name"):
             result["site_name"] = fixed["site_name"]
+    return result
+
+
+async def _apply_quality_pipeline(uid: int, result: dict) -> dict:
+    """Після генерації/правок автоматично шукає технічні проблеми
+    (биті посилання, відсутній viewport, неробочі кнопки/форми тощо) і,
+    якщо знайдено, одразу виправляє — так, щоб користувач отримував уже
+    перевірений сайт, а не сирий код."""
+    try:
+        issues = await website_builder_service.run_quality_check(result["files"])
+        await ai_usage_db.increment_usage(uid)
+    except Exception:
+        logger.exception("website_builder: quality check crashed for uid=%s", uid)
+        return result
+
+    if not issues:
+        return result
+
+    fixed = await website_builder_service.fix_quality_issues(result["files"], issues)
+    if fixed:
+        await ai_usage_db.increment_usage(uid)
+        result["files"] = fixed["files"]
+        result["summary"] = fixed["summary"]
+        result["commit_message"] = fixed["commit_message"]
+        if fixed.get("site_name"):
+            result["site_name"] = fixed["site_name"]
+        result["quality_fixed"] = len(issues)
     return result
 
 
@@ -174,6 +215,281 @@ async def wb_list_entry(msg: Message, state: FSMContext):
     if not sites:
         return await msg.answer("📭 Ще немає жодного збереженого сайту.")
     await msg.answer("📂 *Мої сайти*", reply_markup=ikb_wb_sites_list(sites))
+
+
+# =========================================================
+# 📦 Мій шаблон
+# =========================================================
+
+@router.message(F.text == "📦 Мій шаблон")
+async def wb_template_entry(msg: Message, state: FSMContext):
+    await state.clear()
+    if not ai_service.is_available():
+        return await msg.answer("🤖 AI зараз недоступний (не налаштовано ключ на сервері).")
+    templates = await templates_db.get_user_templates(msg.from_user.id)
+    if not templates:
+        await state.set_state(WebsiteBuilder.waiting_template_zip)
+        return await msg.answer(
+            "📦 Ще немає жодного збереженого шаблону.\n\n"
+            "Надішли ZIP-архів з HTML/CSS/JS проєкту, який хочеш використовувати як базу.",
+            reply_markup=kb_cancel(),
+        )
+    await msg.answer("📦 *Мої шаблони*\n\nОбери шаблон або завантаж новий:", reply_markup=ikb_wb_templates_list(templates))
+
+
+@router.callback_query(F.data == "wb_tpl_new")
+async def wb_tpl_new(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(WebsiteBuilder.waiting_template_zip)
+    await cb.message.answer("📦 Надішли ZIP-архів з HTML/CSS/JS проєкту.", reply_markup=kb_cancel())
+
+
+@router.callback_query(F.data == "wb_tpl_close")
+async def wb_tpl_close(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("wb_tpl_del_yes:"))
+async def wb_tpl_del_yes(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    ok = await templates_db.delete_template(cb.from_user.id, tid)
+    await cb.answer("Видалено ✅" if ok else "Не знайдено", show_alert=not ok)
+    if ok:
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data == "wb_tpl_del_no")
+async def wb_tpl_del_no(cb: CallbackQuery):
+    await cb.answer("Скасовано")
+
+
+@router.callback_query(F.data.startswith("wb_tpl_del:"))
+async def wb_tpl_del_ask(cb: CallbackQuery):
+    tid = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await cb.message.answer("Видалити цей шаблон назавжди?", reply_markup=ikb_wb_template_delete_confirm(tid))
+
+
+@router.message(WebsiteBuilder.waiting_template_zip, F.text == "❌ Скасувати")
+async def wb_template_zip_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(WebsiteBuilder.waiting_template_zip, F.document)
+async def wb_template_zip_received(msg: Message, state: FSMContext, bot):
+    doc = msg.document
+    if not (doc.file_name or "").lower().endswith(".zip"):
+        return await msg.answer("⚠️ Це не ZIP-файл. Надішли архів з розширенням .zip")
+
+    if doc.file_size and doc.file_size > github_zip.MAX_ZIP_SIZE:
+        return await msg.answer(_fail(
+            f"Архів завеликий ({github_zip.fmt_size(doc.file_size)}, "
+            f"ліміт — {github_zip.MAX_ZIP_SIZE // (1024 * 1024)} МБ)."
+        ))
+
+    wait = await msg.answer("⏳ Завантажую і перевіряю архів...")
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        buf = await bot.download_file(tg_file.file_path)
+        zip_bytes = buf.read()
+    except Exception:
+        logger.exception("Не вдалося завантажити ZIP шаблону для uid=%s", msg.from_user.id)
+        return await _safe_edit(wait, _fail("Не вдалося завантажити файл із Telegram. Спробуй ще раз."))
+
+    try:
+        info = github_zip.extract_zip(zip_bytes)
+    except github_zip.ZipValidationError as e:
+        return await _safe_edit(wait, _fail(f"{e.reason} {e.hint}"))
+    except Exception:
+        logger.exception("Zip extraction crashed for template uid=%s", msg.from_user.id)
+        return await _safe_edit(wait, _fail("Не вдалося обробити архів. Перевір архів і спробуй ще раз."))
+
+    text_files: dict[str, str] = {}
+    binary_files: dict[str, bytes] = {}
+    for path, content in info["files"].items():
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in {"html", "htm", "css", "js", "json", "svg", "txt", "md"}:
+            try:
+                text_files[path] = content.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+        else:
+            binary_files[path] = content
+
+    if not any(p.lower().endswith((".html", ".htm")) for p in text_files):
+        return await _safe_edit(wait, _fail(
+            "В архіві не знайдено жодного HTML-файлу. Перевір, що це проєкт сайту, і спробуй ще раз."
+        ))
+
+    project_name = (doc.file_name or "template").rsplit(".", 1)[0]
+    _pending_template[msg.from_user.id] = {
+        "files": text_files, "assets": binary_files, "images": [], "name": project_name,
+    }
+    await state.set_state(WebsiteBuilder.waiting_template_images)
+    await _safe_edit(
+        wait,
+        f"✅ Шаблон «{project_name}» завантажено ({len(text_files)} текстових файлів, "
+        f"{len(binary_files)} ресурсів).\n\n"
+        "🖼 Можеш додатково надіслати скріншоти бажаного вигляду (необов'язково) або одразу "
+        "натисни «✅ Готово», щоб перейти до опису змін.",
+    )
+    await msg.answer("Надішли фото або натисни «✅ Готово»:", reply_markup=kb_photo_done())
+
+
+@router.message(WebsiteBuilder.waiting_template_zip)
+async def wb_template_zip_wrong_type(msg: Message):
+    await msg.answer("📦 Очікую ZIP-архів файлом (не текст).")
+
+
+@router.message(WebsiteBuilder.waiting_template_images, F.photo)
+async def wb_template_image_received(msg: Message, state: FSMContext, bot):
+    uid = msg.from_user.id
+    ctx = _pending_template.get(uid)
+    if ctx is None:
+        await state.clear()
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+    if len(ctx["images"]) >= 10:
+        return await msg.answer("⚠️ Максимум 10 фото. Натисни «✅ Готово», щоб продовжити.")
+
+    try:
+        photo = msg.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buf = await bot.download_file(file.file_path)
+        image_bytes = buf.read()
+    except Exception:
+        logger.exception("Не вдалося завантажити фото шаблону для uid=%s", uid)
+        return await msg.answer("⚠️ Не вдалося завантажити фото. Спробуй ще раз.")
+
+    ctx["images"].append(image_bytes)
+    await msg.answer(f"📸 Додано ({len(ctx['images'])}/10). Надішли ще фото або натисни «✅ Готово».")
+
+
+@router.message(WebsiteBuilder.waiting_template_images, F.text == "✅ Готово")
+async def wb_template_images_done(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    if uid not in _pending_template:
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+    await state.set_state(WebsiteBuilder.waiting_template_description)
+    await msg.answer(
+        "✏️ Опиши, що потрібно змінити в шаблоні (продукт, тексти, кольори, товари тощо) "
+        "або напиши «-», щоб лишити шаблон майже як є.",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(WebsiteBuilder.waiting_template_images, F.text == "❌ Скасувати")
+@router.message(WebsiteBuilder.waiting_template_description, F.text == "❌ Скасувати")
+async def wb_template_flow_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    _pending_template.pop(msg.from_user.id, None)
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(WebsiteBuilder.waiting_template_description)
+async def wb_template_description_received(msg: Message, state: FSMContext):
+    await state.clear()
+    uid = msg.from_user.id
+    ctx = _pending_template.pop(uid, None)
+    if not ctx:
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        return await msg.answer(f"📊 Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день).", reply_markup=kb_main())
+
+    description = (msg.text or "").strip()
+    description = "" if description == "-" else description
+    checklist: list[str] = []
+
+    if description:
+        wait = await msg.answer("⏳ Аналізую побажання...")
+        analysis = await website_builder_service.analyze_requirements(description)
+        if analysis:
+            await ai_usage_db.increment_usage(uid)
+            checklist = analysis["checklist"]
+    else:
+        wait = await msg.answer("⏳ Адаптую шаблон...")
+
+    data_uris = [f"data:image/jpeg;base64,{base64.b64encode(b).decode()}" for b in ctx.get("images", [])]
+    result = await website_builder_service.generate_from_template(
+        ctx["files"], description, checklist, data_uris or None,
+    )
+    if not result:
+        return await _safe_edit(wait, _fail("AI не зміг адаптувати шаблон. Спробуй описати зміни детальніше."))
+
+    result = await _apply_checklist_pipeline(uid, result, checklist)
+    result = await _apply_quality_pipeline(uid, result)
+
+    _pending[uid] = {
+        "mode": "template", "db_id": None,
+        "github_owner": None, "github_repo": None, "branch": None,
+        "netlify_site_id": None, "netlify_url": None,
+        "assets": dict(ctx.get("assets", {})), "checklist": checklist, "notify_bot_connected": False,
+        **result,
+    }
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    await wait.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False, False))
+
+
+@router.callback_query(F.data.startswith("wb_tpl_use:"))
+async def wb_tpl_use(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    tid = cb.data.split(":", 1)[1]
+    tpl = await templates_db.get_template(uid, tid)
+    if not tpl:
+        return await cb.answer("Шаблон не знайдено", show_alert=True)
+    await cb.answer()
+    _pending_template[uid] = {"files": tpl.get("files", {}), "assets": {}, "images": [], "name": tpl.get("name", "template")}
+    await state.set_state(WebsiteBuilder.waiting_template_images)
+    await cb.message.answer(
+        f"📦 Шаблон «{tpl.get('name')}» обрано.\n\n"
+        "🖼 Можеш надіслати скріншоти бажаного вигляду (необов'язково) або натисни «✅ Готово».",
+        reply_markup=kb_photo_done(),
+    )
+
+
+# =========================================================
+# 💾 Зберегти сайт як шаблон
+# =========================================================
+
+@router.callback_query(F.data == "wb_save_as_template")
+async def wb_save_as_template_start(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    if uid not in _pending:
+        return await cb.answer("Немає активного сайту, почни заново", show_alert=True)
+    await cb.answer()
+    await state.set_state(WebsiteBuilder.waiting_template_save_name)
+    await cb.message.answer("Як назвати цей шаблон?", reply_markup=kb_cancel())
+
+
+@router.message(WebsiteBuilder.waiting_template_save_name, F.text == "❌ Скасувати")
+async def wb_save_template_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(WebsiteBuilder.waiting_template_save_name)
+async def wb_save_template_name(msg: Message, state: FSMContext):
+    await state.clear()
+    uid = msg.from_user.id
+    pending = _pending.get(uid)
+    if not pending:
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+
+    name = (msg.text or "").strip()[:60] or pending.get("site_name") or "template"
+    await templates_db.create_template(uid, name, dict(pending["files"]))
+    await msg.answer(f"✅ Шаблон «{name}» збережено. Знайти його можна в «📦 Мій шаблон».", reply_markup=kb_main())
 
 
 # =========================================================
@@ -291,10 +607,13 @@ async def wb_clarification_received(msg: Message, state: FSMContext):
 async def _generate_and_show(
     wait: Message, uid: int, mode: str, description: str, source_url: str | None, checklist: list[str],
 ) -> None:
+    warning_text = None
     if mode == "clone":
-        source_ref = await website_builder_service.fetch_source_reference(source_url)
-        if not source_ref:
-            return await _safe_edit(wait, _fail("Не вдалося завантажити сторінку за цим посиланням. Перевір URL і спробуй ще раз."))
+        try:
+            source_ref = await website_builder_service.fetch_source_reference(source_url)
+        except CloneFetchError as e:
+            return await _safe_edit(wait, e.user_message)
+        warning_text = website_builder_service.clone_warning_message(source_ref)
         result = await website_builder_service.generate_clone_redesign(source_ref, description, checklist)
     else:
         result = await website_builder_service.generate_landing_from_scratch(description, checklist)
@@ -303,6 +622,7 @@ async def _generate_and_show(
         return await _safe_edit(wait, _fail("AI не зміг сформувати сайт із цих даних. Спробуй описати детальніше."))
 
     result = await _apply_checklist_pipeline(uid, result, checklist)
+    result = await _apply_quality_pipeline(uid, result)
 
     _pending[uid] = {
         "mode": mode, "db_id": None,
@@ -315,6 +635,8 @@ async def _generate_and_show(
         await wait.delete()
     except Exception:
         pass
+    if warning_text:
+        await wait.answer(warning_text)
     await wait.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False, False))
 
 
@@ -408,6 +730,7 @@ async def _generate_from_photos_and_show(
         return await _safe_edit(wait, _fail("AI не зміг відтворити сайт із цих фото. Спробуй чіткіші скріншоти або додай опис."))
 
     result = await _apply_checklist_pipeline(uid, result, checklist)
+    result = await _apply_quality_pipeline(uid, result)
 
     _pending[uid] = {
         "mode": "photo", "db_id": None,
@@ -602,6 +925,7 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
         return await _safe_edit(wait, _fail("AI не зміг застосувати ці правки. Спробуй переформулювати."))
 
     await ai_usage_db.increment_usage(uid)
+    result = await _apply_quality_pipeline(uid, result)
     await _save_version_snapshot(uid, pending)
 
     pending["files"] = result["files"]
@@ -609,6 +933,8 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
     pending["commit_message"] = result["commit_message"]
     if result.get("site_name"):
         pending["site_name"] = result["site_name"]
+    if result.get("quality_fixed"):
+        pending["quality_fixed"] = result["quality_fixed"]
 
     if pending.get("db_id"):
         await websites_db.update_website(uid, pending["db_id"], {

@@ -1,3 +1,4 @@
+
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -57,7 +58,8 @@ MAIN_CATEGORIES = {
     ],
     CATEGORY_WEBSITE: [
         "🔗 Клонувати сайт", "🤖 Новий лендінг",
-        "📂 Мої сайти", "🖼 Сайт із фото",
+        "🖼 Сайт із фото", "📦 Мій шаблон",
+        "📂 Мої сайти",
     ],
 }
 

@@ -1,10 +1,14 @@
+
 from aiogram.types import InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
 def ikb_wb_result(has_github: bool, has_netlify: bool, has_db_id: bool = False) -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="👀 Переглянути", callback_data="wb_preview"))
+    b.row(
+        InlineKeyboardButton(text="👀 Переглянути", callback_data="wb_preview"),
+        InlineKeyboardButton(text="📦 Завантажити ZIP", callback_data="wb_download_zip"),
+    )
     b.row(
         InlineKeyboardButton(
             text="🚀 Deploy GitHub" if not has_github else "🐙 Оновити GitHub",
@@ -25,6 +29,7 @@ def ikb_wb_result(has_github: bool, has_netlify: bool, has_db_id: bool = False) 
             InlineKeyboardButton(text="🕐 Історія версій", callback_data="wb_history_view"),
             InlineKeyboardButton(text="🔍 Перевірити ТЗ", callback_data="wb_checklist_check"),
         )
+        b.row(InlineKeyboardButton(text="💾 Зберегти як шаблон", callback_data="wb_save_as_template"))
         b.row(InlineKeyboardButton(text="📨 Бот для замовлень", callback_data="wb_bot_manage"))
         b.row(InlineKeyboardButton(text="🗑 Видалити", callback_data="wb_delete_start"))
     b.row(InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_cancel"))
@@ -76,6 +81,28 @@ def ikb_wb_bot_manage(is_connected: bool) -> InlineKeyboardBuilder:
     if is_connected:
         b.row(InlineKeyboardButton(text="🔕 Відключити", callback_data="wb_bot_disconnect"))
     b.row(InlineKeyboardButton(text="❌ Закрити", callback_data="wb_bot_manage_close"))
+    return b.as_markup()
+
+
+def ikb_wb_templates_list(templates: list[dict]) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    for t in templates:
+        name = t.get("name") or "Без назви"
+        b.row(
+            InlineKeyboardButton(text=f"📦 {name}", callback_data=f"wb_tpl_use:{t['_id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"wb_tpl_del:{t['_id']}"),
+        )
+    b.row(InlineKeyboardButton(text="➕ Завантажити новий шаблон", callback_data="wb_tpl_new"))
+    b.row(InlineKeyboardButton(text="❌ Закрити", callback_data="wb_tpl_close"))
+    return b.as_markup()
+
+
+def ikb_wb_template_delete_confirm(template_id: str) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"wb_tpl_del_yes:{template_id}"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_tpl_del_no"),
+    )
     return b.as_markup()
 
 
