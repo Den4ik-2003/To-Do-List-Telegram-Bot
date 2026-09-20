@@ -58,6 +58,12 @@ JOB_CHECK_INTERVAL_MINUTES = int(os.environ.get("JOB_CHECK_INTERVAL_MINUTES", "6
 JOB_AUTOSEARCH_NOON_TIME = os.environ.get("JOB_AUTOSEARCH_NOON_TIME", "13:00")
 JOB_AUTOSEARCH_EVENING_TIME = os.environ.get("JOB_AUTOSEARCH_EVENING_TIME", "19:00")
 
+# --- НОВЕ: мінімальний відсоток збігу вакансії з профілем ---
+# Показуємо лише вакансії, де match_percent СТРОГО БІЛЬШИЙ за це значення
+# (за замовчуванням > 50%). Вакансії, які не вдалося оцінити (match_percent
+# порожній), не показуються, а повторно перевіряються наступним прогоном.
+JOB_MIN_MATCH_PERCENT = int(os.environ.get("JOB_MIN_MATCH_PERCENT", "50"))
+
 IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 IMAGE_BASE_URL = os.environ.get("IMAGE_BASE_URL", "https://api.openai.com/v1")
 IMAGE_GEN_MODEL = os.environ.get("IMAGE_GEN_MODEL", "gpt-image-1.5")

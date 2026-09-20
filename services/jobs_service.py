@@ -1,3 +1,24 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: services/jobs_service.py
+
+НОВЕ (розширений профіль + фільтр збігу):
+- Усі AI-промпти (parse_job_query, score_vacancy, analyze_vacancy_full,
+  generate_cover_letter) тепер беруть профіль через
+  database.job_profile.format_profile_for_ai() — тобто бачать УСІ заповнені
+  поля, включно з новими (рівень, проєкти, курси, переїзд, бажані сфери,
+  «що не підходить», дата старту), а не фіксований список із п'яти полів.
+- score_vacancy: детальніший промпт зі шкалою оцінок і правилами (стоп-
+  фактори, рівень, формат/локація/переїзд, зарплата, мови). У промпт тепер
+  передаються також зарплата, локація/формат і вимоги до досвіду вакансії.
+  Якщо профіль порожній (немає жодного заповненого поля) — match_percent
+  = None, як і раніше без профілю.
+- get_match_percent() / is_good_match() / filter_by_min_match() —
+  спільна логіка порогу: вакансія підходить, якщо match_percent СТРОГО
+  БІЛЬШИЙ за config.settings.JOB_MIN_MATCH_PERCENT (за замовчуванням 50).
+
+Решта функцій — без змін.
+"""
+
 import json
 import logging
 import re
@@ -9,6 +30,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
+from config.settings import JOB_MIN_MATCH_PERCENT
+from database.job_profile import format_profile_for_ai
 from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
@@ -102,14 +125,41 @@ _CARD_NOISE_LINES = {
 }
 
 
+# =========================================================
+# НОВЕ: поріг збігу з профілем
+# =========================================================
+
+def get_match_percent(vacancy: dict) -> float | None:
+    """Відсоток збігу з vacancy["_score"] або None, якщо оцінити не вдалося
+    (немає профілю / AI недоступний / AI повернув сміття)."""
+    raw = (vacancy.get("_score") or {}).get("match_percent")
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_good_match(vacancy: dict, min_percent: float | None = None) -> bool:
+    """Вакансія підходить, якщо збіг СТРОГО БІЛЬШИЙ за поріг
+    (за замовчуванням config.settings.JOB_MIN_MATCH_PERCENT)."""
+    threshold = JOB_MIN_MATCH_PERCENT if min_percent is None else min_percent
+    pct = get_match_percent(vacancy)
+    return pct is not None and pct > threshold
+
+
+def filter_by_min_match(vacancies: list[dict], min_percent: float | None = None) -> list[dict]:
+    return [v for v in vacancies if is_good_match(v, min_percent)]
+
+
 async def parse_job_query(user_text: str, profile: dict | None, feedback: list[dict] | None = None) -> dict | None:
     profile_text = ""
-    if profile:
+    profile_summary = format_profile_for_ai(profile)
+    if profile_summary:
         profile_text = (
-            f"Профіль користувача (використовуй як контекст, якщо запит не все уточнює): "
-            f"професія={profile.get('profession','')}, досвід={profile.get('experience','')}, "
-            f"навички={profile.get('skills','')}, бажана локація={profile.get('location','')}, "
-            f"формат={profile.get('work_format','')}, зарплата={profile.get('desired_salary','')}"
+            "Профіль користувача (використовуй як контекст, якщо запит не все уточнює; "
+            "пункт «Що не підходить» врахуй як виключення):\n" + profile_summary
         )
 
     feedback_text = ""
@@ -617,21 +667,39 @@ async def search_vacancies(criteria: dict) -> list[dict]:
     return vacancies
 
 
+_EMPTY_SCORE = {"match_percent": None, "fits": [], "missing": [], "highlight": "", "advice": ""}
+
+
 async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
-    if not ai_service.is_available() or not profile:
-        return {"match_percent": None, "fits": [], "missing": [], "highlight": "", "advice": ""}
+    profile_text = format_profile_for_ai(profile)
+    if not ai_service.is_available() or not profile_text:
+        return dict(_EMPTY_SCORE)
 
-    prompt = f"""Оціни відповідність вакансії профілю кандидата.
+    prompt = f"""Оціни, наскільки вакансія підходить кандидату, і поверни відсоток відповідності.
 
-Вакансія: {vacancy.get('title')} у {vacancy.get('company') or 'компанії'}.
-Вимоги/опис: {vacancy.get('requirements', '')[:800]}
+Вакансія: {vacancy.get('title')} у {vacancy.get('company') or 'компанії'}
+Зарплата: {vacancy.get('salary') or 'не вказана'}
+Локація/формат: {vacancy.get('location') or ''} {vacancy.get('work_format') or ''}
+Вимоги до досвіду: {vacancy.get('experience') or 'не вказано'}
+Вимоги/опис: {(vacancy.get('requirements') or '')[:800]}
 
 Профіль кандидата:
-Професія: {profile.get('profession','')}
-Досвід: {profile.get('experience','')}
-Навички: {profile.get('skills','')}
-Освіта: {profile.get('education','')}
-Мови: {profile.get('languages','')}
+{profile_text}
+
+Шкала match_percent:
+- 85-100: майже ідеально — професія, рівень і ключові навички збігаються
+- 65-84: добре підходить, бракує лише другорядного
+- 40-64: частково — напрямок схожий, але є суттєві прогалини
+- 0-39: не підходить
+Значення понад 50 означає, що вакансія реально варта уваги кандидата. Не завищуй оцінку.
+
+Правила:
+- Якщо вакансія потрапляє під пункт «Що не підходить» (галузь, технологія, умови) — match_percent не вище 30.
+- Якщо вакансія вимагає явно вищий рівень, ніж у кандидата (напр. Senior для Junior), суттєво знизь оцінку.
+- Врахуй формат роботи, локацію і готовність до переїзду: конфлікт (напр. лише офіс в іншому місті, а кандидат не готовий переїжджати) — знизь оцінку.
+- Якщо зарплату вказано і вона помітно нижча за бажану — знизь оцінку помірно.
+- Якщо вимагають мову, якої в профілі немає або рівень нижчий за потрібний — врахуй це.
+- Бажані сфери й проєкти кандидата — додатковий плюс, якщо вакансія в них потрапляє.
 
 Поверни ЛИШЕ JSON:
 {{"match_percent": число 0-100, "fits": ["що підходить, коротко, 1-3 слова кожне"],
@@ -639,20 +707,16 @@ async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
   "highlight": "що варто підкреслити в заявці", "advice": "чи варто подаватися, одне речення"}}"""
 
     result = await ai_service.generate_json(prompt, temperature=0.4)
-    return result or {"match_percent": None, "fits": [], "missing": [], "highlight": "", "advice": ""}
+    return result or dict(_EMPTY_SCORE)
 
 
 async def analyze_vacancy_full(vacancy: dict, profile: dict | None) -> str | None:
     if not ai_service.is_available():
         return None
 
-    if profile:
-        profile_text = f"""Профіль кандидата:
-Професія: {profile.get('profession','')}
-Досвід: {profile.get('experience','')}
-Навички: {profile.get('skills','')}
-Освіта: {profile.get('education','')}
-Мови: {profile.get('languages','')}"""
+    profile_summary = format_profile_for_ai(profile)
+    if profile_summary:
+        profile_text = f"Профіль кандидата:\n{profile_summary}"
     else:
         profile_text = ("Профіль кандидата не заповнений — оціни вакансію узагальнено, "
                          "без прив'язки до конкретних навичок кандидата, і в п.3 чесно "
@@ -681,30 +745,30 @@ async def analyze_vacancy_full(vacancy: dict, profile: dict | None) -> str | Non
 👎 Мінуси
 💡 Висновок — чи варто подаватися, одне чітке речення
 
+Якщо в профілі є пункт «Що не підходить» і вакансія під нього потрапляє — обов'язково скажи про це в мінусах і висновку.
 Пиши українською, стисло і по суті, без вступних фраз."""
 
     return await ai_service.generate_text(prompt, temperature=0.4)
 
 
 async def generate_cover_letter(vacancy: dict, profile: dict) -> str | None:
+    profile_text = format_profile_for_ai(profile)
+    portfolio = (profile or {}).get("portfolio_url") or ""
+
     prompt = f"""Напиши персональний Cover Letter під конкретну вакансію. НЕ роби шаблонним —
 адаптуй саме під цю вакансію і профіль кандидата.
 
 Вакансія: {vacancy.get('title')} у {vacancy.get('company') or 'компанії'}
-Вимоги: {vacancy.get('requirements', '')[:800]}
+Вимоги: {(vacancy.get('requirements') or '')[:800]}
 
 Профіль кандидата:
-Професія: {profile.get('profession','')}
-Досвід: {profile.get('experience','')}
-Навички: {profile.get('skills','')}
-Освіта: {profile.get('education','')}
-Мови: {profile.get('languages','')}
-Портфоліо: {profile.get('portfolio_url','')}
-Резюме (короткий опис): {profile.get('resume_summary','')}
+{profile_text}
+- Портфоліо: {portfolio}
 
 Напиши українською (якщо вакансія англомовна — англійською), 120-180 слів, без загальних
-фраз на кшталт "я командний гравець". Конкретно, з посиланням на реальні навички кандидата
-і вимоги вакансії. Поверни ЛИШЕ текст листа."""
+фраз на кшталт "я командний гравець". Конкретно, з посиланням на реальні навички кандидата,
+його проєкти/досягнення і вимоги вакансії. НЕ згадуй у листі зарплатні очікування та пункт
+«Що не підходить». Поверни ЛИШЕ текст листа."""
 
     return await ai_service.generate_text(prompt, temperature=0.6)
 

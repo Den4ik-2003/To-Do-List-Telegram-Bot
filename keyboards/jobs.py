@@ -1,9 +1,12 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: keyboards/jobs.py
 
-Додано клавіатури для флоу "📨 Відгукнутися" (без змін відносно
-попередньої версії) ТА, НОВЕ, для майстра створення автопошуку
-(handlers/jobs.py AutosearchWizard):
+НОВЕ (розширений профіль): ikb_profile_menu() — меню під екраном
+«👤 Мої дані для пошуку» (handlers/job_profile.py): «➕ Доповнити порожні»,
+«🔄 Заповнити все заново», «✖️ Закрити».
+
+Раніше додано: клавіатури для флоу "📨 Відгукнутися" та для майстра
+створення автопошуку (handlers/jobs.py AutosearchWizard):
 - ikb_autosearch_list_header(): кнопка "➕ Створити автопошук" над
   списком "🔔 Мої монітори вакансій".
 - ikb_autosearch_remote() / ikb_autosearch_level(): вибір формату роботи
@@ -167,3 +170,19 @@ def ikb_autosearch_confirm() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Створити автопошук", callback_data="aws_confirm")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="aws_cancel")],
     ])
+
+
+# =========================================================
+# НОВЕ: 👤 Профіль — меню під екраном «Мої дані для пошуку»
+# =========================================================
+
+def ikb_profile_menu(missing_count: int) -> InlineKeyboardMarkup:
+    rows = []
+    if missing_count:
+        rows.append([InlineKeyboardButton(
+            text=f"➕ Доповнити порожні ({missing_count})",
+            callback_data="jprof:missing",
+        )])
+    rows.append([InlineKeyboardButton(text="🔄 Заповнити все заново", callback_data="jprof:all")])
+    rows.append([InlineKeyboardButton(text="✖️ Закрити", callback_data="jprof:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -1,10 +1,23 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/jobs.py
 
-Додано відносно попередньої версії (флоу "📨 Відгукнутися" з подвійним
-підтвердженням — БЕЗ ЗМІН, як і раніше):
+НОВЕ (фільтр збігу + розширений профіль):
+1. Ручний пошук (_run_search_inner): показуються лише вакансії, де
+   match_percent СТРОГО БІЛЬШИЙ за config.settings.JOB_MIN_MATCH_PERCENT
+   (за замовчуванням > 50%). Над списком — коротка статистика («оцінено N,
+   підходять M»). Якщо жодна не пройшла поріг — окреме повідомлення з
+   порадою і кнопкою «🔔 Зберегти пошук». Якщо оцінити неможливо (профіль
+   порожній або AI недоступний) — показуємо все як раніше, з підказкою
+   заповнити профіль, бо відфільтрувати нічим.
+2. _profile_ready(): «є профіль» тепер означає «є хоча б одне заповнене
+   поле», а не «існує документ у БД» (документ може містити лише службові
+   поля, напр. дату підказки про профіль).
+3. send_autosearch_digest: тексти підсумку згадують поріг збігу
+   («підходящих вакансій», «нічого підходящого»).
 
-НОВЕ: 🌙 Автопошук вакансій (майстер створення + вечірній дайджест):
+Раніше додано (флоу "📨 Відгукнутися" з подвійним підтвердженням — БЕЗ ЗМІН):
+
+🌙 Автопошук вакансій (майстер створення + вечірній дайджест):
 1. AutosearchWizard — покроковий діалог створення автопошуку: назва →
    посада/ключові слова → місто → формат роботи (кнопки) → досвід
    (кнопки) → зарплата → підтвердження. Результат — jobs_db.
@@ -35,6 +48,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config.constants import AI_ERROR_TEXT
+from config.settings import JOB_MIN_MATCH_PERCENT
 from database import job_profile as job_profile_db
 from database import jobs as jobs_db
 from services import jobs_service
@@ -84,6 +98,13 @@ def _md_escape(value) -> str:
     if not value:
         return ""
     return _MD_SPECIAL_RE.sub(r"\\\1", str(value))
+
+
+def _profile_ready(profile: dict | None) -> bool:
+    """True, якщо в профілі є хоча б одне заповнене поле. Сам по собі
+    документ у БД ще не означає профіль: він може містити лише службові
+    поля (дата підказки про профіль, digest_seen_ids тощо)."""
+    return bool(job_profile_db.format_profile_for_ai(profile))
 
 
 def _fmt_match_line(score: dict) -> str:
@@ -184,20 +205,55 @@ async def _run_search_inner(msg: Message, uid: int, query_text: str):
     for v in vacancies[:15]:
         v["_score"] = await jobs_service.score_vacancy(v, profile)
         scored.append(v)
-    scored.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
 
-    _results_cache[uid] = scored
+    # Відфільтрувати за збігом можна лише коли є чим оцінювати: заповнений
+    # профіль і робочий AI. Інакше показуємо все, як раніше (з підказкою).
+    scoring_active = _profile_ready(profile) and jobs_service.ai_service.is_available()
+    if scoring_active:
+        matched = jobs_service.filter_by_min_match(scored)
+        unscored = sum(1 for v in scored if jobs_service.get_match_percent(v) is None)
+    else:
+        matched = scored
+        unscored = 0
+    matched.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
+
+    if not matched:
+        _results_cache[uid] = []
+        _position_cache[uid] = 0
+        if unscored == len(scored):
+            text = (
+                f"⚠️ Знайшов {len(scored)} вакансій, але не вдалося оцінити їх відповідність "
+                "профілю. Спробуй ще раз трохи пізніше."
+            )
+        else:
+            text = (
+                f"📭 Знайшов {len(scored)} вакансій, але жодна не підходить більш ніж на "
+                f"{JOB_MIN_MATCH_PERCENT}% з твоїм профілем"
+                + (f" (ще {unscored} не вдалося оцінити)" if unscored else "")
+                + ".\n\nСпробуй ширший запит, доповни «👤 Мої дані для пошуку» — "
+                "або збережи цей пошук, і я сам повідомлю, коли з'явиться щось підходяще."
+            )
+        return await _safe_edit(wait_msg, text, reply_markup=ikb_empty_search())
+
+    _results_cache[uid] = matched
     _position_cache[uid] = 0
 
     top3 = "\n\n".join(
         f"{i+1}. {_md_escape(v.get('title',''))} — {_fmt_match_line(v['_score'])}\n🔗 {v.get('url','')}"
-        for i, v in enumerate(scored[:3])
+        for i, v in enumerate(matched[:3])
     )
-    await _answer_safe(msg, f"🎯 *Найкращі для тебе:*\n\n{top3}")
+    header = "🎯 *Найкращі для тебе:*"
+    if scoring_active:
+        note = f"Оцінено {len(scored)}, підходять більш ніж на {JOB_MIN_MATCH_PERCENT}%: {len(matched)}"
+        if unscored:
+            note += f" (ще {unscored} не вдалося оцінити)"
+        header += f"\n_{note}_"
+    await _answer_safe(msg, f"{header}\n\n{top3}")
 
-    if not profile:
+    if not _profile_ready(profile):
         await msg.answer(
-            "💡 Заповни «👤 Мої дані для пошуку» — і я зможу оцінювати відповідність вакансій "
+            "💡 Заповни «👤 Мої дані для пошуку» — і я зможу оцінювати відповідність вакансій, "
+            f"показувати лише ті, що підходять більш ніж на {JOB_MIN_MATCH_PERCENT}%, "
             "та писати персональні cover letter."
         )
 
@@ -347,7 +403,7 @@ async def jobs_cover_cb(cb: CallbackQuery):
         return await cb.answer("Застаріло", show_alert=True)
 
     profile = await job_profile_db.get_profile(uid)
-    if not profile:
+    if not _profile_ready(profile):
         await cb.answer()
         return await cb.message.answer(
             "⚠️ Спочатку заповни «👤 Мої дані для пошуку» — cover letter пишеться на основі цих даних."
@@ -578,7 +634,7 @@ async def jobs_apply_start_cb(cb: CallbackQuery):
         return await cb.answer("Застаріло", show_alert=True)
 
     profile = await job_profile_db.get_profile(uid)
-    if not profile:
+    if not _profile_ready(profile):
         await cb.answer()
         return await cb.message.answer(
             "⚠️ Спочатку заповни «👤 Мої дані для пошуку» — без цього я не зможу підготувати "
@@ -772,7 +828,7 @@ async def jobs_apply_cancel_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# НОВЕ: 🌙 Автопошук — майстер створення
+# 🌙 Автопошук — майстер створення
 # =========================================================
 
 @router.callback_query(F.data == "jb_autosearch_new")
@@ -882,7 +938,8 @@ async def autosearch_salary_received(msg: Message, state: FSMContext):
         f"💻 Формат: {format_labels.get(data.get('work_format', 'any'), 'не важливо')}\n"
         f"📊 Досвід: {level_labels.get(data.get('level', 'any'), 'будь-який')}\n"
         f"💰 Зарплата від: {salary_min if salary_min else 'не вказано'} {salary_currency if salary_min else ''}\n\n"
-        "Автопошук працюватиме двічі на день і надсилатиме підсумок увечері."
+        "Автопошук працюватиме двічі на день і надсилатиме підсумок увечері "
+        f"(лише вакансії, що підходять більш ніж на {JOB_MIN_MATCH_PERCENT}%)."
     )
     await _answer_safe(msg, summary, reply_markup=ikb_autosearch_confirm())
 
@@ -914,13 +971,14 @@ async def autosearch_cancel_cb(cb: CallbackQuery, state: FSMContext):
 
 
 # =========================================================
-# НОВЕ: 🌙 Вечірній дайджест — виклик з планувальника
+# 🌙 Вечірній дайджест — виклик з планувальника
 # =========================================================
 
 async def send_autosearch_digest(bot: Bot, uid: int, searches: list[dict]) -> None:
     """Викликається ЛИШЕ scheduler/jobs_watch_jobs.py (run_autosearches_evening)
     раз на день. searches: [{"title": str, "vacancies": [vacancy_with_score, ...]}, ...]
-    — по одному запису на кожен активний автопошук користувача.
+    — по одному запису на кожен активний автопошук користувача. Планувальник
+    уже відфільтрував вакансії за порогом збігу (> JOB_MIN_MATCH_PERCENT).
 
     Надсилає текстовий підсумок по кожному автопошуку, а потім — ТІ Ж САМІ
     інтерактивні картки (Зберегти/AI аналіз/📨 Відгукнутися/❌ Не показувати
@@ -928,7 +986,11 @@ async def send_autosearch_digest(bot: Bot, uid: int, searches: list[dict]) -> No
     одразу веде в уже готовий флоу з подвійним підтвердженням, без дублювання
     логіки. Гарантовано показує хоча б одну вакансію повною карткою, якщо
     хоч один автопошук щось знайшов за день."""
-    lines = ["🌙 *Вечірній підсумок автопошуку вакансій*\n"]
+    lines = [
+        "🌙 *Вечірній підсумок автопошуку вакансій*",
+        f"_Лише вакансії, що підходять більш ніж на {JOB_MIN_MATCH_PERCENT}%_",
+        "",
+    ]
     all_vacancies: list[dict] = []
     seen_urls: set[str] = set()
     any_found = False
@@ -938,16 +1000,19 @@ async def send_autosearch_digest(bot: Bot, uid: int, searches: list[dict]) -> No
         vacancies = entry["vacancies"]
         if vacancies:
             any_found = True
-            lines.append(f"🔍 *{_md_escape(title)}* — знайдено {len(vacancies)} нових вакансій")
+            lines.append(f"🔍 *{_md_escape(title)}* — підходящих вакансій: {len(vacancies)}")
             for v in vacancies:
                 if v["url"] not in seen_urls:
                     seen_urls.add(v["url"])
                     all_vacancies.append(v)
         else:
-            lines.append(f"🔍 *{_md_escape(title)}* — нічого нового сьогодні")
+            lines.append(f"🔍 *{_md_escape(title)}* — нічого підходящого сьогодні")
 
     if not any_found:
-        lines.append("\nСьогодні по жодному з твоїх автопошуків нічого нового не знайшлось 😔")
+        lines.append(
+            f"\nСьогодні по жодному з твоїх автопошуків не знайшлось вакансій зі збігом "
+            f"понад {JOB_MIN_MATCH_PERCENT}% 😔"
+        )
 
     text = "\n".join(lines)
     try:

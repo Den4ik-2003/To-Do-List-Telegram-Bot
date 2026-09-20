@@ -1,7 +1,17 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: scheduler/jobs_watch_jobs.py
 
-ПОВНІСТЮ ПЕРЕРОБЛЕНО під фічу "🌙 Автопошук вакансій двічі на день":
+НОВЕ (фільтр за збігом з профілем):
+- До pending_digest і у вечірній підсумок потрапляють лише вакансії, де
+  match_percent СТРОГО БІЛЬШИЙ за config.settings.JOB_MIN_MATCH_PERCENT
+  (за замовчуванням > 50%). Решта відсіюється й у дайджесті не з'являється.
+- Вакансії, які не вдалося оцінити (match_percent порожній), НЕ вважаються
+  переглянутими: їх id не потрапляє в seen_ids, тому наступний прогін
+  спробує оцінити їх знову (щоб збій AI не «з'їв» вакансії назавжди).
+- Вечірній прогін після дайджесту раз на PROFILE_HINT_EVERY_DAYS днів
+  нагадує про неповний профіль (чим повніший профіль — тим точніший збіг).
+
+Раніше ПОВНІСТЮ ПЕРЕРОБЛЕНО під фічу "🌙 Автопошук вакансій двічі на день":
 - Раніше: один interval-джоб раз на JOB_CHECK_INTERVAL_MINUTES, який
   одразу слав окреме повідомлення про кожну нову вакансію (без AI-скору,
   без кнопок відгуку).
@@ -25,7 +35,11 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import JOB_AUTOSEARCH_NOON_TIME, JOB_AUTOSEARCH_EVENING_TIME
+from config.settings import (
+    JOB_AUTOSEARCH_NOON_TIME,
+    JOB_AUTOSEARCH_EVENING_TIME,
+    JOB_MIN_MATCH_PERCENT,
+)
 from database import job_profile as job_profile_db
 from database import jobs as jobs_db
 from services import jobs_service
@@ -42,10 +56,26 @@ def _parse_hm(value: str, fallback: tuple[int, int]) -> tuple[int, int]:
         return fallback
 
 
+def _match_percent(vacancy: dict) -> float | None:
+    """Відсоток збігу з _score вакансії або None, якщо оцінити не вдалося."""
+    raw = (vacancy.get("_score") or {}).get("match_percent")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_good_match(vacancy: dict) -> bool:
+    pct = _match_percent(vacancy)
+    return pct is not None and pct > JOB_MIN_MATCH_PERCENT
+
+
 async def _run_watch_cycle(watch: dict, profile: dict | None) -> list[dict]:
     """Виконує пошук для ОДНОГО автопошуку, оновлює seen_ids, повертає
-    НОВІ (ще не бачені) вакансії зі скором відповідності, відсортовані за
-    match_percent спадно."""
+    НОВІ (ще не бачені) вакансії зі збігом > JOB_MIN_MATCH_PERCENT,
+    відсортовані за match_percent спадно."""
     criteria = watch.get("criteria", {})
     vacancies = await jobs_service.search_vacancies(criteria)
     if not vacancies:
@@ -54,16 +84,26 @@ async def _run_watch_cycle(watch: dict, profile: dict | None) -> list[dict]:
     seen_ids = set(watch.get("seen_ids", []))
     new_items = [v for v in vacancies if v["id"] not in seen_ids]
 
-    scored_new = []
+    good: list[dict] = []
+    unscored_ids: set[str] = set()
     for v in new_items:
         v["_score"] = await jobs_service.score_vacancy(v, profile)
-        scored_new.append(v)
-    scored_new.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
+        if _match_percent(v) is None:
+            unscored_ids.add(v["id"])
+        elif _is_good_match(v):
+            good.append(v)
+    good.sort(key=lambda v: _match_percent(v) or 0, reverse=True)
 
-    all_ids = seen_ids | {v["id"] for v in vacancies}
+    logger.info(
+        "Автопошук %s: нових %s, збіг > %s%%: %s, без оцінки (повторю пізніше): %s",
+        watch.get("_id"), len(new_items), JOB_MIN_MATCH_PERCENT, len(good), len(unscored_ids),
+    )
+
+    # Неоцінені вакансії не позначаємо переглянутими — наступний прогін спробує ще раз
+    all_ids = (seen_ids | {v["id"] for v in vacancies}) - unscored_ids
     await jobs_db.update_watch_seen(watch["_id"], list(all_ids))
 
-    return scored_new
+    return good
 
 
 async def run_autosearches_noon(bot: Bot):
@@ -78,40 +118,70 @@ async def run_autosearches_noon(bot: Bot):
             if new_items:
                 await jobs_db.append_pending_digest(w["_id"], new_items)
             logger.info(
-                "Автопошук %s (uid=%s): знайдено %s нових вакансій (обід)",
+                "Автопошук %s (uid=%s): підходящих нових вакансій %s (обід)",
                 w["_id"], w["uid"], len(new_items),
             )
         except Exception:
             logger.exception("Обідній автопошук впав для watch=%s", w.get("_id"))
 
 
+async def _maybe_send_profile_hint(bot: Bot, uid: int, profile: dict | None):
+    """Раз на кілька днів нагадує, що неповний профіль = менш точний збіг."""
+    try:
+        if not job_profile_db.should_send_profile_hint(profile):
+            return
+        status = job_profile_db.get_profile_status(profile)
+        await bot.send_message(
+            uid,
+            f"💡 Профіль для підбору вакансій заповнено на {status['percent']}%.\n\n"
+            "Що більше я знаю про тебе, то точніше рахую збіг і то кращі вакансії показую.\n"
+            "Відкрий «👤 Мої дані для пошуку» → «➕ Доповнити порожні».",
+        )
+        await job_profile_db.mark_profile_hint_sent(uid)
+    except Exception:
+        logger.exception("Не вдалося надіслати підказку про профіль uid=%s", uid)
+
+
 async def run_autosearches_evening(bot: Bot):
     """Вечірній прогін: шукає ще раз, зливає з обідніми знахідками
     (pending_digest), формує й надсилає ОДИН підсумок на юзера з усіма
     активними автопошуками — гарантовано з хоча б однією повною карткою
-    вакансії, якщо щось знайдено за день."""
+    вакансії, якщо щось знайдено за день. У підсумок потрапляють лише
+    вакансії зі збігом > JOB_MIN_MATCH_PERCENT."""
     from handlers import jobs as jobs_handler  # локальний імпорт — без циклічних залежностей при старті бота
 
     watches = await jobs_db.get_all_watches()
     logger.info("Вечірній автопошук: перевіряю %s активних автопошуків", len(watches))
 
     by_uid: dict[int, list[dict]] = {}
+    profiles: dict[int, dict | None] = {}
 
     for w in watches:
         try:
             profile = await job_profile_db.get_profile(w["uid"])
+            profiles[w["uid"]] = profile
             new_items = await _run_watch_cycle(w, profile)
             if new_items:
                 await jobs_db.append_pending_digest(w["_id"], new_items)
 
             pending = await jobs_db.get_and_clear_pending_digest(w["_id"])
+            # Скор у pending_digest не зберігається (профіль міг змінитись між
+            # обідом і вечором), тому рахуємо заново і фільтруємо за порогом.
+            matched: list[dict] = []
             for v in pending:
                 if "_score" not in v:
                     v["_score"] = await jobs_service.score_vacancy(v, profile)
-            pending.sort(key=lambda v: v["_score"].get("match_percent") or 0, reverse=True)
+                if _is_good_match(v):
+                    matched.append(v)
+            matched.sort(key=lambda v: _match_percent(v) or 0, reverse=True)
+
+            logger.info(
+                "Автопошук %s (uid=%s): у накопиченому %s, після фільтра > %s%%: %s",
+                w["_id"], w["uid"], len(pending), JOB_MIN_MATCH_PERCENT, len(matched),
+            )
 
             title = w.get("title") or w.get("criteria", {}).get("profession") or "Без назви"
-            by_uid.setdefault(w["uid"], []).append({"title": title, "vacancies": pending})
+            by_uid.setdefault(w["uid"], []).append({"title": title, "vacancies": matched})
         except Exception:
             logger.exception("Вечірній автопошук впав для watch=%s", w.get("_id"))
 
@@ -120,6 +190,7 @@ async def run_autosearches_evening(bot: Bot):
             await jobs_handler.send_autosearch_digest(bot, uid, searches)
         except Exception:
             logger.exception("Не вдалося надіслати вечірній дайджест uid=%s", uid)
+        await _maybe_send_profile_hint(bot, uid, profiles.get(uid))
 
 
 def register_jobs_watch_jobs(scheduler: AsyncIOScheduler, bot: Bot):
