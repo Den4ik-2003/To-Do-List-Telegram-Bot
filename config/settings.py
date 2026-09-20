@@ -39,6 +39,10 @@ QA_MAX_PAGES = int(os.environ.get("QA_MAX_PAGES", "8"))
 CURRENCY_UPDATE_TIME = os.environ.get("CURRENCY_UPDATE_TIME", "08:00")
 WEATHER_MORNING_TIME = os.environ.get("WEATHER_MORNING_TIME", "07:30")
 
+# НОВЕ: час ранкового питання «Потрібні сьогодні Threads-пости?»
+# (scheduler/daily_jobs.py → thread_ideas_morning_task).
+THREADS_MORNING_TIME = os.environ.get("THREADS_MORNING_TIME", "08:30")
+
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
 # ЗМІНЕНО: JOB_CHECK_INTERVAL_MINUTES більше НЕ використовується

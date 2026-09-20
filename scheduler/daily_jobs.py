@@ -32,13 +32,12 @@ from services import notification_service
 from services import task_cleaner_service
 from services.planner_service import generate_daily_analysis
 from services.insights_service import detect_stalled_goal, generate_insight_text
-from services.thread_generator_service import generate_thread_ideas, format_ideas_message
 from utils.dates import parse_due
 from utils.formatting import build_daily_summary_text
 from keyboards.ai import ikb_insight_actions
 from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
-from keyboards.shop_threads import ikb_thread_ideas_actions
+from keyboards.shop_threads import ikb_threads_ask
 from keyboards.task_cleaner import ikb_cleaner_actions
 from handlers.common import compute_daily_stats
 from handlers.task_cleaner import cleaner_digest_cache
@@ -50,10 +49,10 @@ logger = logging.getLogger("scheduler.daily_jobs")
 INSIGHT_CHECK_INTERVAL_DAYS = 7
 INSIGHT_CHECK_TIME = "12:00"
 
-# Час щоденної розсилки 3 Threads-ідей для кожного магазину. Береться з
-# config.settings, якщо там визначено THREADS_MORNING_TIME; інакше — безпечне
-# значення за замовчуванням, щоб не вимагати обов'язкової правки
-# config/settings.py для роботи фічі.
+# Час щоденного ранкового питання «Потрібні сьогодні Threads-пости?» для
+# кожного магазину. Береться з config.settings, якщо там визначено
+# THREADS_MORNING_TIME; інакше — безпечне значення за замовчуванням, щоб не
+# вимагати обов'язкової правки config/settings.py для роботи фічі.
 THREADS_MORNING_TIME = getattr(_settings, "THREADS_MORNING_TIME", "08:30")
 
 # НОВЕ: день тижня для "🧹 AI-прибиральник" (0=понеділок ... 6=неділя,
@@ -345,36 +344,28 @@ async def weather_morning_task(bot: Bot):
             logger.exception("weather_morning_task outer loop failed")
 
 
-async def _send_fresh_thread_ideas(bot: Bot, shop: dict):
-    """Генерує та надсилає власнику магазину 3 нові Threads-ідеї.
-    Викликається як з ранкового автозапуску, так і потенційно вручну —
-    але для ручного натискання «🔄 Нові ідеї» використовується прямий
-    виклик з handlers/shop_threads.py, а не ця функція (там своя обробка
-    помилок з поверненням тексту в чат, а не логом)."""
+async def _ask_threads_today(bot: Bot, shop: dict):
+    """Питає власника магазину, чи потрібні сьогодні Threads-ідеї.
+    Саму генерацію запускає handlers/shop_threads.py (threads_ask_answer_cb)
+    після відповіді «✅ Так»."""
     uid = shop.get("uid")
-    shop_id = str(shop["_id"])
-    title = shop.get("title") or "Магазин"
     if not uid:
         return
+    shop_id = str(shop["_id"])
+    title = shop.get("title") or "Магазин"
 
-    sample_products = await shop_threads_db.get_sample_product_names(shop_id)
-    previous_texts = await shop_threads_db.get_recent_texts(shop_id)
-
-    ideas = await generate_thread_ideas(title, sample_products, previous_texts)
-    if not ideas:
-        logger.warning("thread_ideas_morning_task: AI не згенерував ідей для shop_id=%s (%s)", shop_id, title)
-        return
-
-    await shop_threads_db.add_ideas(uid, shop_id, ideas)
-    text = format_ideas_message(title, ideas)
-    await notification_service.safe_send(bot, uid, text, reply_markup=ikb_thread_ideas_actions(shop_id))
+    await notification_service.safe_send(
+        bot,
+        uid,
+        f"🧵 *Доброго ранку!*\n\nПотрібні сьогодні Threads-пости для «{title}»?",
+        reply_markup=ikb_threads_ask(shop_id),
+    )
 
 
 async def thread_ideas_morning_task(bot: Bot):
-    """🧵 Щоранку для кожного збереженого магазину генерує і надсилає
-    власнику 3 готові Threads-ідеї (провокаційне питання / експертна думка
-    / життєве питання), з урахуванням тематики магазину і без повторів
-    відносно раніше надісланих постів (services/thread_generator_service.py)."""
+    """🧵 Щоранку для кожного збереженого магазину питає власника, чи потрібні
+    сьогодні Threads-ідеї. Генерація (services/thread_generator_service.py)
+    запускається лише після відповіді «Так»."""
     while True:
         try:
             hh, mm = map(int, THREADS_MORNING_TIME.split(":"))
@@ -388,13 +379,13 @@ async def thread_ideas_morning_task(bot: Bot):
         await asyncio.sleep((target - now).total_seconds())
         try:
             if not ai_service.is_available():
-                logger.info("thread_ideas_morning_task: AI недоступний, пропускаю сьогоднішню розсилку")
+                logger.info("thread_ideas_morning_task: AI недоступний, пропускаю сьогоднішнє питання")
                 continue
             shops = await shop_threads_db.get_all_shops_for_broadcast()
-            logger.info("thread_ideas_morning_task: генерую Threads-ідеї для %d магазинів", len(shops))
+            logger.info("thread_ideas_morning_task: питаю про Threads-ідеї для %d магазинів", len(shops))
             for shop in shops:
                 try:
-                    await _send_fresh_thread_ideas(bot, shop)
+                    await _ask_threads_today(bot, shop)
                 except Exception:
                     logger.exception("thread_ideas_morning_task failed for shop %s", shop.get("_id"))
         except Exception:
