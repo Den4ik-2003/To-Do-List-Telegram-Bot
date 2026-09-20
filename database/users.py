@@ -1,13 +1,4 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: database/users.py
 
-Додано (для фічі "👥 Авторизовані користувачі" в налаштуваннях):
-- deauthorize(uid): прибирає користувача з auth_col і з in-memory кешу
-  authorized_uids, тобто фактично блокує його (require_auth перестане
-  пропускати цього uid).
-
-Решта функцій — 1:1 як було.
-"""
 
 import logging
 
@@ -35,8 +26,6 @@ async def authorize(uid: int):
 
 
 async def deauthorize(uid: int):
-    """НОВЕ: прибирає uid з авторизованих — і з БД, і з in-memory кешу.
-    Після цього require_auth() більше не пропускатиме цього користувача."""
     authorized_uids.discard(uid)
     await db_call(m.auth_col.delete_one({"uid": uid}))
     logger.info("Користувача %s деавторизовано (заблоковано)", uid)
@@ -68,6 +57,8 @@ async def get_user_state(uid: int) -> dict:
             "total_completed": 0, "total_missed": 0, "total_postponed": 0,
             "last_ai_plan_date": "", "ai_morning_enabled": True,
             "awaiting_morning_time": False, "awaiting_morning_date": "",
+            # НОВЕ: вечірній план на завтра
+            "evening_plan_enabled": True, "last_evening_plan_date": "",
         }
     doc.setdefault("xp", 0)
     doc.setdefault("total_completed", 0)
@@ -77,6 +68,8 @@ async def get_user_state(uid: int) -> dict:
     doc.setdefault("ai_morning_enabled", True)
     doc.setdefault("awaiting_morning_time", False)
     doc.setdefault("awaiting_morning_date", "")
+    doc.setdefault("evening_plan_enabled", True)
+    doc.setdefault("last_evening_plan_date", "")
     return doc
 
 

@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import sys
@@ -117,6 +118,7 @@ def register_routers(dp: Dispatcher) -> None:
         worktime,
         ai_planner,
         morning_plan,
+        evening_plan,
         ai_chat,
         voice,
         translator,
@@ -157,6 +159,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(worktime.router)
     dp.include_router(ai_planner.router)
     dp.include_router(morning_plan.router)
+    dp.include_router(evening_plan.router)
     dp.include_router(ai_chat.router)
     dp.include_router(voice.router)
     dp.include_router(translator.router)

@@ -1,35 +1,9 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: services/planner_service.py
 
-ДОДАНО: фіча "🔥 One Thing" — AI під час генерації ранкового плану також
-обирає ОДНУ найголовнішу дію дня (окремо від звичайного списку задач) і
-пояснює чому саме вона. Результат зберігається на весь день через
-уже існуючий узагальнений user_state (users_db.save_user_state) — без
-нових колекцій БД і без міграцій.
-
-Нове:
-- generate_daily_plan(): у промпт додано блок "one_thing" (JSON), у return
-  додано ключ "one_thing": {"text": ..., "reason": ...} | None. Після
-  вдалої генерації one_thing автоматично зберігається на сьогодні.
-- get_todays_one_thing(uid): дістати збережений на сьогодні One Thing
-  (або None, якщо на сьогодні ще не генерували / вже інший день).
-- save_one_thing(uid, one_thing): зберегти/перезаписати One Thing на
-  сьогодні (використовується і generate_daily_plan, і для "🔄 Обрати іншу").
-- mark_one_thing_done(uid): позначити сьогоднішній One Thing виконаним.
-- format_one_thing_block(one_thing): готовий текстовий блок для вставки
-  у повідомлення ранкового плану (Markdown, як і решта бота).
-
-Якщо AI з якоїсь причини не повернув валідний "one_thing" (порожньо,
-неправильний формат) — є fallback: беремо найпріоритетнішу за LABEL_ORDER
-задачу зі згенерованого tasks_out і робимо її One Thing автоматично, щоб
-фіча не "мовчала", навіть якщо AI недопрацював.
-
-Решта функцій файлу — 1:1 як було, окрім generate_daily_plan (доповнено).
-"""
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 
 from config.constants import LABELS, CATEGORIES, DEFAULT_CURRENCY, LABEL_ORDER
 from config.settings import WORK_HOURS_TEXT, AI_DAILY_LIMIT
@@ -167,7 +141,7 @@ async def _build_context(uid: int) -> dict:
 
 
 # =========================================================
-# НОВЕ: 🔥 One Thing дня
+# 🔥 One Thing дня
 # =========================================================
 
 def _today_str() -> str:
@@ -175,8 +149,6 @@ def _today_str() -> str:
 
 
 async def get_todays_one_thing(uid: int) -> dict | None:
-    """Повертає збережений на сьогодні One Thing, або None, якщо його ще
-    не генерували сьогодні (чи настав новий день)."""
     state = await users_db.get_user_state(uid)
     if state.get("one_thing_date") != _today_str():
         return None
@@ -185,8 +157,6 @@ async def get_todays_one_thing(uid: int) -> dict | None:
 
 
 async def save_one_thing(uid: int, one_thing: dict) -> None:
-    """Зберігає/перезаписує One Thing на сьогодні. Скидає прапорець
-    виконання (нова обрана задача ще не зроблена)."""
     await users_db.save_user_state(uid, {
         "one_thing_date": _today_str(),
         "one_thing": one_thing,
@@ -195,8 +165,6 @@ async def save_one_thing(uid: int, one_thing: dict) -> None:
 
 
 async def mark_one_thing_done(uid: int) -> bool:
-    """Позначає сьогоднішній One Thing виконаним. Повертає False, якщо на
-    сьогодні One Thing не було збережено (наприклад, уже минула північ)."""
     state = await users_db.get_user_state(uid)
     if state.get("one_thing_date") != _today_str():
         return False
@@ -205,9 +173,6 @@ async def mark_one_thing_done(uid: int) -> bool:
 
 
 def _fallback_one_thing_from_tasks(tasks_out: list) -> dict | None:
-    """Якщо AI не повернув валідний one_thing — беремо найпріоритетнішу
-    (за LABEL_ORDER, той самий порядок що й у database/tasks.py) задачу
-    зі щойно згенерованого списку, щоб фіча не залишалась порожньою."""
     if not tasks_out:
         return None
     best = min(tasks_out, key=lambda t: LABEL_ORDER.get(t.get("label", "idea"), 9))
@@ -215,8 +180,6 @@ def _fallback_one_thing_from_tasks(tasks_out: list) -> dict | None:
 
 
 def format_one_thing_block(one_thing: dict | None, done: bool = False) -> str:
-    """Готовий Markdown-блок для вставки у повідомлення ранкового плану
-    (чи будь-яке інше). Повертає порожній рядок, якщо one_thing відсутній."""
     if not one_thing or not one_thing.get("text"):
         return ""
     status = "✅ " if done else ""
@@ -369,6 +332,201 @@ XP: {ctx['state'].get('xp', 0)}
         "one_thing": one_thing,
         "tasks": tasks_out[:6],
     }
+
+
+# =========================================================
+# НОВЕ: фаззі-дедуп проти вже активних задач
+# =========================================================
+
+_NORM_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _normalize_text(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = _NORM_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _is_similar(a: str, b: str, threshold: float = 0.72) -> bool:
+    na, nb = _normalize_text(a), _normalize_text(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    # одна задача повністю "всередині" іншої (напр. коротший переказ довшої)
+    if len(na) >= 6 and len(nb) >= 6 and (na in nb or nb in na):
+        return True
+    return SequenceMatcher(None, na, nb).ratio() >= threshold
+
+
+def _is_similar_to_any(text: str, existing_texts: list[str], threshold: float = 0.72) -> bool:
+    return any(_is_similar(text, existing, threshold) for existing in existing_texts)
+
+
+def _dedup_against_existing(candidate_tasks: list[dict], existing_texts: list[str]) -> list[dict]:
+    result = []
+    for t in candidate_tasks:
+        if _is_similar_to_any(t["text"], existing_texts):
+            continue
+        result.append(t)
+        # щойно прийняту задачу теж враховуємо, щоб не пропустити два
+        # майже однакових НОВИХ кандидати одночасно
+        existing_texts.append(t["text"])
+    return result
+
+
+# =========================================================
+# НОВЕ: 🌙 План на завтра (вечірній флоу, без погодинного розпису)
+# =========================================================
+
+async def generate_tomorrow_plan(uid: int, hours: float) -> dict | None:
+    """Формує список НОВИХ задач на завтра під заявлену кількість годин.
+    На відміну від generate_daily_plan — БЕЗ конкретного часу (time) для
+    кожної задачі, лише список у порядку пріоритету з estimated_minutes.
+    Має подвійний захист від дублів: інструкція в промпті + програмний
+    фаззі-фільтр проти УСІХ активних задач (а не лише топ-20 з промпту)."""
+    if not ai_service.is_available():
+        return None
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        return None
+
+    all_active = await tasks_db.get_user_tasks(uid, statuses=[STATUS_PENDING])
+    existing_texts = [t.get("text", "") for t in all_active if t.get("text")]
+
+    ctx = await _build_context(uid)
+    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+    budget_minutes = int(hours * 60 * 0.9)
+
+    prompt = f"""Ти — персональний AI-планувальник задач. Відповідай виключно українською.
+
+Завтра: {tomorrow_str}
+Користувач планує працювати завтра: {hours} год (~{budget_minutes} хв корисного часу).
+
+Уже активні (ще не виконані) задачі користувача. НЕ повторюй жодну з них,
+навіть переформульовану іншими словами — це буде вважатись дублем:
+{ctx['active_text']}
+
+Довгострокові цілі користувача:
+{ctx['goals_text']}
+
+Активні проєкти (якщо вказано поточний етап — задача має просувати САМЕ його):
+{ctx['projects_text']}
+
+Сформуй список НОВИХ конкретних задач на завтра, реалістичний у межах ~{budget_minutes} хв.
+Правила:
+- НЕ дублюй жодну активну задачу вище, навіть перефразовану.
+- Кожна задача — конкретна дія, не абстрактна.
+- Сумарний estimated_minutes усіх задач не повинен перевищувати {budget_minutes} хв.
+- НЕ прив'язуй задачі до конкретних годин доби — просто впорядкований список за пріоритетом.
+- Балансуй між проєктами, роботою, цілями, не роби весь список про одне.
+
+Поверни ВИКЛЮЧНО валідний JSON без пояснень і без markdown-розмітки, формату:
+{{
+  "focus": "короткий головний фокус завтрашнього дня",
+  "tasks": [
+    {{"text": "конкретна дія", "label": "urgent|medium|low|idea|personal", "category": "work|finance|home|sport|study|other", "estimated_minutes": 30}}
+  ]
+}}"""
+
+    data = await ai_service.generate_json(prompt)
+    if not data:
+        return None
+
+    tasks_out = []
+    for it in data.get("tasks", []):
+        if not isinstance(it, dict):
+            continue
+        label = it.get("label") if it.get("label") in LABELS else "medium"
+        category = it.get("category") if it.get("category") in CATEGORIES else "other"
+        try:
+            est = int(it.get("estimated_minutes", 30))
+        except (TypeError, ValueError):
+            est = 30
+        est = max(5, min(est, 240))
+        text = str(it.get("text") or "").strip()[:200]
+        if not text:
+            continue
+        tasks_out.append({"text": text, "label": label, "category": category, "estimated_minutes": est})
+
+    if not tasks_out:
+        return None
+
+    tasks_out = _dedup_against_existing(tasks_out, list(existing_texts))
+    if not tasks_out:
+        logger.info("generate_tomorrow_plan: усі кандидати відсіяно як дублі активних задач, uid=%s", uid)
+        return None
+
+    trimmed = []
+    total = 0
+    for t in tasks_out:
+        if trimmed and total + t["estimated_minutes"] > budget_minutes:
+            continue
+        trimmed.append(t)
+        total += t["estimated_minutes"]
+        if total >= budget_minutes:
+            break
+    tasks_out = trimmed or tasks_out[:1]
+
+    await ai_usage_db.increment_usage(uid)
+
+    return {
+        "focus": str(data.get("focus", "")).strip()[:120],
+        "hours": hours,
+        "tasks": tasks_out[:8],
+    }
+
+
+async def save_tomorrow_tasks(uid: int, tasks: list[dict]) -> int:
+    """Зберігає підтверджені задачі на завтра. Другий рубіж захисту від
+    дублів: звіряє з усіма задачами, вже запланованими на завтра в БД
+    (get_tasks_due_date), а не лише з тими, що бачив AI під час генерації.
+    Розставляє due послідовно від 09:00 (для коректної роботи нагадувань/
+    rollover) — це НЕ показується користувачу як погодинний план, лише
+    зберігається у полі due кожної задачі."""
+    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+    existing = await tasks_db.get_tasks_due_date(uid, tomorrow_str)
+    existing_texts = [t.get("text", "") for t in existing if t.get("text")]
+
+    start_dt = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+    offset_minutes = 0
+    added = 0
+
+    for t in tasks:
+        if _is_similar_to_any(t["text"], existing_texts):
+            continue
+        due_dt = start_dt + timedelta(minutes=offset_minutes)
+        new_id = await tasks_db.next_task_id()
+        task = {
+            "id": new_id,
+            "uid": uid,
+            "text": t["text"],
+            "label": t["label"],
+            "category": t["category"],
+            "due": due_dt.strftime("%d.%m.%Y %H:%M"),
+            "status": STATUS_PENDING,
+            "pinned": False,
+            "subtasks": [],
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "reminded_before": False,
+            "missed_flagged": False,
+            "missed_counted": False,
+            "postponed_count": 0,
+            "postponed_today": False,
+            "source": "ai_evening",
+            "project_id": None,
+            "estimated_minutes": t.get("estimated_minutes"),
+        }
+        await tasks_db.add_task(task)
+        existing_texts.append(t["text"])
+        offset_minutes += (t.get("estimated_minutes") or 30) + 10
+        added += 1
+
+    return added
 
 
 async def generate_daily_analysis(uid: int, daily_stats: dict) -> str | None:

@@ -1,26 +1,5 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: database/tasks.py
 
-Додано:
-- get_project_tasks(uid, project_id) — саме її бракувало, через що падало
-  відкриття БУДЬ-ЯКОГО проєкту (project_service.get_project_progress його
-  викликав, а функції не існувало: AttributeError).
-- set_task_project(tid, project_id) — допоміжна функція на майбутнє, щоб
-  прив'язати вже існуючу задачу до проєкту (поки що жоден хендлер її не
-  викликає — UI для "🔗 Прив'язати задачу до проєкту" ще треба зробити
-  окремо, якщо потрібно).
-
-ВАЖЛИВО: у задачах ДОСІ немає поля project_id в жодному вже створеному
-документі — його там ніколи не було. Це не міграція, а просто новий
-ОПЦІОНАЛЬНИЙ ключ: get_project_tasks фільтрує по ньому, і задачі без
-цього поля (тобто буквально всі задачі, створені досі) просто не
-потраплять у жоден проєкт. Нічого зі старої поведінки не ламається.
-Щоб нові задачі реально прив'язувались до проєкту, треба окремо
-допрацювати місце, де задача створюється (найімовірніше handlers/tasks.py
-або ai_chat.py) — я його ще не бачив, тож туди нічого не чіпав.
-
-Решта функцій — 1:1 як було.
-"""
+import re
 
 from database import mongo as m
 from database.mongo import db_call
@@ -65,7 +44,6 @@ async def get_user_tasks(uid: int, statuses: list | None = None) -> list:
 
 
 async def find_pending(extra_filter: dict | None = None) -> list:
-    """Використовується фоновими job'ами (нагадування, rollover)."""
     query = {"status": "pending"}
     if extra_filter:
         query.update(extra_filter)
@@ -86,22 +64,33 @@ def sort_tasks_by_label_then_due(tasks: list) -> list:
 
 
 # =========================================================
-# НОВЕ: зв'язок задач із проєктами (для 📁 Мої проєкти → прогрес задач)
+# Зв'язок задач із проєктами
 # =========================================================
 
 async def get_project_tasks(uid: int, project_id: str) -> list:
-    """Задачі користувача, прив'язані до конкретного проєкту (поле project_id).
-    Ізоляція користувачів зберігається — фільтр по uid обов'язковий, як і
-    в усіх інших функціях цього файлу."""
     cursor = m.tasks_col.find({"uid": uid, "project_id": project_id}, {"_id": 0})
     tasks = await db_call(cursor.to_list(length=None), default=[]) or []
     return tasks
 
 
 async def set_task_project(tid: int, project_id: str | None):
-    """Прив'язує (або відв'язує, якщо project_id=None) існуючу задачу до проєкту.
-    Поки що не викликається жодним хендлером — заготовка на майбутнє."""
     if project_id:
         await update_task(tid, {"project_id": project_id})
     else:
         await db_call(m.tasks_col.update_one({"id": tid}, {"$unset": {"project_id": ""}}))
+
+
+# =========================================================
+# НОВЕ: задачі на конкретну дату (для вечірнього плану на завтра)
+# =========================================================
+
+async def get_tasks_due_date(uid: int, date_str: str) -> list:
+    """Усі задачі користувача (будь-якого статусу), заплановані на конкретну
+    дату — поле due зберігається як 'DD.MM.YYYY HH:MM', тому фільтруємо
+    префіксом по регулярному виразу. Використовується для другого рубежу
+    захисту від дублів при збереженні вечірнього плану."""
+    cursor = m.tasks_col.find(
+        {"uid": uid, "due": {"$regex": f"^{re.escape(date_str)}"}}, {"_id": 0}
+    )
+    tasks = await db_call(cursor.to_list(length=None), default=[]) or []
+    return tasks

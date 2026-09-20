@@ -16,10 +16,6 @@ AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
 # --- НОВЕ: резервний AI-провайдер/ключ ---
-# Якщо основний AI_API_KEY недоступний (помилка авторизації, вичерпана
-# квота, 5xx від провайдера тощо), сервіс може автоматично перейти
-# на ці резервні дані. Якщо AI_API_KEY_BACKUP не задано — резерву немає,
-# і система працює як раніше.
 AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
 AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL)
 AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", AI_MODEL)
@@ -39,29 +35,20 @@ QA_MAX_PAGES = int(os.environ.get("QA_MAX_PAGES", "8"))
 CURRENCY_UPDATE_TIME = os.environ.get("CURRENCY_UPDATE_TIME", "08:00")
 WEATHER_MORNING_TIME = os.environ.get("WEATHER_MORNING_TIME", "07:30")
 
-# НОВЕ: час ранкового питання «Потрібні сьогодні Threads-пости?»
-# (scheduler/daily_jobs.py → thread_ideas_morning_task).
 THREADS_MORNING_TIME = os.environ.get("THREADS_MORNING_TIME", "08:30")
 
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
-# ЗМІНЕНО: JOB_CHECK_INTERVAL_MINUTES більше НЕ використовується
-# scheduler/jobs_watch_jobs.py (автопошуки тепер працюють за розкладом
-# JOB_AUTOSEARCH_NOON_TIME/JOB_AUTOSEARCH_EVENING_TIME нижче), лишено
-# лише для зворотної сумісності, якщо десь ще читається.
+# --- НОВЕ: 🌙 Вечірній план на завтра ---
+EVENING_PLAN_TIME = os.environ.get("EVENING_PLAN_TIME", "22:00")
+EVENING_PLAN_ENABLED = os.environ.get("EVENING_PLAN_ENABLED", "true").strip().lower() == "true"
+EVENING_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
+
 JOB_CHECK_INTERVAL_MINUTES = int(os.environ.get("JOB_CHECK_INTERVAL_MINUTES", "60"))
 
-# --- НОВЕ: 🌙 AI Автопошук вакансій (двічі на день: обід + вечір) ---
-# Обідній прогін лише шукає й накопичує знахідки (нічого не шле користувачу).
-# Вечірній прогін шукає ще раз, зливає обидві знахідки й шле єдиний підсумок
-# по КОЖНОМУ активному автопошуку користувача (scheduler/jobs_watch_jobs.py).
 JOB_AUTOSEARCH_NOON_TIME = os.environ.get("JOB_AUTOSEARCH_NOON_TIME", "13:00")
 JOB_AUTOSEARCH_EVENING_TIME = os.environ.get("JOB_AUTOSEARCH_EVENING_TIME", "19:00")
 
-# --- НОВЕ: мінімальний відсоток збігу вакансії з профілем ---
-# Показуємо лише вакансії, де match_percent СТРОГО БІЛЬШИЙ за це значення
-# (за замовчуванням > 50%). Вакансії, які не вдалося оцінити (match_percent
-# порожній), не показуються, а повторно перевіряються наступним прогоном.
 JOB_MIN_MATCH_PERCENT = int(os.environ.get("JOB_MIN_MATCH_PERCENT", "50"))
 
 IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")

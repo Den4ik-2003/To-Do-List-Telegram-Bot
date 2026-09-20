@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -17,6 +18,8 @@ from config.settings import (
     AI_CLEANER_STALE_DAYS,
     AI_CLEANER_WEEKDAY,
     AI_CLEANER_TIME,
+    EVENING_PLAN_TIME,
+    EVENING_PLAN_ENABLED,
 )
 from config import settings as _settings
 from database import mongo as m
@@ -39,6 +42,7 @@ from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
 from keyboards.settings import ikb_archive_clear
 from keyboards.shop_threads import ikb_threads_ask
 from keyboards.task_cleaner import ikb_cleaner_actions
+from keyboards.evening_plan import ikb_evening_hours
 from handlers.common import compute_daily_stats
 from handlers.task_cleaner import cleaner_digest_cache
 
@@ -49,14 +53,8 @@ logger = logging.getLogger("scheduler.daily_jobs")
 INSIGHT_CHECK_INTERVAL_DAYS = 7
 INSIGHT_CHECK_TIME = "12:00"
 
-# Час щоденного ранкового питання «Потрібні сьогодні Threads-пости?» для
-# кожного магазину. Береться з config.settings, якщо там визначено
-# THREADS_MORNING_TIME; інакше — безпечне значення за замовчуванням, щоб не
-# вимагати обов'язкової правки config/settings.py для роботи фічі.
 THREADS_MORNING_TIME = getattr(_settings, "THREADS_MORNING_TIME", "08:30")
 
-# НОВЕ: день тижня для "🧹 AI-прибиральник" (0=понеділок ... 6=неділя,
-# сумісно з datetime.weekday()).
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 _background_tasks: set[asyncio.Task] = set()
@@ -345,9 +343,6 @@ async def weather_morning_task(bot: Bot):
 
 
 async def _ask_threads_today(bot: Bot, shop: dict):
-    """Питає власника магазину, чи потрібні сьогодні Threads-ідеї.
-    Саму генерацію запускає handlers/shop_threads.py (threads_ask_answer_cb)
-    після відповіді «✅ Так»."""
     uid = shop.get("uid")
     if not uid:
         return
@@ -363,9 +358,6 @@ async def _ask_threads_today(bot: Bot, shop: dict):
 
 
 async def thread_ideas_morning_task(bot: Bot):
-    """🧵 Щоранку для кожного збереженого магазину питає власника, чи потрібні
-    сьогодні Threads-ідеї. Генерація (services/thread_generator_service.py)
-    запускається лише після відповіді «Так»."""
     while True:
         try:
             hh, mm = map(int, THREADS_MORNING_TIME.split(":"))
@@ -392,17 +384,7 @@ async def thread_ideas_morning_task(bot: Bot):
             logger.exception("thread_ideas_morning_task outer loop failed")
 
 
-# =========================================================
-# НОВЕ: 🧹 AI-прибиральник
-# =========================================================
-
 async def ai_cleaner_task(bot: Bot):
-    """🧹 Раз на тиждень (день/час — AI_CLEANER_WEEKDAY/AI_CLEANER_TIME)
-    шукає PENDING-задачі, які довго не виконуються (алгоритмічно, за віком —
-    див. services/task_cleaner_service.py, НЕ залежить від AI-провайдера),
-    і надсилає кожному користувачу окремий дайджест із пропозицією видалити
-    їх (одразу всі / вибірково / залишити) — той самий патерн кнопок, що й
-    у групового дайджесту "📅 Автоперенесення задач"."""
     target_weekday = _WEEKDAY_MAP.get((AI_CLEANER_WEEKDAY or "mon").strip().lower(), 0)
     while True:
         if not AI_CLEANER_ENABLED:
@@ -435,6 +417,56 @@ async def ai_cleaner_task(bot: Bot):
             logger.exception("ai_cleaner_task outer loop failed")
 
 
+# =========================================================
+# НОВЕ: 🌙 Вечірній план на завтра (22:00)
+# =========================================================
+
+async def evening_plan_task(bot: Bot):
+    """Щодня о EVENING_PLAN_TIME (22:00 за замовчуванням) шле кожному
+    користувачу (з увімкненою evening_plan_enabled, раз на день) питання
+    про кількість годин на завтра з кнопками — кнопки і подальшу
+    генерацію обробляє handlers/evening_plan.py."""
+    while True:
+        if not EVENING_PLAN_ENABLED or not ai_service.is_available():
+            logger.info("evening_plan_task: вимкнено або AI недоступний, перевірю знову через 30 хв")
+            await asyncio.sleep(1800)
+            continue
+        try:
+            hh, mm = map(int, EVENING_PLAN_TIME.split(":"))
+        except ValueError:
+            hh, mm = 22, 0
+        now = datetime.now()
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        logger.info("evening_plan_task: сплю до %s (локальний час сервера)", target.isoformat())
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            uids = await get_all_uids()
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            logger.info("evening_plan_task: старт розсилки для %d користувачів", len(uids))
+            sent = 0
+            for uid in uids:
+                try:
+                    state = await get_user_state(uid)
+                    if not state.get("evening_plan_enabled", True):
+                        continue
+                    if state.get("last_evening_plan_date") == today_str:
+                        continue
+                    await save_user_state(uid, {"last_evening_plan_date": today_str})
+                    await bot.send_message(
+                        uid,
+                        "🌙 *Плануємо завтра?*\n\nСкільки годин плануєте працювати завтра?",
+                        reply_markup=ikb_evening_hours(),
+                    )
+                    sent += 1
+                except Exception:
+                    logger.exception("evening_plan_task failed for uid %s", uid)
+            logger.info("evening_plan_task: розіслано %d користувачам", sent)
+        except Exception:
+            logger.exception("evening_plan_task outer loop failed")
+
+
 def register_scheduler_jobs(bot: Bot):
     _spawn(reminder_task(bot), "reminder_task")
     _spawn(midnight_rollover_task(bot), "midnight_rollover_task")
@@ -445,4 +477,5 @@ def register_scheduler_jobs(bot: Bot):
     _spawn(weather_morning_task(bot), "weather_morning_task")
     _spawn(thread_ideas_morning_task(bot), "thread_ideas_morning_task")
     _spawn(ai_cleaner_task(bot), "ai_cleaner_task")
+    _spawn(evening_plan_task(bot), "evening_plan_task")
     logger.info("Зареєстровано %d фонових задач планувальника, посилання збережено (захист від GC)", len(_background_tasks))
