@@ -242,6 +242,43 @@ async def _update_ref(session, owner, repo, branch, commit_sha, create_branch=Fa
                 data = await resp.json()
                 raise GithubDeployError(f"ref update failed: {data}")
 
+
+async def _init_empty_repo(
+    session: aiohttp.ClientSession, owner: str, repo: str, branch: str,
+    seed_path: str, seed_content: bytes, message: str,
+) -> str:
+    """Creates the very first commit on a brand-new, completely empty
+    repository, and the target branch along with it.
+
+    The Git Data API (blobs/trees/commits) has no ref to attach to on an
+    empty repo, so POST .../git/blobs fails with 'Git Repository is empty'
+    no matter what. The Contents API doesn't have that restriction — it can
+    create a single file from nothing, and GitHub creates the branch for it
+    in the same call. This is the API equivalent of:
+
+        echo "..." >> README.md
+        git init
+        git add README.md
+        git commit -m "first commit"
+        git branch -M main
+        git remote add origin https://github.com/<owner>/<repo>.git
+        git push -u origin main
+
+    Returns the sha of the commit that was just created, so the caller can
+    use it as the parent/base_tree for the rest of the files.
+    """
+    payload = {
+        "message": message,
+        "content": base64.b64encode(seed_content).decode(),
+        "branch": branch,
+    }
+    async with session.put(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{seed_path}", json=payload) as resp:
+        data = await resp.json()
+        if resp.status not in (200, 201):
+            raise GithubDeployError(f"initial commit failed: {data}")
+        return data["commit"]["sha"]
+
+
 async def create_repo(token: str, name: str, private: bool = True) -> dict | None:
     async with aiohttp.ClientSession(headers=_headers(token)) as session:
         async with session.post(
@@ -256,6 +293,7 @@ async def create_repo(token: str, name: str, private: bool = True) -> dict | Non
                 "repo": data["name"],
                 "default_branch": data.get("default_branch", "main"),
             }
+
 
 async def repo_exists(token: str, owner: str, repo: str) -> bool:
     async with aiohttp.ClientSession(headers=_headers(token)) as session:
@@ -296,11 +334,28 @@ async def deploy_files(
     commit_message: str,
     progress_cb=None,
 ) -> str:
+    if not files:
+        raise GithubDeployError("no files to deploy")
+
     async with aiohttp.ClientSession(headers=_headers(token), timeout=aiohttp.ClientTimeout(total=90)) as session:
         parent_sha = await _get_branch_sha(session, owner, repo, branch)
-        base_tree_sha = None
-        if parent_sha:
-            base_tree_sha = await _get_commit_tree_sha(session, owner, repo, parent_sha)
+
+        if parent_sha is None:
+            # Brand-new / completely empty repo (or the branch doesn't exist
+            # yet): there is no commit for the Git Data API to build on top
+            # of, so bootstrap it first via the Contents API — same result
+            # as `git init && git commit && git push -u origin main`.
+            seed_path, seed_content = next(iter(files.items()))
+            logger.info(
+                "Repo %s/%s branch %s has no commits yet — bootstrapping via contents API",
+                owner, repo, branch,
+            )
+            parent_sha = await _init_empty_repo(
+                session, owner, repo, branch, seed_path, seed_content,
+                "first commit",
+            )
+
+        base_tree_sha = await _get_commit_tree_sha(session, owner, repo, parent_sha)
 
         tree_items = []
         total = len(files)
@@ -312,5 +367,7 @@ async def deploy_files(
 
         tree_sha = await _create_tree(session, owner, repo, base_tree_sha, tree_items)
         commit_sha = await _create_commit(session, owner, repo, commit_message, tree_sha, parent_sha)
-        await _update_ref(session, owner, repo, branch, commit_sha, create_branch=parent_sha is None)
+        # The branch now always exists by this point — either it already did,
+        # or _init_empty_repo just created it — so this is always an update.
+        await _update_ref(session, owner, repo, branch, commit_sha, create_branch=False)
         return commit_sha
