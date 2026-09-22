@@ -1,133 +1,383 @@
-# database/olx.py
 import hashlib
 from bson import ObjectId
 from datetime import datetime, timedelta
+
 from pymongo import ReturnDocument
-from database.mongo import olx_tracked_col, olx_deals_col, olx_user_settings_col, olx_search_stats_col, db_call
+
+from database.mongo import (
+    olx_tracked_col,
+    olx_deals_col,
+    olx_user_settings_col,
+    olx_search_stats_col,
+    db_call,
+)
+
 
 def _content_hash(title: str | None, price: float | None, description: str | None, photos: list | None) -> str:
-    raw = f'{title or ''}|{price or ''}|{description or ''}|{','.join(photos or [])}'
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+    raw = f"{title or ''}|{price or ''}|{description or ''}|{','.join(photos or [])}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-async def add_listing_tracker(uid: int, url: str, last_price: float | None, currency: str, title: str | None=None, description: str | None=None, location_text: str | None=None, views: int | None=None, photos_count: int | None=None, photos: list | None=None, params: list | None=None, own_listing: bool=False) -> str:
+
+async def add_listing_tracker(
+    uid: int,
+    url: str,
+    last_price: float | None,
+    currency: str,
+    title: str | None = None,
+    description: str | None = None,
+    location_text: str | None = None,
+    views: int | None = None,
+    photos_count: int | None = None,
+    photos: list | None = None,
+    params: list | None = None,
+    own_listing: bool = False,
+) -> str:
     now = datetime.now().isoformat()
-    doc = {'uid': uid, 'type': 'listing', 'url': url, 'last_price': last_price, 'currency': currency, 'title': title, 'description': description, 'location_text': location_text, 'views': views, 'photos_count': photos_count, 'photos': photos or [], 'params': params or [], 'content_hash': _content_hash(title, last_price, description, photos), 'resale_analysis': None, 'resale_analysis_at': None, 'negotiation_messages': None, 'status': 'watching', 'favorited': False, 'price_history': [{'price': last_price, 'currency': currency, 'at': now}] if last_price is not None else [], 'own_listing': own_listing, 'audit_result': None, 'audit_analysis_at': None, 'competitor_result': None, 'competitor_content_hash': None, 'created_at': now}
+    doc = {
+        "uid": uid,
+        "type": "listing",
+        "url": url,
+        "last_price": last_price,
+        "currency": currency,
+        "title": title,
+        "description": description,
+        "location_text": location_text,
+        "views": views,
+        "photos_count": photos_count,
+        "photos": photos or [],
+        "params": params or [],
+        "content_hash": _content_hash(title, last_price, description, photos),
+        "resale_analysis": None,
+        "resale_analysis_at": None,
+        "negotiation_messages": None,
+        "status": "watching",
+        "favorited": False,
+        "price_history": [{"price": last_price, "currency": currency, "at": now}] if last_price is not None else [],
+        "own_listing": own_listing,
+        # "🔍 Аудит мого оголошення" — кешування за content_hash.
+        "audit_result": None,
+        "audit_analysis_at": None,
+        # НОВЕ: "🔎 Аналіз конкурента" — окремий кеш (окремий content_hash-
+        # ключ, бо оголошення-конкурент може оновлюватись незалежно від
+        # того, чи це саме оголошення колись аналізувалось як "своє").
+        "competitor_result": None,
+        "competitor_content_hash": None,
+        "created_at": now,
+    }
     result = await db_call(olx_tracked_col.insert_one(doc))
     return str(result.inserted_id)
+
 
 async def upsert_own_listing(uid: int, url: str, details: dict) -> str:
+    """
+    Використовується і для "🔍 Аудит мого оголошення", і для
+    "🔎 Аналіз конкурента" — в обох випадках ми не хочемо плодити дублікати
+    записів при повторному аналізі того самого URL для того самого
+    користувача, тому upsert за парою (uid, url, own_listing=True). Назва
+    залишена історичною ("own_listing"), хоча тепер сюди ж потрапляють і
+    оголошення конкурентів — структурно це той самий документ-трекер, і all
+    інші функції (get_tracker, compute_content_hash тощо) працюють з ним
+    однаково незалежно від того, для якої з двох фіч він був створений.
+    """
     now = datetime.now().isoformat()
-    set_fields = {'uid': uid, 'type': 'listing', 'url': url, 'own_listing': True, 'last_price': details.get('price'), 'currency': details.get('currency'), 'title': details.get('title'), 'description': details.get('description'), 'location_text': details.get('location_text'), 'views': details.get('views'), 'photos_count': details.get('photos_count'), 'photos': details.get('photos') or [], 'params': details.get('params') or [], 'content_hash': _content_hash(details.get('title'), details.get('price'), details.get('description'), details.get('photos'))}
-    set_on_insert = {'resale_analysis': None, 'resale_analysis_at': None, 'negotiation_messages': None, 'status': 'watching', 'favorited': False, 'price_history': [], 'audit_result': None, 'audit_analysis_at': None, 'competitor_result': None, 'competitor_content_hash': None, 'created_at': now}
-    result = await db_call(olx_tracked_col.find_one_and_update({'uid': uid, 'url': url, 'own_listing': True}, {'$set': set_fields, '$setOnInsert': set_on_insert}, upsert=True, return_document=ReturnDocument.AFTER))
-    return str(result['_id'])
+    set_fields = {
+        "uid": uid,
+        "type": "listing",
+        "url": url,
+        "own_listing": True,
+        "last_price": details.get("price"),
+        "currency": details.get("currency"),
+        "title": details.get("title"),
+        "description": details.get("description"),
+        "location_text": details.get("location_text"),
+        "views": details.get("views"),
+        "photos_count": details.get("photos_count"),
+        "photos": details.get("photos") or [],
+        "params": details.get("params") or [],
+        "content_hash": _content_hash(
+            details.get("title"), details.get("price"), details.get("description"), details.get("photos")
+        ),
+    }
+    set_on_insert = {
+        "resale_analysis": None,
+        "resale_analysis_at": None,
+        "negotiation_messages": None,
+        "status": "watching",
+        "favorited": False,
+        "price_history": [],
+        "audit_result": None,
+        "audit_analysis_at": None,
+        # НОВЕ: заготовка полів для "🔎 Аналіз конкурента", як і в
+        # add_listing_tracker вище — щоб save_competitor_result() завжди мав
+        # куди писати, навіть якщо документ щойно створений через цей upsert.
+        "competitor_result": None,
+        "competitor_content_hash": None,
+        "created_at": now,
+    }
+    result = await db_call(
+        olx_tracked_col.find_one_and_update(
+            {"uid": uid, "url": url, "own_listing": True},
+            {"$set": set_fields, "$setOnInsert": set_on_insert},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    )
+    return str(result["_id"])
+
 
 async def add_search_tracker(uid: int, title_query: str, max_price: float | None, location: str, radius_km: int) -> str:
-    doc = {'uid': uid, 'type': 'search', 'title_query': title_query, 'max_price': max_price, 'location': location, 'radius_km': radius_km, 'seen_ids': [], 'created_at': datetime.now().isoformat()}
+    doc = {
+        "uid": uid,
+        "type": "search",
+        "title_query": title_query,
+        "max_price": max_price,
+        "location": location,
+        "radius_km": radius_km,
+        "seen_ids": [],
+        "created_at": datetime.now().isoformat(),
+    }
     result = await db_call(olx_tracked_col.insert_one(doc))
     return str(result.inserted_id)
 
-async def add_scanner_tracker(uid: int, query: str, max_price: float | None, location: str, radius_km: int) -> str:
-    doc = {'uid': uid, 'type': 'scanner', 'title_query': query, 'max_price': max_price, 'location': location, 'radius_km': radius_km, 'seen_ids': [], 'last_checked_at': None, 'created_at': datetime.now().isoformat()}
+
+async def add_scanner_tracker(
+    uid: int,
+    query: str,
+    max_price: float | None,
+    location: str,
+    radius_km: int,
+) -> str:
+    doc = {
+        "uid": uid,
+        "type": "scanner",
+        "title_query": query,
+        "max_price": max_price,
+        "location": location,
+        "radius_km": radius_km,
+        "seen_ids": [],
+        "last_checked_at": None,
+        "created_at": datetime.now().isoformat(),
+    }
     result = await db_call(olx_tracked_col.insert_one(doc))
     return str(result.inserted_id)
+
 
 async def get_user_trackers(uid: int) -> list[dict]:
-    cursor = olx_tracked_col.find({'uid': uid})
+    cursor = olx_tracked_col.find({"uid": uid})
     return await db_call(cursor.to_list(length=100))
+
 
 async def get_own_listings(uid: int) -> list[dict]:
-    cursor = olx_tracked_col.find({'uid': uid, 'type': 'listing', 'own_listing': True})
+    cursor = olx_tracked_col.find({"uid": uid, "type": "listing", "own_listing": True})
     return await db_call(cursor.to_list(length=100))
 
+
 async def get_tracker(tracker_id) -> dict | None:
-    return await db_call(olx_tracked_col.find_one({'_id': ObjectId(tracker_id)}))
+    return await db_call(olx_tracked_col.find_one({"_id": ObjectId(tracker_id)}))
+
 
 async def get_all_trackers() -> list[dict]:
     cursor = olx_tracked_col.find({})
     return await db_call(cursor.to_list(length=1000))
 
-async def update_listing_price(tracker_id, new_price: float, currency: str | None=None):
-    entry = {'price': new_price, 'currency': currency, 'at': datetime.now().isoformat()}
-    update = {'$set': {'last_price': new_price}, '$push': {'price_history': entry}}
+
+async def update_listing_price(tracker_id, new_price: float, currency: str | None = None):
+    entry = {"price": new_price, "currency": currency, "at": datetime.now().isoformat()}
+    update = {"$set": {"last_price": new_price}, "$push": {"price_history": entry}}
     if currency:
-        update['$set']['currency'] = currency
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, update))
+        update["$set"]["currency"] = currency
+    await db_call(olx_tracked_col.update_one({"_id": ObjectId(tracker_id)}, update))
+
 
 async def update_search_seen_ids(tracker_id, seen_ids: list[str]):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'seen_ids': seen_ids}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {"seen_ids": seen_ids}},
+        )
+    )
+
 
 async def update_scanner_state(tracker_id, seen_ids: list[str]):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'seen_ids': seen_ids, 'last_checked_at': datetime.now().isoformat()}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {"seen_ids": seen_ids, "last_checked_at": datetime.now().isoformat()}},
+        )
+    )
+
 
 def compute_content_hash(tracker: dict) -> str:
-    return _content_hash(tracker.get('title'), tracker.get('last_price'), tracker.get('description'), tracker.get('photos'))
+    return _content_hash(
+        tracker.get("title"), tracker.get("last_price"),
+        tracker.get("description"), tracker.get("photos"),
+    )
+
 
 def price_drop_summary(tracker: dict) -> dict | None:
-    history = tracker.get('price_history') or []
-    prices = [h['price'] for h in history if h.get('price') is not None]
+    history = tracker.get("price_history") or []
+    prices = [h["price"] for h in history if h.get("price") is not None]
     if len(prices) < 2:
         return None
-    first, last = (prices[0], prices[-1])
+    first, last = prices[0], prices[-1]
     drop_percent = round((first - last) / first * 100, 1) if first else 0
-    return {'prices': prices, 'first': first, 'last': last, 'drop_percent': drop_percent}
+    return {"prices": prices, "first": first, "last": last, "drop_percent": drop_percent}
+
 
 async def save_resale_analysis(tracker_id, analysis: dict, content_hash: str):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'resale_analysis': analysis, 'resale_analysis_at': datetime.now().isoformat(), 'content_hash': content_hash}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {
+                "resale_analysis": analysis,
+                "resale_analysis_at": datetime.now().isoformat(),
+                "content_hash": content_hash,
+            }},
+        )
+    )
+
 
 async def save_audit_result(tracker_id, audit: dict, content_hash: str):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'audit_result': audit, 'audit_analysis_at': datetime.now().isoformat(), 'content_hash': content_hash}}))
+    """Кеш результату "🔍 Аудит мого оголошення" — той самий патерн, що й
+    save_resale_analysis вище (прив'язка до content_hash оголошення)."""
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {
+                "audit_result": audit,
+                "audit_analysis_at": datetime.now().isoformat(),
+                "content_hash": content_hash,
+            }},
+        )
+    )
+
 
 async def save_competitor_result(tracker_id, result: dict, content_hash: str):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'competitor_result': result, 'competitor_analysis_at': datetime.now().isoformat(), 'competitor_content_hash': content_hash}}))
+    """НОВЕ: кеш результату "🔎 Аналіз конкурента" — окремий від
+    save_audit_result, бо це принципово інший аналіз (чуже оголошення з
+    точки зору "чим воно сильне/слабке відносно мого"), навіть якщо
+    технічно зберігається в тому самому document-трекері. Використовує
+    окреме поле competitor_content_hash (не content_hash), щоб кеш аудиту
+    власного оголошення і кеш аналізу конкурента не перезаписували
+    контрольні хеші один одного, якщо колись один і той самий URL
+    аналізується через обидві фічі."""
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {
+                "competitor_result": result,
+                "competitor_analysis_at": datetime.now().isoformat(),
+                "competitor_content_hash": content_hash,
+            }},
+        )
+    )
+
 
 async def save_negotiation_messages(tracker_id, messages: dict):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'negotiation_messages': messages}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {"negotiation_messages": messages}},
+        )
+    )
+
 
 async def set_tracker_status(tracker_id, status: str):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'status': status}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {"status": status}},
+        )
+    )
+
 
 async def set_favorite(tracker_id, value: bool):
-    await db_call(olx_tracked_col.update_one({'_id': ObjectId(tracker_id)}, {'$set': {'favorited': value}}))
+    await db_call(
+        olx_tracked_col.update_one(
+            {"_id": ObjectId(tracker_id)},
+            {"$set": {"favorited": value}},
+        )
+    )
+
 
 async def delete_tracker(tracker_id, uid: int) -> bool:
-    result = await db_call(olx_tracked_col.delete_one({'_id': ObjectId(tracker_id), 'uid': uid}))
+    result = await db_call(
+        olx_tracked_col.delete_one({"_id": ObjectId(tracker_id), "uid": uid})
+    )
     return result.deleted_count > 0
 
+
 async def get_user_settings(uid: int) -> dict:
-    doc = await db_call(olx_user_settings_col.find_one({'uid': uid}), default=None, raise_on_fail=False)
-    return doc or {'uid': uid, 'budget': None, 'min_margin_percent': None}
+    doc = await db_call(olx_user_settings_col.find_one({"uid": uid}), default=None, raise_on_fail=False)
+    return doc or {"uid": uid, "budget": None, "min_margin_percent": None}
+
 
 async def set_user_settings(uid: int, **fields):
-    await db_call(olx_user_settings_col.update_one({'uid': uid}, {'$set': fields}, upsert=True))
+    await db_call(
+        olx_user_settings_col.update_one(
+            {"uid": uid}, {"$set": fields}, upsert=True,
+        )
+    )
+
 
 async def add_deal_record(uid: int, tracker_id, deal: dict):
-    doc = {'uid': uid, 'tracker_id': str(tracker_id), **deal, 'created_at': datetime.now().isoformat()}
+    doc = {"uid": uid, "tracker_id": str(tracker_id), **deal, "created_at": datetime.now().isoformat()}
     result = await db_call(olx_deals_col.insert_one(doc))
     return str(result.inserted_id)
 
+
 async def get_user_deals(uid: int) -> list[dict]:
-    cursor = olx_deals_col.find({'uid': uid})
+    cursor = olx_deals_col.find({"uid": uid})
     return await db_call(cursor.to_list(length=500))
 
+
 async def record_search_stat(title_query: str, domain: str, count_total: int, count_new: int, avg_price: float | None, currency: str):
-    doc = {'title_query_norm': title_query.strip().lower(), 'title_query': title_query, 'domain': domain, 'count_total': count_total, 'count_new': count_new, 'avg_price': avg_price, 'currency': currency, 'checked_at': datetime.now().isoformat()}
+    doc = {
+        "title_query_norm": title_query.strip().lower(),
+        "title_query": title_query,
+        "domain": domain,
+        "count_total": count_total,
+        "count_new": count_new,
+        "avg_price": avg_price,
+        "currency": currency,
+        "checked_at": datetime.now().isoformat(),
+    }
     await db_call(olx_search_stats_col.insert_one(doc), raise_on_fail=False)
 
-async def get_trend_for_query(title_query: str, days: int=14) -> dict | None:
+
+async def get_trend_for_query(title_query: str, days: int = 14) -> dict | None:
     since = (datetime.now() - timedelta(days=days)).isoformat()
-    cursor = olx_search_stats_col.find({'title_query_norm': title_query.strip().lower(), 'checked_at': {'$gte': since}}).sort('checked_at', 1)
+    cursor = olx_search_stats_col.find(
+        {"title_query_norm": title_query.strip().lower(), "checked_at": {"$gte": since}}
+    ).sort("checked_at", 1)
     points = await db_call(cursor.to_list(length=500), default=[], raise_on_fail=False) or []
     if len(points) < 2:
         return None
-    first, last = (points[0], points[-1])
-    count_delta = last['count_total'] - first['count_total']
-    price_delta_percent = None
-    if first.get('avg_price') and last.get('avg_price'):
-        price_delta_percent = round((last['avg_price'] - first['avg_price']) / first['avg_price'] * 100, 1)
-    return {'title_query': last['title_query'], 'points_count': len(points), 'count_first': first['count_total'], 'count_last': last['count_total'], 'count_delta': count_delta, 'avg_price_first': first.get('avg_price'), 'avg_price_last': last.get('avg_price'), 'price_delta_percent': price_delta_percent, 'currency': last.get('currency')}
 
-async def get_tracked_query_names(limit: int=20) -> list[str]:
-    cursor = olx_search_stats_col.aggregate([{'$group': {'_id': '$title_query_norm', 'title_query': {'$last': '$title_query'}, 'n': {'$sum': 1}}}, {'$match': {'n': {'$gte': 2}}}, {'$limit': limit}])
+    first, last = points[0], points[-1]
+    count_delta = last["count_total"] - first["count_total"]
+    price_delta_percent = None
+    if first.get("avg_price") and last.get("avg_price"):
+        price_delta_percent = round((last["avg_price"] - first["avg_price"]) / first["avg_price"] * 100, 1)
+
+    return {
+        "title_query": last["title_query"],
+        "points_count": len(points),
+        "count_first": first["count_total"],
+        "count_last": last["count_total"],
+        "count_delta": count_delta,
+        "avg_price_first": first.get("avg_price"),
+        "avg_price_last": last.get("avg_price"),
+        "price_delta_percent": price_delta_percent,
+        "currency": last.get("currency"),
+    }
+
+
+async def get_tracked_query_names(limit: int = 20) -> list[str]:
+    cursor = olx_search_stats_col.aggregate([
+        {"$group": {"_id": "$title_query_norm", "title_query": {"$last": "$title_query"}, "n": {"$sum": 1}}},
+        {"$match": {"n": {"$gte": 2}}},
+        {"$limit": limit},
+    ])
     docs = await db_call(cursor.to_list(length=limit), default=[], raise_on_fail=False) or []
-    return [d['title_query'] for d in docs]
+    return [d["title_query"] for d in docs]

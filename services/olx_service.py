@@ -1,19 +1,49 @@
-# services/olx_service.py
 import logging
 import re
 from urllib.parse import quote
+
 from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
-logger = logging.getLogger('tasks_bot')
-IMPERSONATE = 'chrome124'
-HEADERS = {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8', 'Accept-Language': 'uk-UA,uk;q=0.9,pl;q=0.8,ru;q=0.7,en;q=0.6'}
-PRICE_RE = re.compile('([\\d\\s]+)(?:,\\d+)?\\s*(грн|UAH|zł|PLN|€|EUR|\\$|USD)', re.IGNORECASE)
-VIEWS_RE = re.compile('([\\d\\s]+)\\s*(?:переглядів|перегляд|views|wyświetleń)', re.IGNORECASE)
-CURRENCY_MAP = {'ГРН': 'UAH', 'UAH': 'UAH', 'ZŁ': 'PLN', 'PLN': 'PLN', '€': 'EUR', 'EUR': 'EUR', '$': 'USD', 'USD': 'USD'}
-DOMAIN_CONFIG = {'olx.ua': {'list_path': '/uk/list/q-', 'referer': 'https://www.olx.ua/', 'default_currency': 'UAH'}}
-CONDITION_PARAM_MAP = {'used': 'used', 'new': 'new'}
+
+logger = logging.getLogger("tasks_bot")
+
+IMPERSONATE = "chrome124"
+
+HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "uk-UA,uk;q=0.9,pl;q=0.8,ru;q=0.7,en;q=0.6",
+}
+
+PRICE_RE = re.compile(r"([\d\s]+)(?:,\d+)?\s*(грн|UAH|zł|PLN|€|EUR|\$|USD)", re.IGNORECASE)
+VIEWS_RE = re.compile(r"([\d\s]+)\s*(?:переглядів|перегляд|views|wyświetleń)", re.IGNORECASE)
+
+CURRENCY_MAP = {
+    "ГРН": "UAH", "UAH": "UAH",
+    "ZŁ": "PLN", "PLN": "PLN",
+    "€": "EUR", "EUR": "EUR",
+    "$": "USD", "USD": "USD",
+}
+
+DOMAIN_CONFIG = {
+    "olx.ua": {"list_path": "/uk/list/q-", "referer": "https://www.olx.ua/", "default_currency": "UAH"}
+}
+
+CONDITION_PARAM_MAP = {"used": "used", "new": "new"}
+
 MAX_PHOTOS_FOR_AI = 10
-FALLBACK_REASON_MARKERS = ('extendedsearchnoresultslastresort',)
+
+# OLX сам додає цей reason до картки, коли розширений пошук НЕ дав жодного
+# реального збігу і сайт підсовує випадкові оголошення з фіду, аби блок
+# "схожі"/список не був порожнім. Такі картки — НЕ результати пошуку і їх
+# треба відкидати, інакше видача виглядає як рандомний набір товарів
+# (диван, чоботи, молоток замість реально схожих оголошень).
+FALLBACK_REASON_MARKERS = (
+    "extendedsearchnoresultslastresort",
+)
+
 
 def _parse_price(text: str) -> tuple[float, str] | None:
     if not text:
@@ -21,30 +51,35 @@ def _parse_price(text: str) -> tuple[float, str] | None:
     match = PRICE_RE.search(text)
     if not match:
         return None
-    number = match.group(1).replace(' ', '').replace('\xa0', '')
-    currency = CURRENCY_MAP.get(match.group(2).upper(), 'UAH')
+    number = match.group(1).replace(" ", "").replace("\xa0", "")
+    currency = CURRENCY_MAP.get(match.group(2).upper(), "UAH")
     try:
-        return (float(number), currency)
+        return float(number), currency
     except ValueError:
         return None
 
+
 def _domain_headers(domain: str) -> dict:
-    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG['olx.ua'])
-    return {**HEADERS, 'Referer': cfg['referer']}
+    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
+    return {**HEADERS, "Referer": cfg["referer"]}
+
 
 def _is_fallback_card(href: str) -> bool:
-    return any((marker in href for marker in FALLBACK_REASON_MARKERS))
+    """True, якщо OLX сам позначив цю картку як "останній резерв"
+    (реального збігу за запитом немає)."""
+    return any(marker in href for marker in FALLBACK_REASON_MARKERS)
+
 
 def _best_srcset_url(srcset: str) -> str | None:
     candidates = []
-    for part in srcset.split(','):
+    for part in srcset.split(","):
         part = part.strip()
         if not part:
             continue
-        bits = part.rsplit(' ', 1)
+        bits = part.rsplit(" ", 1)
         url = bits[0].strip()
         width = 0
-        if len(bits) == 2 and bits[1].endswith('w'):
+        if len(bits) == 2 and bits[1].endswith("w"):
             try:
                 width = int(bits[1][:-1])
             except ValueError:
@@ -55,199 +90,282 @@ def _best_srcset_url(srcset: str) -> str | None:
     candidates.sort(key=lambda c: c[0], reverse=True)
     return candidates[0][1]
 
+
 def _extract_photos(soup: BeautifulSoup) -> tuple[list[str], int]:
     urls: list[str] = []
     seen: set[str] = set()
-    gallery = soup.select('[data-testid="image-gallery-container"] img') or soup.select('[data-testid="swiper-image"] img') or soup.select('[data-testid="ad-photo"] img')
+
+    gallery = (
+        soup.select('[data-testid="image-gallery-container"] img')
+        or soup.select('[data-testid="swiper-image"] img')
+        or soup.select('[data-testid="ad-photo"] img')
+    )
+
     for img in gallery:
         candidate = None
-        if img.get('srcset'):
-            candidate = _best_srcset_url(img['srcset'])
+        if img.get("srcset"):
+            candidate = _best_srcset_url(img["srcset"])
         if not candidate:
-            candidate = img.get('data-src') or img.get('src')
-        if not candidate or candidate.startswith('data:'):
+            candidate = img.get("data-src") or img.get("src")
+        if not candidate or candidate.startswith("data:"):
             continue
         if candidate in seen:
             continue
         seen.add(candidate)
         urls.append(candidate)
-    return (urls[:MAX_PHOTOS_FOR_AI], len(urls))
+
+    return urls[:MAX_PHOTOS_FOR_AI], len(urls)
+
 
 def _parse_listing_html(html: str, default_currency: str) -> dict:
-    soup = BeautifulSoup(html, 'html.parser')
-    result: dict = {'price': None, 'currency': default_currency, 'title': None, 'description': None, 'location_text': None, 'views': None, 'photos': [], 'photos_count': None, 'params': []}
+    soup = BeautifulSoup(html, "html.parser")
+    result: dict = {
+        "price": None, "currency": default_currency, "title": None,
+        "description": None, "location_text": None, "views": None,
+        "photos": [], "photos_count": None, "params": [],
+    }
+
     price_el = soup.select_one('[data-testid="ad-price-container"]') or soup.select_one('[data-testid="ad-price"]')
-    price_text = price_el.get_text(' ', strip=True) if price_el else None
+    price_text = price_el.get_text(" ", strip=True) if price_el else None
     if price_text:
         parsed = _parse_price(price_text)
         if parsed:
-            result['price'], result['currency'] = parsed
-    if result['price'] is None:
-        meta = soup.find('meta', {'property': 'product:price:amount'})
-        if meta and meta.get('content'):
-            currency_meta = soup.find('meta', {'property': 'product:price:currency'})
+            result["price"], result["currency"] = parsed
+    if result["price"] is None:
+        meta = soup.find("meta", {"property": "product:price:amount"})
+        if meta and meta.get("content"):
+            currency_meta = soup.find("meta", {"property": "product:price:currency"})
             try:
-                result['price'] = float(meta['content'])
-                result['currency'] = currency_meta['content'] if currency_meta else default_currency
+                result["price"] = float(meta["content"])
+                result["currency"] = currency_meta["content"] if currency_meta else default_currency
             except (ValueError, KeyError):
                 pass
+
     try:
-        title_el = soup.select_one('[data-cy="ad_title"]') or soup.find('h1')
+        title_el = soup.select_one('[data-cy="ad_title"]') or soup.find("h1")
         if title_el:
-            result['title'] = title_el.get_text(strip=True)
-        elif soup.find('title'):
-            result['title'] = soup.find('title').get_text(strip=True)
+            result["title"] = title_el.get_text(strip=True)
+        elif soup.find("title"):
+            result["title"] = soup.find("title").get_text(strip=True)
     except Exception:
-        logger.exception('Не вдалося розпарсити назву оголошення')
+        logger.exception("Не вдалося розпарсити назву оголошення")
+
     try:
         desc_el = soup.select_one('[data-cy="ad_description"]')
         if desc_el:
-            result['description'] = desc_el.get_text(' ', strip=True)[:1500]
+            result["description"] = desc_el.get_text(" ", strip=True)[:1500]
     except Exception:
-        logger.exception('Не вдалося розпарсити опис оголошення')
+        logger.exception("Не вдалося розпарсити опис оголошення")
+
     try:
         loc_el = soup.select_one('[data-testid="location-date"]')
         if loc_el:
-            result['location_text'] = loc_el.get_text(' ', strip=True)
+            result["location_text"] = loc_el.get_text(" ", strip=True)
     except Exception:
-        logger.exception('Не вдалося розпарсити локацію оголошення')
+        logger.exception("Не вдалося розпарсити локацію оголошення")
+
     try:
         views_el = soup.select_one('[data-testid="page-view-counter"]')
-        views_text = views_el.get_text(' ', strip=True) if views_el else html
+        views_text = views_el.get_text(" ", strip=True) if views_el else html
         views_match = VIEWS_RE.search(views_text)
         if views_match:
-            result['views'] = int(views_match.group(1).replace(' ', '').replace('\xa0', ''))
+            result["views"] = int(views_match.group(1).replace(" ", "").replace("\xa0", ""))
     except Exception:
-        logger.exception('Не вдалося розпарсити кількість переглядів')
+        logger.exception("Не вдалося розпарсити кількість переглядів")
+
     try:
         photos, total = _extract_photos(soup)
-        result['photos'] = photos
-        result['photos_count'] = total
+        result["photos"] = photos
+        result["photos_count"] = total
     except Exception:
-        logger.exception('Не вдалося розпарсити фото оголошення')
+        logger.exception("Не вдалося розпарсити фото оголошення")
+
     try:
         params_container = soup.select_one('[data-testid="ad-parameters-container"]')
         if params_container:
-            for li in params_container.find_all('li'):
-                text = li.get_text(' ', strip=True)
+            for li in params_container.find_all("li"):
+                text = li.get_text(" ", strip=True)
                 if text:
-                    result['params'].append(text)
+                    result["params"].append(text)
     except Exception:
-        logger.exception('Не вдалося розпарсити характеристики оголошення')
+        logger.exception("Не вдалося розпарсити характеристики оголошення")
+
     return result
 
+
 async def fetch_listing_details(url: str) -> dict | None:
-    domain = 'olx.pl' if 'olx.pl' in url else 'olx.ua'
+    domain = "olx.pl" if "olx.pl" in url else "olx.ua"
     headers = _domain_headers(domain)
-    default_currency = DOMAIN_CONFIG[domain]['default_currency']
+    default_currency = DOMAIN_CONFIG[domain]["default_currency"]
+
     try:
         async with AsyncSession(impersonate=IMPERSONATE, headers=headers) as session:
             resp = await session.get(url, timeout=20, allow_redirects=True)
             final_url = str(resp.url)
             if resp.status_code != 200:
-                logger.warning('OLX listing fetch status=%s for %s (final_url=%s)', resp.status_code, url, final_url)
+                logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status_code, url, final_url)
                 return None
             html = resp.text
     except Exception:
-        logger.exception('OLX listing fetch failed for %s', url)
+        logger.exception("OLX listing fetch failed for %s", url)
         return None
-    logger.info('OLX listing fetch OK, final_url=%s, html_len=%s', final_url, len(html))
+
+    logger.info("OLX listing fetch OK, final_url=%s, html_len=%s", final_url, len(html))
+
     details = _parse_listing_html(html, default_currency)
-    if details['price'] is None:
-        title_tag_text = details.get('title')
-        logger.warning('OLX listing: price not found. page_title=%r, snippet=%r', title_tag_text, html[:500])
+    if details["price"] is None:
+        title_tag_text = details.get("title")
+        logger.warning("OLX listing: price not found. page_title=%r, snippet=%r", title_tag_text, html[:500])
         return None
     return details
 
+
 async def fetch_listing_price(url: str) -> tuple[float, str] | None:
     details = await fetch_listing_details(url)
-    if not details or details['price'] is None:
+    if not details or details["price"] is None:
         return None
-    return (details['price'], details['currency'])
+    return details["price"], details["currency"]
+
 
 def _guess_image_mime(url: str) -> str:
-    lower = url.split('?')[0].lower()
-    if lower.endswith('.png'):
-        return 'image/png'
-    if lower.endswith('.webp'):
-        return 'image/webp'
-    if lower.endswith('.gif'):
-        return 'image/gif'
-    return 'image/jpeg'
+    """НОВЕ: для 🔍 Аудит мого оголошення — грубе визначення MIME за розширенням
+    у URL, щоб коректно сформувати data:URI для vision-запиту. OLX CDN інколи
+    не віддає розширення в чистому вигляді (query-параметри після нього),
+    тому спочатку відрізаємо все після "?"."""
+    lower = url.split("?")[0].lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
+
 
 async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
+    """
+    НОВЕ: для 🔍 Аудит мого оголошення — завантажує сирі байти фото з OLX CDN
+    для подальшого vision-аналізу (кодування в base64 відбувається вже на
+    боці services/olx_audit.py). Повертає (bytes, mime) або None, якщо
+    завантажити не вдалося — це НЕ фатально для решти аудиту, просто те
+    конкретне фото пропускається з чесним попередженням користувачу.
+    """
     try:
         async with AsyncSession(impersonate=IMPERSONATE, timeout=15) as session:
             resp = await session.get(url, timeout=15)
             if resp.status_code != 200:
-                logger.warning('OLX image fetch status=%s for %s', resp.status_code, url)
+                logger.warning("OLX image fetch status=%s for %s", resp.status_code, url)
                 return None
-            return (resp.content, _guess_image_mime(url))
+            return resp.content, _guess_image_mime(url)
     except Exception:
-        logger.exception('OLX image fetch failed for %s', url)
+        logger.exception("OLX image fetch failed for %s", url)
         return None
 
-def _build_search_url(domain: str, title_query: str, max_price: float | None, location: str, radius_km: int, condition: str | None=None) -> str:
-    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG['olx.ua'])
-    slug = title_query.strip().replace(' ', '-')
-    query = quote(slug, safe='-')
-    base = f'https://www.{domain}{cfg['list_path']}{query}/'
+
+def _build_search_url(
+    domain: str,
+    title_query: str,
+    max_price: float | None,
+    location: str,
+    radius_km: int,
+    condition: str | None = None,
+) -> str:
+    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
+    slug = title_query.strip().replace(" ", "-")
+    query = quote(slug, safe="-")
+    base = f"https://www.{domain}{cfg['list_path']}{query}/"
     params = []
     if max_price:
-        params.append(f'search[filter_float_price:to]={int(max_price)}')
+        params.append(f"search[filter_float_price:to]={int(max_price)}")
     if location:
-        params.append(f'search[dist]={radius_km}')
+        params.append(f"search[dist]={radius_km}")
     if condition and condition in CONDITION_PARAM_MAP:
-        params.append(f'search[filter_enum_state][0]={CONDITION_PARAM_MAP[condition]}')
+        params.append(f"search[filter_enum_state][0]={CONDITION_PARAM_MAP[condition]}")
     if params:
-        base += '?' + '&'.join(params)
+        base += "?" + "&".join(params)
     return base
 
-async def search_listings(title_query: str, max_price: float | None, location: str, radius_km: int, domain: str='olx.ua', condition: str | None=None) -> list[dict] | None:
-    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG['olx.ua'])
+
+async def search_listings(
+    title_query: str,
+    max_price: float | None,
+    location: str,
+    radius_km: int,
+    domain: str = "olx.ua",
+    condition: str | None = None,
+) -> list[dict] | None:
+    cfg = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])
     url = _build_search_url(domain, title_query, max_price, location, radius_km, condition)
     headers = _domain_headers(domain)
+
     try:
         async with AsyncSession(impersonate=IMPERSONATE, headers=headers) as session:
             resp = await session.get(url, timeout=20, allow_redirects=True)
             if resp.status_code != 200:
-                logger.warning('OLX search fetch status=%s for %s', resp.status_code, url)
+                logger.warning("OLX search fetch status=%s for %s", resp.status_code, url)
                 return None
             html = resp.text
     except Exception:
-        logger.exception('OLX search fetch failed for %s', url)
+        logger.exception("OLX search fetch failed for %s", url)
         return None
-    soup = BeautifulSoup(html, 'html.parser')
+
+    soup = BeautifulSoup(html, "html.parser")
     cards = soup.select('[data-cy="l-card"]')
-    logger.info('OLX search OK url=%s cards_found=%s', url, len(cards))
+    logger.info("OLX search OK url=%s cards_found=%s", url, len(cards))
+
     results = []
     fallback_skipped = 0
     for card in cards:
-        link_el = card.select_one('a')
-        href = link_el.get('href') if link_el else None
+        link_el = card.select_one("a")
+        href = link_el.get("href") if link_el else None
         if not href:
             continue
-        if href.startswith('/'):
-            href = f'https://www.{domain}' + href
+        if href.startswith("/"):
+            href = f"https://www.{domain}" + href
+
+        # OLX сам позначає картку як "останній резерв" (реального збігу за
+        # запитом немає, показуємо будь-що з фіду, аби блок не був порожнім).
+        # Це НЕ результат пошуку за запитом — відкидаємо, інакше видача
+        # виглядає як рандомний набір товарів, що не мають нічого спільного
+        # із запитом користувача.
         if _is_fallback_card(href):
             fallback_skipped += 1
             continue
-        listing_id_match = re.search('-ID([a-zA-Z0-9]+)\\.html', href)
+
+        listing_id_match = re.search(r"-ID([a-zA-Z0-9]+)\.html", href)
         listing_id = listing_id_match.group(1) if listing_id_match else href
-        title_el = card.select_one('[data-cy="ad-card-title"] h4') or card.select_one('h4') or card.select_one('h6')
-        title = title_el.get_text(strip=True) if title_el else 'Без назви'
+
+        title_el = card.select_one('[data-cy="ad-card-title"] h4') or card.select_one("h4") or card.select_one("h6")
+        title = title_el.get_text(strip=True) if title_el else "Без назви"
+
         price_el = card.select_one('[data-testid="ad-price"]')
-        price_text = price_el.get_text(' ', strip=True) if price_el else ''
+        price_text = price_el.get_text(" ", strip=True) if price_el else ""
         parsed_price = _parse_price(price_text)
+
         location_el = card.select_one('[data-testid="location-date"]')
-        location_text = location_el.get_text(strip=True) if location_el else ''
-        results.append({'id': listing_id, 'url': href, 'title': title, 'price': parsed_price[0] if parsed_price else None, 'currency': parsed_price[1] if parsed_price else cfg['default_currency'], 'location_text': location_text})
+        location_text = location_el.get_text(strip=True) if location_el else ""
+
+        results.append({
+            "id": listing_id,
+            "url": href,
+            "title": title,
+            "price": parsed_price[0] if parsed_price else None,
+            "currency": parsed_price[1] if parsed_price else cfg["default_currency"],
+            "location_text": location_text,
+        })
+
     if fallback_skipped:
-        logger.info('OLX search url=%s: відкинуто %s fallback-карток (extendedsearchnoresultslastresort) — реальних збігів за запитом %r не знайдено', url, fallback_skipped, title_query)
+        logger.info(
+            "OLX search url=%s: відкинуто %s fallback-карток (extendedsearchnoresultslastresort) — "
+            "реальних збігів за запитом %r не знайдено",
+            url, fallback_skipped, title_query,
+        )
+
     return results
 
-def sort_by_price(results: list[dict], ascending: bool=True) -> list[dict]:
-    priced = [r for r in results if r.get('price') is not None]
-    unpriced = [r for r in results if r.get('price') is None]
-    priced.sort(key=lambda r: r['price'], reverse=not ascending)
+
+def sort_by_price(results: list[dict], ascending: bool = True) -> list[dict]:
+    priced = [r for r in results if r.get("price") is not None]
+    unpriced = [r for r in results if r.get("price") is None]
+    priced.sort(key=lambda r: r["price"], reverse=not ascending)
     return priced + unpriced
