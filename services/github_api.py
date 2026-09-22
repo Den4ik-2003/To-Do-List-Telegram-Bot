@@ -31,6 +31,42 @@ def _headers(token: str) -> dict:
     }
 
 
+def _friendly_error(status: int, data: dict, owner: str = "", repo: str = "") -> str:
+    """
+    Перетворює сиру відповідь GitHub API на зрозуміле користувачу пояснення.
+    GitHub повертає однакові статус-коди (403/404/422) для дуже різних
+    причин, тому розрізняємо їх за текстом message, а не лише за кодом.
+    """
+    message = (data or {}).get("message", "") if isinstance(data, dict) else str(data)
+    repo_hint = f"{owner}/{repo}" if owner and repo else "цей репозиторій"
+
+    if status == 403:
+        if "Resource not accessible by personal access token" in message:
+            return (
+                f"Токен не має прав писати в {repo_hint}. Перевір:\n"
+                f"1) Якщо це fine-grained token — чи вибрано саме цей репозиторій "
+                f"у списку доступних, і чи увімкнено право «Contents: Read and write».\n"
+                f"2) Якщо це classic token — чи є scope «repo» (для приватних) "
+                f"або «public_repo» (для публічних).\n"
+                f"3) Якщо репозиторій належить організації з SSO — чи авторизовано "
+                f"токен під цю організацію (кнопка «Configure SSO» біля токена в GitHub Settings)."
+            )
+        if "rate limit" in message.lower():
+            return "Вичерпано ліміт запитів до GitHub API. Спробуй ще раз за кілька хвилин."
+        return f"GitHub відмовив у доступі (403): {message or 'невідома причина'}"
+
+    if status == 404:
+        return (
+            f"Репозиторій {repo_hint} не знайдено, або токен не має доступу навіть на читання. "
+            f"Перевір назву репозиторію та права токена."
+        )
+
+    if status == 422:
+        return f"GitHub відхилив запит як некоректний (422): {message or 'невідома причина'}"
+
+    return f"Помилка GitHub API ({status}): {message or data}"
+
+
 async def verify_token(token: str) -> dict | None:
     try:
         async with aiohttp.ClientSession(headers=_headers(token)) as session:
@@ -92,6 +128,37 @@ async def get_repo(token: str, owner: str, repo: str) -> dict | None:
     except Exception:
         logger.exception("GitHub get_repo failed for %s/%s", owner, repo)
         return None
+
+
+async def check_write_access(token: str, owner: str, repo: str) -> str | None:
+    """
+    Легка перевірка ПЕРЕД деплоєм: чи взагалі токен має право писати
+    в репозиторій. GET /repos/{owner}/{repo} повертає поле "permissions"
+    (push/admin/pull), яке видно навіть без спроби реального запису —
+    це дозволяє показати зрозумілу помилку одразу, а не після того, як
+    користувач уже чекав на прогрес деплою і впав на кроці ініціалізації.
+    Повертає None, якщо все гаразд, або готовий текст помилки для показу.
+    """
+    try:
+        async with aiohttp.ClientSession(headers=_headers(token)) as session:
+            async with session.get(
+                f"{GITHUB_API}/repos/{owner}/{repo}",
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    data = await resp.json()
+                    return _friendly_error(resp.status, data, owner, repo)
+                data = await resp.json()
+                perms = data.get("permissions", {})
+                if not perms.get("push", False):
+                    return (
+                        f"Токен має доступ лише на читання {owner}/{repo} — "
+                        f"права на запис (push) немає. Перевір scope/permissions токена."
+                    )
+                return None
+    except Exception:
+        logger.exception("GitHub check_write_access failed for %s/%s", owner, repo)
+        return "Не вдалося перевірити права доступу токена (мережева помилка). Спробуй ще раз."
 
 
 async def list_branches(token: str, owner: str, repo: str) -> list[dict]:
@@ -202,7 +269,7 @@ async def _create_blob(session: aiohttp.ClientSession, owner: str, repo: str, co
     async with session.post(f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs", json=payload) as resp:
         data = await resp.json()
         if resp.status not in (200, 201):
-            raise GithubDeployError(f"blob create failed: {data}")
+            raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
         return data["sha"]
 
 
@@ -213,7 +280,7 @@ async def _create_tree(session, owner, repo, base_tree_sha, tree_items):
     async with session.post(f"{GITHUB_API}/repos/{owner}/{repo}/git/trees", json=payload) as resp:
         data = await resp.json()
         if resp.status not in (200, 201):
-            raise GithubDeployError(f"tree create failed: {data}")
+            raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
         return data["sha"]
 
 
@@ -224,7 +291,7 @@ async def _create_commit(session, owner, repo, message, tree_sha, parent_sha):
     async with session.post(f"{GITHUB_API}/repos/{owner}/{repo}/git/commits", json=payload) as resp:
         data = await resp.json()
         if resp.status not in (200, 201):
-            raise GithubDeployError(f"commit create failed: {data}")
+            raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
         return data["sha"]
 
 
@@ -234,13 +301,13 @@ async def _update_ref(session, owner, repo, branch, commit_sha, create_branch=Fa
         async with session.post(f"{GITHUB_API}/repos/{owner}/{repo}/git/refs", json=payload) as resp:
             if resp.status not in (200, 201):
                 data = await resp.json()
-                raise GithubDeployError(f"ref create failed: {data}")
+                raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
     else:
         payload = {"sha": commit_sha, "force": False}
         async with session.patch(f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/{branch}", json=payload) as resp:
             if resp.status not in (200, 201):
                 data = await resp.json()
-                raise GithubDeployError(f"ref update failed: {data}")
+                raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
 
 
 async def _init_empty_repo(
@@ -275,7 +342,11 @@ async def _init_empty_repo(
     async with session.put(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{seed_path}", json=payload) as resp:
         data = await resp.json()
         if resp.status not in (200, 201):
-            raise GithubDeployError(f"initial commit failed: {data}")
+            # ВАЖЛИВО: раніше тут було "initial commit failed: {data}" — сирий
+            # словник від GitHub, який нічого не пояснював користувачу
+            # (саме це й вилізло в логах як голий traceback). Тепер повідомлення
+            # одразу каже, яке саме право токена перевірити.
+            raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
         return data["commit"]["sha"]
 
 
@@ -350,10 +421,20 @@ async def deploy_files(
                 "Repo %s/%s branch %s has no commits yet — bootstrapping via contents API",
                 owner, repo, branch,
             )
-            parent_sha = await _init_empty_repo(
-                session, owner, repo, branch, seed_path, seed_content,
-                "first commit",
-            )
+            try:
+                parent_sha = await _init_empty_repo(
+                    session, owner, repo, branch, seed_path, seed_content,
+                    "first commit",
+                )
+            except GithubDeployError:
+                # ДОДАНО: логуємо саме тут з повним контекстом (owner/repo/branch),
+                # щоб при потребі шукати в логах Render було зрозуміло, який саме
+                # репозиторій і крок впали, не гортаючи весь traceback вручну.
+                logger.error(
+                    "GitHub deploy: bootstrap порожнього репо %s/%s@%s не вдався",
+                    owner, repo, branch,
+                )
+                raise
 
         base_tree_sha = await _get_commit_tree_sha(session, owner, repo, parent_sha)
 
