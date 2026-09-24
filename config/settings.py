@@ -1,11 +1,18 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: config/settings.py
 
-Єдина змістовна зміна: EVENING_PLAN_TIME "22:00" → "21:30" (дефолт;
-якщо на Render задано env-змінну EVENING_PLAN_TIME — вона й далі має
-пріоритет над цим дефолтом, як і раніше).
+НОВЕ:
+- JOB_SCORE_BATCH_SIZE — скільки вакансій оцінюється одним AI-запитом
+  (раніше 1 вакансія = 1 запит, 94 вакансії з'їдали денний ліміт).
+- JOB_MAX_SCORE_PER_CYCLE — максимум нових вакансій, які оцінюються за
+  один прогін одного автопошуку. Решта не позначається переглянутою
+  і буде оцінена наступного прогону.
 
-Решта файлу — без змін.
+Резервний провайдер (Gemini) підключається ЛИШЕ змінними середовища на
+Render, код міняти не треба:
+  AI_API_KEY_BACKUP  = ключ Google AI Studio
+  AI_BASE_URL_BACKUP = https://generativelanguage.googleapis.com/v1beta/openai/
+  AI_MODEL_BACKUP    = gemini-2.5-flash
 """
 
 import os
@@ -28,6 +35,9 @@ AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
+# ВАЖЛИВО: якщо AI_BASE_URL_BACKUP / AI_MODEL_BACKUP не задані, резерв
+# успадковує OpenRouter і ділить з основним ту саму денну квоту (50 запитів).
+# Щоб резерв реально рятував — задай ці змінні на Render (див. докстрінг).
 AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
 AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL).strip()
 AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", "").strip() or AI_MODEL
@@ -72,7 +82,6 @@ THREADS_MORNING_TIME = os.environ.get("THREADS_MORNING_TIME", "08:30")
 
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
-# ЗМІНЕНО: "22:00" → "21:30"
 EVENING_PLAN_TIME = os.environ.get("EVENING_PLAN_TIME", "21:30")
 EVENING_PLAN_ENABLED = os.environ.get("EVENING_PLAN_ENABLED", "true").strip().lower() == "true"
 EVENING_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
@@ -83,6 +92,10 @@ JOB_AUTOSEARCH_NOON_TIME = os.environ.get("JOB_AUTOSEARCH_NOON_TIME", "13:00")
 JOB_AUTOSEARCH_EVENING_TIME = os.environ.get("JOB_AUTOSEARCH_EVENING_TIME", "19:00")
 
 JOB_MIN_MATCH_PERCENT = int(os.environ.get("JOB_MIN_MATCH_PERCENT", "50"))
+
+# НОВЕ: пакетна оцінка вакансій (економія AI-запитів)
+JOB_SCORE_BATCH_SIZE = int(os.environ.get("JOB_SCORE_BATCH_SIZE", "10"))
+JOB_MAX_SCORE_PER_CYCLE = int(os.environ.get("JOB_MAX_SCORE_PER_CYCLE", "40"))
 
 IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 IMAGE_BASE_URL = os.environ.get("IMAGE_BASE_URL", "https://api.openai.com/v1")

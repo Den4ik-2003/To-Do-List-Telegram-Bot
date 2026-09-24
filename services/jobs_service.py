@@ -1,32 +1,19 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: services/jobs_service.py
 
-НОВЕ (збалансована видача з різних джерел):
-- interleave_by_source(): результати пошуку чергуються по джерелах
-  (Djinni → DOU → Work.ua → Robota.ua → знову Djinni ...), тому коли
-  handlers/jobs.py бере для оцінки лише перші N вакансій, у вибірці є по
-  кілька вакансій від КОЖНОГО джерела, а не лише від того, яке віддало
-  найбільше результатів (раніше Work.ua/Robota.ua лежали в кінці списку й
-  відрізались обмеженням).
-- _search_once() логує, скільки вакансій віддало кожне джерело (до і після
-  дедуплікації) — видно, якщо Work.ua/Robota.ua віддають 0.
+НОВЕ (економія AI-запитів):
+- score_vacancies_batch(): оцінює вакансії ПАЧКАМИ (JOB_SCORE_BATCH_SIZE
+  за один AI-запит) замість 1 запиту на вакансію. 94 вакансії = ~10
+  запитів замість 94. Якщо два запити поспіль провалились (ліміт/збій AI),
+  решта пачок не пробується — не спамимо провайдера й лог.
+  Вакансії, які не вдалося оцінити, лишаються з match_percent=None.
+- score_vacancy() (одиночна) збережена без змін для ручного аналізу.
 
-НОВЕ (розширений профіль + фільтр збігу):
-- Усі AI-промпти (parse_job_query, score_vacancy, analyze_vacancy_full,
-  generate_cover_letter) тепер беруть профіль через
-  database.job_profile.format_profile_for_ai() — тобто бачать УСІ заповнені
-  поля, включно з новими (рівень, проєкти, курси, переїзд, бажані сфери,
-  «що не підходить», дата старту), а не фіксований список із п'яти полів.
-- score_vacancy: детальніший промпт зі шкалою оцінок і правилами (стоп-
-  фактори, рівень, формат/локація/переїзд, зарплата, мови). У промпт тепер
-  передаються також зарплата, локація/формат і вимоги до досвіду вакансії.
-  Якщо профіль порожній (немає жодного заповненого поля) — match_percent
-  = None, як і раніше без профілю.
-- get_match_percent() / is_good_match() / filter_by_min_match() —
-  спільна логіка порогу: вакансія підходить, якщо match_percent СТРОГО
-  БІЛЬШИЙ за config.settings.JOB_MIN_MATCH_PERCENT (за замовчуванням 50).
-
-Решта функцій — без змін.
+Раніше:
+- interleave_by_source(): результати пошуку чергуються по джерелах.
+- _search_once() логує, скільки вакансій віддало кожне джерело.
+- Усі AI-промпти беруть профіль через format_profile_for_ai().
+- get_match_percent() / is_good_match() / filter_by_min_match().
 """
 
 import json
@@ -41,7 +28,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
-from config.settings import JOB_MIN_MATCH_PERCENT
+from config.settings import JOB_MIN_MATCH_PERCENT, JOB_SCORE_BATCH_SIZE
 from database.job_profile import format_profile_for_ai
 from services import ai_service
 
@@ -137,7 +124,7 @@ _CARD_NOISE_LINES = {
 
 
 # =========================================================
-# НОВЕ: поріг збігу з профілем
+# Поріг збігу з профілем
 # =========================================================
 
 def get_match_percent(vacancy: dict) -> float | None:
@@ -642,10 +629,7 @@ def apply_filters(vacancies: list[dict], filters: dict) -> list[dict]:
 def interleave_by_source(vacancies: list[dict]) -> list[dict]:
     """Чергує вакансії по джерелах (round-robin): по одній від кожного
     джерела по колу — Djinni, DOU, Work.ua, Robota.ua, знову Djinni ...
-    Порядок усередині кожного джерела зберігається. Завдяки цьому, коли
-    далі беруться лише перші N вакансій (handlers/jobs.py оцінює перші 15),
-    у вибірці є по кілька вакансій від КОЖНОГО джерела, а не лише від
-    того, яке віддало найбільше результатів."""
+    Порядок усередині кожного джерела зберігається."""
     groups: dict[str, list[dict]] = {}
     for v in vacancies:
         groups.setdefault(v.get("source") or "", []).append(v)
@@ -717,6 +701,21 @@ async def search_vacancies(criteria: dict) -> list[dict]:
 
 _EMPTY_SCORE = {"match_percent": None, "fits": [], "missing": [], "highlight": "", "advice": ""}
 
+_SCORE_RULES = """Шкала match_percent:
+- 85-100: майже ідеально — професія, рівень і ключові навички збігаються
+- 65-84: добре підходить, бракує лише другорядного
+- 40-64: частково — напрямок схожий, але є суттєві прогалини
+- 0-39: не підходить
+Значення понад 50 означає, що вакансія реально варта уваги кандидата. Не завищуй оцінку.
+
+Правила:
+- Якщо вакансія потрапляє під пункт «Що не підходить» (галузь, технологія, умови) — match_percent не вище 30.
+- Якщо вакансія вимагає явно вищий рівень, ніж у кандидата (напр. Senior для Junior), суттєво знизь оцінку.
+- Врахуй формат роботи, локацію і готовність до переїзду: конфлікт (напр. лише офіс в іншому місті, а кандидат не готовий переїжджати) — знизь оцінку.
+- Якщо зарплату вказано і вона помітно нижча за бажану — знизь оцінку помірно.
+- Якщо вимагають мову, якої в профілі немає або рівень нижчий за потрібний — врахуй це.
+- Бажані сфери й проєкти кандидата — додатковий плюс, якщо вакансія в них потрапляє."""
+
 
 async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
     profile_text = format_profile_for_ai(profile)
@@ -734,20 +733,7 @@ async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
 Профіль кандидата:
 {profile_text}
 
-Шкала match_percent:
-- 85-100: майже ідеально — професія, рівень і ключові навички збігаються
-- 65-84: добре підходить, бракує лише другорядного
-- 40-64: частково — напрямок схожий, але є суттєві прогалини
-- 0-39: не підходить
-Значення понад 50 означає, що вакансія реально варта уваги кандидата. Не завищуй оцінку.
-
-Правила:
-- Якщо вакансія потрапляє під пункт «Що не підходить» (галузь, технологія, умови) — match_percent не вище 30.
-- Якщо вакансія вимагає явно вищий рівень, ніж у кандидата (напр. Senior для Junior), суттєво знизь оцінку.
-- Врахуй формат роботи, локацію і готовність до переїзду: конфлікт (напр. лише офіс в іншому місті, а кандидат не готовий переїжджати) — знизь оцінку.
-- Якщо зарплату вказано і вона помітно нижча за бажану — знизь оцінку помірно.
-- Якщо вимагають мову, якої в профілі немає або рівень нижчий за потрібний — врахуй це.
-- Бажані сфери й проєкти кандидата — додатковий плюс, якщо вакансія в них потрапляє.
+{_SCORE_RULES}
 
 Поверни ЛИШЕ JSON:
 {{"match_percent": число 0-100, "fits": ["що підходить, коротко, 1-3 слова кожне"],
@@ -756,6 +742,100 @@ async def score_vacancy(vacancy: dict, profile: dict | None) -> dict:
 
     result = await ai_service.generate_json(prompt, temperature=0.4)
     return result or dict(_EMPTY_SCORE)
+
+
+# =========================================================
+# НОВЕ: пакетна оцінка (1 AI-запит на N вакансій)
+# =========================================================
+
+def _build_batch_prompt(chunk: list[dict], profile_text: str) -> str:
+    blocks = []
+    for i, v in enumerate(chunk, start=1):
+        blocks.append(
+            f"[{i}] {v.get('title')} у {v.get('company') or 'компанії'}\n"
+            f"Зарплата: {v.get('salary') or 'не вказана'}; "
+            f"локація/формат: {v.get('location') or ''} {v.get('work_format') or ''}; "
+            f"досвід: {v.get('experience') or 'не вказано'}\n"
+            f"Опис: {(v.get('requirements') or '')[:400]}"
+        )
+    vacancies_text = "\n\n".join(blocks)
+
+    return f"""Оціни, наскільки КОЖНА з вакансій нижче підходить кандидату.
+
+Профіль кандидата:
+{profile_text}
+
+{_SCORE_RULES}
+
+Вакансії:
+{vacancies_text}
+
+Поверни ЛИШЕ JSON-об'єкт, по одному елементу на КОЖНУ вакансію (i — номер у квадратних дужках):
+{{"results": [
+  {{"i": 1, "match_percent": число 0-100, "fits": ["коротко"], "missing": ["коротко"],
+    "highlight": "що підкреслити в заявці", "advice": "чи варто подаватися, одне речення"}}
+]}}"""
+
+
+def _extract_batch_items(result) -> list[dict]:
+    if isinstance(result, dict):
+        items = result.get("results") or result.get("items") or []
+    elif isinstance(result, list):
+        items = result
+    else:
+        return []
+    return [x for x in items if isinstance(x, dict)]
+
+
+async def score_vacancies_batch(vacancies: list[dict], profile: dict | None,
+                                batch_size: int | None = None) -> int:
+    """Оцінює вакансії пачками й записує результат у v["_score"].
+    Вакансії, які не вдалося оцінити, отримують match_percent=None.
+    Якщо два запити поспіль провалились (ліміт / збій AI) — решта пачок
+    не пробується. Повертає кількість успішно оцінених."""
+    for v in vacancies:
+        v["_score"] = dict(_EMPTY_SCORE)
+
+    profile_text = format_profile_for_ai(profile)
+    if not vacancies or not ai_service.is_available() or not profile_text:
+        return 0
+
+    size = max(1, batch_size or JOB_SCORE_BATCH_SIZE)
+    scored = 0
+    failures = 0
+
+    for start in range(0, len(vacancies), size):
+        chunk = vacancies[start:start + size]
+        result = await ai_service.generate_json(_build_batch_prompt(chunk, profile_text), temperature=0.3)
+        items = _extract_batch_items(result)
+        if not items:
+            failures += 1
+            logger.warning("Пакетна оцінка: порожня відповідь AI (пачка %s-%s, збоїв поспіль: %s)",
+                           start + 1, start + len(chunk), failures)
+            if failures >= 2:
+                logger.warning("Пакетна оцінка перервана: AI недоступний, решту оцінимо наступного прогону")
+                break
+            continue
+
+        failures = 0
+        for item in items:
+            try:
+                idx = int(item.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= idx <= len(chunk) or item.get("match_percent") is None:
+                continue
+            chunk[idx - 1]["_score"] = {
+                "match_percent": item.get("match_percent"),
+                "fits": item.get("fits") or [],
+                "missing": item.get("missing") or [],
+                "highlight": item.get("highlight") or "",
+                "advice": item.get("advice") or "",
+            }
+            scored += 1
+
+    logger.info("Пакетна оцінка: оцінено %s з %s вакансій", scored, len(vacancies))
+    return scored
 
 
 async def analyze_vacancy_full(vacancy: dict, profile: dict | None) -> str | None:
@@ -849,7 +929,7 @@ async def attempt_auto_apply(vacancy: dict, cover_letter: str) -> dict:
 
 
 # =========================================================
-# НОВЕ: 🌙 Автопошук — побудова criteria з майстра (не з вільного тексту)
+# 🌙 Автопошук — побудова criteria з майстра (не з вільного тексту)
 # =========================================================
 
 _LEVEL_TO_TEXT = {
@@ -877,8 +957,7 @@ def build_criteria_from_wizard(data: dict) -> dict:
     """Перетворює структуровані відповіді майстра створення автопошуку
     (handlers/jobs.py AutosearchWizard) у той самий формат criteria, який
     очікують fetch_djinni/fetch_dou/fetch_workua/fetch_robotaua і
-    score_vacancy — ІДЕНТИЧНИЙ формату, що повертає parse_job_query, тому
-    жодну з існуючих функцій пошуку/скорингу не треба було переписувати."""
+    score_vacancy — ІДЕНТИЧНИЙ формату, що повертає parse_job_query."""
     position = (data.get("position") or "").strip()
     city = (data.get("city") or "").strip()
     if city.lower() in ("будь-де", "будь де", "не важливо", "anywhere", ""):
