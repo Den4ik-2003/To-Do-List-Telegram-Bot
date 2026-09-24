@@ -1,21 +1,23 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/ai_planner.py
 
-Єдина змістовна зміна: AI_PLAN_TIMEOUT_SECONDS 45 → 100.
+Додано відносно попередньої версії:
+- Питання "Скільки часу ти сьогодні маєш для виконання задач?" (ai_plan_cb
+  та ai_regenerate_cb) тепер показує кнопки 2/4/6/8/10/12 год + "✏️ Інша
+  кількість" — той самий підхід, що вже використовується у вечірньому
+  плані (keyboards/evening_plan.ikb_evening_hours), а не вимагає вільного
+  тексту. Клавіатура визначена ЛОКАЛЬНО в цьому файлі (_ikb_ai_plan_hours),
+  щоб не чіпати keyboards/ai.py.
+- Нові callback-хендлери aiplan_hours_cb / aiplan_hours_custom_cb:
+  aiplan_hours:{h} одразу запускає генерацію плану на h годин;
+  aiplan_hours_custom переводить у стан AvailableTimeInput.answer, де
+  людина, як і раніше, може написати довільний текст ("3 години" або
+  "2 години, з 19:00 до 21:00") — це зберігає можливість вказати часовий
+  проміжок, чого прості кнопки з кількістю годин не покривають.
+- AvailableTimeInput.answer (вільний текст) залишено БЕЗ ЗМІН — тепер до
+  нього потрапляють лише ті, хто натиснув "✏️ Інша кількість".
 
-ЧОМУ: services/ai_service.py у найгіршому разі (json_mode-спроба +
-retry, потім текстовий fallback-прохід) для ОДНІЄЇ моделі може зайняти
-до ~90с (після паралельного фіксу AI_REQUEST_TIMEOUT_SECONDS 45→30 і
-прибирання retry з fallback-проходу). Попередній зовнішній тайм-аут 45с
-був КОРОТШИЙ за цей внутрішній найгірший сценарій — тому користувач
-регулярно бачив "AI не відповів вчасно" навіть тоді, коли AI за трохи
-довший час усе ж відповів би успішно. 100с дає невеликий запас понад
-розрахований найгірший сценарій (~90с) для однієї моделі.
-
-Якщо в AI_FALLBACK_MODELS (config/settings.py) налаштовано кілька
-резервних моделей — час пропорційно зростає на кожну додаткову модель,
-і це значення, можливо, доведеться підняти ще — про це залишено
-коментар і в services/ai_service.py.
+ЗМІНЕНО раніше (без змін відносно попередньої версії): AI_PLAN_TIMEOUT_SECONDS = 100.
 
 Решта файлу — без змін.
 """
@@ -28,7 +30,7 @@ from aiogram import Router, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config.constants import LABELS, CATEGORIES, DB_ERROR_TEXT, AI_ERROR_TEXT, AI_LIMIT_TEXT, STATUS_PENDING
 from config.settings import AI_DAILY_LIMIT
@@ -45,9 +47,11 @@ from handlers.common import require_auth, ai_suggestions_cache, compute_daily_st
 logger = logging.getLogger("tasks_bot")
 router = Router(name="ai_planner")
 
-# ЗМІНЕНО: 45 → 100 (див. докстрінг файлу — узгоджено з реальним
-# найгіршим сценарієм часу відповіді в services/ai_service.py).
 AI_PLAN_TIMEOUT_SECONDS = 100
+
+# НОВЕ: ті самі варіанти годин, що й у вечірньому плані — узгоджено
+# візуально, хоч це й окрема клавіатура (щоб не чіпати keyboards/ai.py).
+_AI_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
 
 _generation_tasks: dict[int, asyncio.Task] = {}
 
@@ -62,6 +66,18 @@ class AiEditTask(StatesGroup):
 
 class AvailableTimeInput(StatesGroup):
     answer = State()
+
+
+def _ikb_ai_plan_hours() -> InlineKeyboardMarkup:
+    """НОВЕ: кнопки вибору кількості годин замість вільного тексту —
+    аналог keyboards/evening_plan.ikb_evening_hours()."""
+    buttons = [
+        InlineKeyboardButton(text=f"{h} год", callback_data=f"aiplan_hours:{h}")
+        for h in _AI_PLAN_HOUR_OPTIONS
+    ]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(text="✏️ Інша кількість", callback_data="aiplan_hours_custom")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _fmt_plan_preview(plan: dict, selected: set) -> str:
@@ -159,6 +175,50 @@ async def generate_and_show_plan_for_message(msg: Message, available: dict):
     )
 
 
+async def generate_and_show_plan_for_callback(cb: CallbackQuery, available: dict):
+    """НОВЕ: варіант generate_and_show_plan_for_message, який редагує
+    існуюче повідомлення (з кнопками годин), а не шле нове — викликається
+    з aiplan_hours_cb, де в нас уже є cb.message для edit_text."""
+    uid = cb.from_user.id
+    allowed, remaining = await planner_service.check_ai_limit(uid)
+    if not allowed:
+        return await cb.message.edit_text(AI_LIMIT_TEXT, reply_markup=ikb_ai_menu())
+
+    generating_text = "☀️ Аналізую твої задачі, цілі, проєкти та фінанси, зачекай кілька секунд..."
+    try:
+        await cb.message.edit_text(generating_text, reply_markup=ikb_ai_generating())
+        status_msg = cb.message
+    except TelegramAPIError:
+        status_msg = await cb.message.answer(generating_text, reply_markup=ikb_ai_generating())
+
+    task = asyncio.create_task(planner_service.generate_daily_plan(uid, available=available))
+    _generation_tasks[uid] = task
+    try:
+        plan = await asyncio.wait_for(task, timeout=AI_PLAN_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        return
+    except asyncio.TimeoutError:
+        task.cancel()
+        return await status_msg.edit_text(
+            "⚠️ AI не відповів вчасно. Спробуй ще раз трохи пізніше.",
+            reply_markup=ikb_ai_menu(),
+        )
+    except Exception:
+        logger.exception("Помилка генерації AI-плану для uid=%s", uid)
+        return await status_msg.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
+    finally:
+        _generation_tasks.pop(uid, None)
+
+    if not plan or not plan.get("tasks"):
+        return await status_msg.edit_text(AI_ERROR_TEXT, reply_markup=ikb_ai_menu())
+    selected = set(range(len(plan["tasks"])))
+    ai_suggestions_cache[uid] = {"plan": plan, "selected": selected}
+    await status_msg.edit_text(
+        _fmt_plan_preview(plan, selected),
+        reply_markup=ikb_ai_plan_preview(plan["tasks"], selected),
+    )
+
+
 @router.callback_query(F.data == "ai_gen_cancel")
 async def ai_gen_cancel_cb(cb: CallbackQuery):
     await cb.answer("Скасовую...")
@@ -174,12 +234,13 @@ async def ai_gen_cancel_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "ai_plan")
 async def ai_plan_cb(cb: CallbackQuery, state: FSMContext):
+    """ЗМІНЕНО: замість переходу в стан очікування вільного тексту тепер
+    показує кнопки вибору кількості годин."""
     try:
         await cb.answer()
-        await state.set_state(AvailableTimeInput.answer)
         await cb.message.edit_text(
-            "🌅 *План на сьогодні*\n\nСкільки часу ти сьогодні маєш для виконання задач?\n\n"
-            "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`"
+            "🌅 *План на сьогодні*\n\nСкільки часу ти сьогодні маєш для виконання задач?",
+            reply_markup=_ikb_ai_plan_hours(),
         )
     except Exception:
         logger.exception("ai_plan_cb failed")
@@ -188,16 +249,39 @@ async def ai_plan_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "ai_regenerate")
 async def ai_regenerate_cb(cb: CallbackQuery, state: FSMContext):
+    """ЗМІНЕНО: так само, кнопки замість вільного тексту."""
     try:
         await cb.answer()
-        await state.set_state(AvailableTimeInput.answer)
         await cb.message.edit_text(
-            "🔄 *Перегенерувати план*\n\nСкільки часу ти сьогодні маєш для виконання задач?\n\n"
-            "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`"
+            "🔄 *Перегенерувати план*\n\nСкільки часу ти сьогодні маєш для виконання задач?",
+            reply_markup=_ikb_ai_plan_hours(),
         )
     except Exception:
         logger.exception("ai_regenerate_cb failed")
         await _safe_edit(cb, AI_ERROR_TEXT)
+
+
+@router.callback_query(F.data.startswith("aiplan_hours:"))
+async def aiplan_hours_cb(cb: CallbackQuery, state: FSMContext):
+    """НОВЕ: натискання конкретної кількості годин одразу запускає
+    генерацію плану, без проміжного текстового вводу."""
+    if not await require_auth(cb.message, state):
+        return await cb.answer()
+    hours = int(cb.data.split(":")[1])
+    await cb.answer()
+    await generate_and_show_plan_for_callback(cb, {"hours": hours})
+
+
+@router.callback_query(F.data == "aiplan_hours_custom")
+async def aiplan_hours_custom_cb(cb: CallbackQuery, state: FSMContext):
+    """НОВЕ: "✏️ Інша кількість" — єдиний шлях, що й раніше веде до
+    вільного тексту (дозволяє вказати часовий проміжок типу
+    "2 години, з 19:00 до 21:00", чого прості кнопки не покривають)."""
+    await cb.answer()
+    await state.set_state(AvailableTimeInput.answer)
+    await cb.message.edit_text(
+        "✏️ Напиши, скільки часу маєш сьогодні.\n\nНапиклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`",
+    )
 
 
 @router.message(AvailableTimeInput.answer)

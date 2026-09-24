@@ -1,3 +1,13 @@
+"""
+ЗМІНЕНИЙ ФАЙЛ: config/settings.py
+
+Єдина змістовна зміна: EVENING_PLAN_TIME "22:00" → "21:30" (дефолт;
+якщо на Render задано env-змінну EVENING_PLAN_TIME — вона й далі має
+пріоритет над цим дефолтом, як і раніше).
+
+Решта файлу — без змін.
+"""
+
 import os
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -22,7 +32,7 @@ AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
 AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL).strip()
 AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", "").strip() or AI_MODEL
 
-# --- НОВЕ: стійкість AI до "мертвих" безкоштовних моделей ---
+# --- стійкість AI до "мертвих" безкоштовних моделей ---
 # Таймаут для ЛЕГКИХ запитів (chat, розбір чека, аналіз фото товару).
 AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("AI_REQUEST_TIMEOUT_SECONDS", "30"))
 # Максимальний ЗАГАЛЬНИЙ час однієї спроби генерації сайту (стрімінг).
@@ -62,7 +72,8 @@ THREADS_MORNING_TIME = os.environ.get("THREADS_MORNING_TIME", "08:30")
 
 WORK_HOURS_TEXT = os.environ.get("WORK_HOURS_TEXT", "09:00–18:00")
 
-EVENING_PLAN_TIME = os.environ.get("EVENING_PLAN_TIME", "22:00")
+# ЗМІНЕНО: "22:00" → "21:30"
+EVENING_PLAN_TIME = os.environ.get("EVENING_PLAN_TIME", "21:30")
 EVENING_PLAN_ENABLED = os.environ.get("EVENING_PLAN_ENABLED", "true").strip().lower() == "true"
 EVENING_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
 
