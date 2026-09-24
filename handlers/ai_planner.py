@@ -1,25 +1,18 @@
 """
 ЗМІНЕНИЙ ФАЙЛ: handlers/ai_planner.py
 
-Додано відносно попередньої версії:
-- Питання "Скільки часу ти сьогодні маєш для виконання задач?" (ai_plan_cb
-  та ai_regenerate_cb) тепер показує кнопки 2/4/6/8/10/12 год + "✏️ Інша
-  кількість" — той самий підхід, що вже використовується у вечірньому
-  плані (keyboards/evening_plan.ikb_evening_hours), а не вимагає вільного
-  тексту. Клавіатура визначена ЛОКАЛЬНО в цьому файлі (_ikb_ai_plan_hours),
-  щоб не чіпати keyboards/ai.py.
-- Нові callback-хендлери aiplan_hours_cb / aiplan_hours_custom_cb:
-  aiplan_hours:{h} одразу запускає генерацію плану на h годин;
-  aiplan_hours_custom переводить у стан AvailableTimeInput.answer, де
-  людина, як і раніше, може написати довільний текст ("3 години" або
-  "2 години, з 19:00 до 21:00") — це зберігає можливість вказати часовий
-  проміжок, чого прості кнопки з кількістю годин не покривають.
-- AvailableTimeInput.answer (вільний текст) залишено БЕЗ ЗМІН — тепер до
-  нього потрапляють лише ті, хто натиснув "✏️ Інша кількість".
+Виправлення відносно попередньої версії: у aiplan_hours_cb прибрано
+зайвий повторний виклик require_auth(cb.message, state). Причина бага:
+cb.message — це повідомлення БОТА (з кнопками годин), а не повідомлення
+користувача, тому require_auth отримував не той контекст користувача і
+хибно вважав сесію неавторизованою, показуючи повторний запит пароля
+замість генерації плану. Решта хендлерів флоу AI Планера (ai_plan_cb,
+ai_regenerate_cb, aiptoggle_cb та інші) НІКОЛИ не перевіряють авторизацію
+повторно — вона перевіряється один раз на вході, у ai_menu (кнопка
+"🤖 AI Планер") — тепер aiplan_hours_cb узгоджено з цим же підходом.
 
-ЗМІНЕНО раніше (без змін відносно попередньої версії): AI_PLAN_TIMEOUT_SECONDS = 100.
-
-Решта файлу — без змін.
+Решта змін (кнопки 2/4/6/8/10/12 год замість вільного тексту) — БЕЗ ЗМІН
+відносно попередньої версії.
 """
 
 import asyncio
@@ -49,8 +42,6 @@ router = Router(name="ai_planner")
 
 AI_PLAN_TIMEOUT_SECONDS = 100
 
-# НОВЕ: ті самі варіанти годин, що й у вечірньому плані — узгоджено
-# візуально, хоч це й окрема клавіатура (щоб не чіпати keyboards/ai.py).
 _AI_PLAN_HOUR_OPTIONS = [2, 4, 6, 8, 10, 12]
 
 _generation_tasks: dict[int, asyncio.Task] = {}
@@ -69,8 +60,6 @@ class AvailableTimeInput(StatesGroup):
 
 
 def _ikb_ai_plan_hours() -> InlineKeyboardMarkup:
-    """НОВЕ: кнопки вибору кількості годин замість вільного тексту —
-    аналог keyboards/evening_plan.ikb_evening_hours()."""
     buttons = [
         InlineKeyboardButton(text=f"{h} год", callback_data=f"aiplan_hours:{h}")
         for h in _AI_PLAN_HOUR_OPTIONS
@@ -176,9 +165,8 @@ async def generate_and_show_plan_for_message(msg: Message, available: dict):
 
 
 async def generate_and_show_plan_for_callback(cb: CallbackQuery, available: dict):
-    """НОВЕ: варіант generate_and_show_plan_for_message, який редагує
-    існуюче повідомлення (з кнопками годин), а не шле нове — викликається
-    з aiplan_hours_cb, де в нас уже є cb.message для edit_text."""
+    """Варіант generate_and_show_plan_for_message, який редагує існуюче
+    повідомлення (з кнопками годин), а не шле нове."""
     uid = cb.from_user.id
     allowed, remaining = await planner_service.check_ai_limit(uid)
     if not allowed:
@@ -234,8 +222,6 @@ async def ai_gen_cancel_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "ai_plan")
 async def ai_plan_cb(cb: CallbackQuery, state: FSMContext):
-    """ЗМІНЕНО: замість переходу в стан очікування вільного тексту тепер
-    показує кнопки вибору кількості годин."""
     try:
         await cb.answer()
         await cb.message.edit_text(
@@ -249,7 +235,6 @@ async def ai_plan_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "ai_regenerate")
 async def ai_regenerate_cb(cb: CallbackQuery, state: FSMContext):
-    """ЗМІНЕНО: так само, кнопки замість вільного тексту."""
     try:
         await cb.answer()
         await cb.message.edit_text(
@@ -263,10 +248,11 @@ async def ai_regenerate_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("aiplan_hours:"))
 async def aiplan_hours_cb(cb: CallbackQuery, state: FSMContext):
-    """НОВЕ: натискання конкретної кількості годин одразу запускає
-    генерацію плану, без проміжного текстового вводу."""
-    if not await require_auth(cb.message, state):
-        return await cb.answer()
+    """ВИПРАВЛЕНО: прибрано зайвий require_auth(cb.message, state) —
+    cb.message належить боту, а не користувачу, тому ця перевірка хибно
+    вимагала повторний пароль. Авторизація вже перевірена вище по флоу
+    (ai_menu), тут — як і у всіх інших callback-хендлерах цього файлу —
+    повторна перевірка не потрібна."""
     hours = int(cb.data.split(":")[1])
     await cb.answer()
     await generate_and_show_plan_for_callback(cb, {"hours": hours})
@@ -274,9 +260,6 @@ async def aiplan_hours_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "aiplan_hours_custom")
 async def aiplan_hours_custom_cb(cb: CallbackQuery, state: FSMContext):
-    """НОВЕ: "✏️ Інша кількість" — єдиний шлях, що й раніше веде до
-    вільного тексту (дозволяє вказати часовий проміжок типу
-    "2 години, з 19:00 до 21:00", чого прості кнопки не покривають)."""
     await cb.answer()
     await state.set_state(AvailableTimeInput.answer)
     await cb.message.edit_text(
