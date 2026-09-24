@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import sys
@@ -145,6 +144,7 @@ def register_routers(dp: Dispatcher) -> None:
         shops,
         shop_templates,
         shop_articles,
+        shop_threads,
         posts,
         github_deploy,
         ai_developer,
@@ -185,6 +185,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(shops.router)
     dp.include_router(shop_templates.router)
     dp.include_router(shop_articles.router)
+    dp.include_router(shop_threads.router)
     dp.include_router(posts.router)
     dp.include_router(github_deploy.router)
     dp.include_router(ai_developer.router)

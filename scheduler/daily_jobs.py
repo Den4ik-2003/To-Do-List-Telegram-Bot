@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -54,6 +53,7 @@ INSIGHT_CHECK_INTERVAL_DAYS = 7
 INSIGHT_CHECK_TIME = "12:00"
 
 THREADS_MORNING_TIME = getattr(_settings, "THREADS_MORNING_TIME", "08:30")
+THREADS_SHOP_GAP_SECONDS = 300
 
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
@@ -374,8 +374,13 @@ async def thread_ideas_morning_task(bot: Bot):
                 logger.info("thread_ideas_morning_task: AI недоступний, пропускаю сьогоднішнє питання")
                 continue
             shops = await shop_threads_db.get_all_shops_for_broadcast()
-            logger.info("thread_ideas_morning_task: питаю про Threads-ідеї для %d магазинів", len(shops))
-            for shop in shops:
+            logger.info(
+                "thread_ideas_morning_task: питаю про Threads-ідеї для %d магазинів, з інтервалом %d с",
+                len(shops), THREADS_SHOP_GAP_SECONDS,
+            )
+            for i, shop in enumerate(shops):
+                if i > 0:
+                    await asyncio.sleep(THREADS_SHOP_GAP_SECONDS)
                 try:
                     await _ask_threads_today(bot, shop)
                 except Exception:
@@ -417,15 +422,7 @@ async def ai_cleaner_task(bot: Bot):
             logger.exception("ai_cleaner_task outer loop failed")
 
 
-# =========================================================
-# НОВЕ: 🌙 Вечірній план на завтра (22:00)
-# =========================================================
-
 async def evening_plan_task(bot: Bot):
-    """Щодня о EVENING_PLAN_TIME (22:00 за замовчуванням) шле кожному
-    користувачу (з увімкненою evening_plan_enabled, раз на день) питання
-    про кількість годин на завтра з кнопками — кнопки і подальшу
-    генерацію обробляє handlers/evening_plan.py."""
     while True:
         if not EVENING_PLAN_ENABLED or not ai_service.is_available():
             logger.info("evening_plan_task: вимкнено або AI недоступний, перевірю знову через 30 хв")
