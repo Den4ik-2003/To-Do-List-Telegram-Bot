@@ -248,14 +248,9 @@ async def ai_regenerate_cb(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("aiplan_hours:"))
 async def aiplan_hours_cb(cb: CallbackQuery, state: FSMContext):
-    """ВИПРАВЛЕНО: services/planner_service.generate_daily_plan очікує
-    словник із ключем "total_minutes" (саме так його формує
-    parse_available_time() з вільного тексту), а не "hours" — передача
-    {"hours": h} валила генерацію з KeyError: 'total_minutes'. Тепер
-    рахуємо хвилини з обраної кількості годин тут же."""
     hours = int(cb.data.split(":")[1])
     await cb.answer()
-    await generate_and_show_plan_for_callback(cb, {"total_minutes": hours * 60})
+    await generate_and_show_plan_for_callback(cb, {"total_minutes": hours * 60, "windows": []})
 
 
 @router.callback_query(F.data == "aiplan_hours_custom")
