@@ -48,6 +48,7 @@ def ikb_project_actions(project_id) -> InlineKeyboardMarkup:
     pid = str(project_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Deploy оновлення", callback_data=f"ghproj_deploy:{pid}")],
+        [InlineKeyboardButton(text="🌐 Netlify", callback_data=f"nf_open:{pid}")],
         [InlineKeyboardButton(text="📥 Download ZIP", callback_data=f"ghproj_download:{pid}")],
         [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"ghproj_edit:{pid}")],
         [InlineKeyboardButton(text="📜 Історія", callback_data=f"ghproj_history:{pid}")],
@@ -107,3 +108,47 @@ def ikb_gitlog_branches(branches: list[dict], default_branch: str, project_id) -
         rows.append([InlineKeyboardButton(text=label, callback_data=f"ghlog_branch:{pid}:{i}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ghproj:{pid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_netlify_status(project_id, site_url: str | None) -> InlineKeyboardMarkup:
+    pid = str(project_id)
+    rows = [[InlineKeyboardButton(text="🔄 Redeploy", callback_data=f"nf_redeploy:{pid}")]]
+    if site_url:
+        rows.append([InlineKeyboardButton(text="🌐 Відкрити сайт", url=site_url)])
+    rows.append([InlineKeyboardButton(text="🔌 Відключити сайт", callback_data=f"nf_disconnect_site:{pid}")])
+    rows.append([InlineKeyboardButton(text="🔌 Відключити Netlify акаунт", callback_data="nf_token_disconnect")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ghproj:{pid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_netlify_branch_choice(branches: list[dict], default_branch: str, project_id) -> InlineKeyboardMarkup:
+    pid = str(project_id)
+    rows = []
+    for i, b in enumerate(branches[:25]):
+        label = f"🌿 {b['name']}" + (" (default)" if b["name"] == default_branch else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"nfdl_branch:{pid}:{i}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ghproj:{pid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_netlify_deploy_confirm(project_id) -> InlineKeyboardMarkup:
+    pid = str(project_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Deploy", callback_data=f"nf_deploy_yes:{pid}"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data=f"nf_deploy_no:{pid}"),
+    ]])
+
+
+def ikb_netlify_disconnect_site_confirm(project_id) -> InlineKeyboardMarkup:
+    pid = str(project_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, відключити", callback_data=f"nf_disconnect_site_yes:{pid}"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data=f"nf_disconnect_site_no:{pid}"),
+    ]])
+
+
+def ikb_netlify_token_disconnect_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, відключити", callback_data="nf_token_disconnect_yes"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data="nf_token_disconnect_no"),
+    ]])

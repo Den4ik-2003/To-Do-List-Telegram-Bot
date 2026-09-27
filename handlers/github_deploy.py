@@ -9,13 +9,16 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardButton
 
 from database import github_projects as github_projects_db
-from services import github_api, github_crypto, github_download, github_zip
+from database import netlify_credentials as netlify_credentials_db
+from services import github_api, github_crypto, github_download, github_zip, netlify_service
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.github import (
     ikb_github_settings, ikb_disconnect_confirm, ikb_repo_choice, ikb_deploy_confirm,
     ikb_projects_list, ikb_project_actions, ikb_project_delete_confirm, ikb_edit_fields,
     ikb_download_branches, ikb_download_version_choice, ikb_download_commits,
     ikb_gitlog_branches,
+    ikb_netlify_status, ikb_netlify_branch_choice, ikb_netlify_deploy_confirm,
+    ikb_netlify_disconnect_site_confirm, ikb_netlify_token_disconnect_confirm,
 )
 from handlers.common import require_auth
 
@@ -36,10 +39,14 @@ _pending_dl_commits: dict[int, list] = {}
 _pending_gitlog_branches: dict[int, list] = {}
 _pending_gitlog_ctx: dict[int, dict] = {}
 
+_pending_netlify_target: dict[int, str] = {}
+_pending_netlify_branches: dict[int, list] = {}
+_pending_netlify_ctx: dict[int, dict] = {}
+
 _JUNK_NAME_RE = re.compile(r"^(нова папка|новая папка|new folder|project)(\s*\(\d+\))?$", re.IGNORECASE)
 
 TELEGRAM_MSG_LIMIT = 4096
-_SAFE_CHUNK = 4000  # leave headroom for markdown entity edge cases
+_SAFE_CHUNK = 4000
 
 
 def _is_junk_project_name(name: str) -> bool:
@@ -54,6 +61,10 @@ class GithubDeploy(StatesGroup):
     add_waiting_name = State()
     saved_waiting_zip = State()
     edit_waiting_value = State()
+
+
+class NetlifyDeploy(StatesGroup):
+    waiting_token = State()
 
 
 def _md_escape(text: str) -> str:
@@ -77,12 +88,11 @@ async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
 
 
 def _chunk_lines(lines: list[str], limit: int = _SAFE_CHUNK) -> list[str]:
-    """Group lines into chunks each under `limit` chars when joined with '\n'."""
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
     for line in lines:
-        line_len = len(line) + 1  # +1 for the joining newline
+        line_len = len(line) + 1
         if current and current_len + line_len > limit:
             chunks.append("\n".join(current))
             current = [line]
@@ -96,8 +106,6 @@ def _chunk_lines(lines: list[str], limit: int = _SAFE_CHUNK) -> list[str]:
 
 
 async def _answer_chunked(msg: Message, lines: list[str], reply_markup=None, **kwargs) -> None:
-    """Send `lines` as one or more messages, each under Telegram's length limit.
-    Any reply_markup is attached only to the last chunk."""
     chunks = _chunk_lines(lines)
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1
@@ -1049,3 +1057,307 @@ async def _gh_download_execute(cb: CallbackQuery, commit_sha: str | None):
         await github_projects_db.record_download(
             uid, project_id, branch, commit_sha, short_sha, total, len(zip_bytes),
         )
+
+
+async def _nf_start_branch_pick(msg_target: Message, uid: int, project: dict, kind: str):
+    pid = str(project["_id"])
+    cred = await github_projects_db.get_credential(uid)
+    if not cred:
+        return await msg_target.answer("🔐 Спочатку підключи GitHub у «⚙️ Налаштування GitHub».")
+    token = github_crypto.decrypt_token(cred["encryptedToken"])
+    if not token:
+        return await msg_target.answer(_fail_text(
+            "Не вдалося розшифрувати токен GitHub.", "Підключи GitHub заново в налаштуваннях.",
+        ))
+
+    wait = await msg_target.answer("⏳ Отримую branches з GitHub...")
+    branches = await github_api.list_branches(token, project["githubOwner"], project["githubRepo"])
+    if not branches:
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося отримати список branch.", "Перевір права токена і спробуй ще раз.",
+        ))
+
+    _pending_netlify_branches[uid] = branches
+    _pending_netlify_ctx[uid] = {
+        "project_id": pid,
+        "owner": project["githubOwner"],
+        "repo": project["githubRepo"],
+        "gh_token": token,
+        "kind": kind,
+    }
+
+    await _safe_edit(
+        wait, "🌿 Обери branch для деплою на Netlify:",
+        reply_markup=ikb_netlify_branch_choice(branches, project["defaultBranch"], pid),
+    )
+
+
+async def _nf_show_menu(msg_target: Message, uid: int, project: dict):
+    pid = str(project["_id"])
+    if project.get("netlifySiteId"):
+        text = (
+            f"🌐 *Netlify* — {project['projectName']}\n\n"
+            f"Сайт: {project.get('netlifyUrl') or '—'}"
+        )
+        return await msg_target.answer(text, reply_markup=ikb_netlify_status(pid, project.get("netlifyUrl")))
+    await msg_target.answer(f"🌐 *Netlify* — {project['projectName']}\n\nСайт ще не створено.")
+    await _nf_start_branch_pick(msg_target, uid, project, kind="new")
+
+
+@router.callback_query(F.data.startswith("nf_open:"))
+async def nf_open(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project:
+        return await cb.answer("Проєкт не знайдено", show_alert=True)
+    await cb.answer()
+
+    nf_cred = await netlify_credentials_db.get_credential(uid)
+    if not nf_cred:
+        _pending_netlify_target[uid] = pid
+        await state.set_state(NetlifyDeploy.waiting_token)
+        return await cb.message.answer(
+            "🌐 *Підключення Netlify*\n\n"
+            "1. Відкрий https://app.netlify.com/user/applications#personal-access-tokens\n"
+            "2. Створи Personal Access Token\n"
+            "3. Встав його сюди повідомленням\n\n"
+            "Я одразу видалю твоє повідомлення з токеном після обробки.",
+            reply_markup=kb_cancel(),
+        )
+
+    await _nf_show_menu(cb.message, uid, project)
+
+
+@router.message(NetlifyDeploy.waiting_token, F.text == "❌ Скасувати")
+async def nf_connect_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    _pending_netlify_target.pop(msg.from_user.id, None)
+    await msg.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.message(NetlifyDeploy.waiting_token)
+async def nf_connect_token(msg: Message, state: FSMContext, bot: Bot):
+    uid = msg.from_user.id
+    token = (msg.text or "").strip()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if not token:
+        return await msg.answer("Токен порожній. Спробуй ще раз або натисни «❌ Скасувати».")
+
+    user_info = await netlify_service.verify_token(token)
+    if not user_info:
+        return await msg.answer(_fail_text(
+            "Токен недійсний або немає доступу.",
+            "Перевір токен на app.netlify.com і надішли ще раз.",
+        ))
+
+    if not github_crypto.is_available():
+        await state.clear()
+        _pending_netlify_target.pop(uid, None)
+        return await msg.answer(_fail_text(
+            "Не налаштовано ключ шифрування на сервері.",
+            "Звернись до адміністратора бота.",
+        ), reply_markup=kb_main())
+
+    encrypted = github_crypto.encrypt_token(token)
+    await netlify_credentials_db.save_credential(uid, encrypted, user_info.get("email", "?"))
+    await state.clear()
+    await msg.answer(f"✅ Netlify підключено як *{user_info.get('email', '?')}*")
+
+    pid = _pending_netlify_target.pop(uid, None)
+    if pid:
+        project = await github_projects_db.get_project(uid, pid)
+        if project:
+            return await _nf_show_menu(msg, uid, project)
+    await msg.answer("Готово.", reply_markup=kb_main())
+
+
+@router.callback_query(F.data.startswith("nf_redeploy:"))
+async def nf_redeploy_start(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project or not project.get("netlifySiteId"):
+        return await cb.answer("Сайт не знайдено", show_alert=True)
+    await cb.answer()
+    await _nf_start_branch_pick(cb.message, uid, project, kind="redeploy")
+
+
+@router.callback_query(F.data.startswith("nfdl_branch:"))
+async def nf_branch_pick(cb: CallbackQuery):
+    uid = cb.from_user.id
+    _, pid, idx_str = cb.data.split(":", 2)
+    idx = int(idx_str)
+    branches = _pending_netlify_branches.get(uid) or []
+    ctx = _pending_netlify_ctx.get(uid)
+    if idx >= len(branches) or not ctx or ctx.get("project_id") != pid:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+
+    ctx["branch"] = branches[idx]["name"]
+    await cb.answer()
+    label = "Створити сайт на Netlify" if ctx["kind"] == "new" else "Оновити сайт на Netlify"
+    await cb.message.answer(
+        f"🌿 Branch: {ctx['branch']}\n\n{label}?",
+        reply_markup=ikb_netlify_deploy_confirm(pid),
+    )
+
+
+@router.callback_query(F.data.startswith("nf_deploy_no:"))
+async def nf_deploy_cancel(cb: CallbackQuery):
+    uid = cb.from_user.id
+    _pending_netlify_branches.pop(uid, None)
+    _pending_netlify_ctx.pop(uid, None)
+    await cb.answer("Скасовано")
+    await cb.message.answer("Скасовано.", reply_markup=kb_main())
+
+
+@router.callback_query(F.data.startswith("nf_deploy_yes:"))
+async def nf_deploy_confirmed(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    ctx = _pending_netlify_ctx.pop(uid, None)
+    _pending_netlify_branches.pop(uid, None)
+    if not ctx or ctx.get("project_id") != pid or "branch" not in ctx:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+    await cb.answer()
+
+    nf_cred = await netlify_credentials_db.get_credential(uid)
+    if not nf_cred:
+        return await cb.message.answer(_fail_text(
+            "Netlify не підключено.", "Підключи Netlify і спробуй ще раз.",
+        ))
+    nf_token = github_crypto.decrypt_token(nf_cred["encryptedToken"])
+    if not nf_token:
+        return await cb.message.answer(_fail_text(
+            "Не вдалося розшифрувати токен Netlify.", "Підключи Netlify заново.",
+        ))
+
+    wait = await cb.message.answer("⏳ Отримую файли з GitHub...")
+
+    branches = await github_api.list_branches(ctx["gh_token"], ctx["owner"], ctx["repo"])
+    branch_sha = next((b["sha"] for b in branches if b["name"] == ctx["branch"]), None)
+    if not branch_sha:
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося визначити commit branch.", "Спробуй ще раз.",
+        ))
+
+    try:
+        tree_info = await github_download.prepare_download(ctx["gh_token"], ctx["owner"], ctx["repo"], branch_sha)
+    except github_download.DownloadError as e:
+        return await _safe_edit(wait, _fail_text(e.reason, e.hint))
+    except Exception:
+        logger.exception("Netlify tree fetch crashed for uid=%s repo=%s/%s", uid, ctx["owner"], ctx["repo"])
+        return await _safe_edit(wait, _fail_text(
+            "GitHub тимчасово недоступний.", "Спробуй ще раз через кілька хвилин.",
+        ))
+
+    items = tree_info["items"]
+    total = len(items)
+
+    async def progress(done, total_files):
+        pct = int(done / total_files * 100)
+        bar_len = 10
+        filled = int(bar_len * done / total_files)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        try:
+            await wait.edit_text(f"⏳ Завантажую файли з GitHub...\n{bar} {pct}%")
+        except Exception:
+            pass
+
+    try:
+        files = await github_download.fetch_files_dict(
+            ctx["gh_token"], ctx["owner"], ctx["repo"], items, progress_cb=progress,
+        )
+    except github_download.DownloadError as e:
+        return await _safe_edit(wait, _fail_text(e.reason, e.hint))
+    except Exception:
+        logger.exception("Netlify file fetch crashed for uid=%s repo=%s/%s", uid, ctx["owner"], ctx["repo"])
+        return await _safe_edit(wait, _fail_text("Не вдалося завантажити файли з GitHub.", "Спробуй ще раз."))
+
+    await _safe_edit(wait, "⏳ Деплою на Netlify...")
+
+    project = await github_projects_db.get_project(uid, pid)
+    if not project:
+        return await _safe_edit(wait, _fail_text("Проєкт не знайдено.", "Почни спочатку."))
+
+    if ctx["kind"] == "new":
+        slug = re.sub(r"[^a-z0-9]+", "-", project["projectName"].lower()).strip("-") or None
+        site_info = await netlify_service.deploy_new_site(nf_token, files, desired_name=slug)
+    else:
+        site_id = project.get("netlifySiteId")
+        if not site_id:
+            return await _safe_edit(wait, _fail_text(
+                "Сайт Netlify не знайдено для цього проєкту.", "Створи сайт заново.",
+            ))
+        site_info = await netlify_service.redeploy_site(nf_token, site_id, files)
+
+    if not site_info or not site_info.get("site_id"):
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося задеплоїти на Netlify.", "Перевір токен Netlify і спробуй ще раз.",
+        ))
+
+    await github_projects_db.set_netlify_site(
+        uid, pid, site_info["site_id"], site_info.get("url"), site_info.get("admin_url"),
+    )
+    await github_projects_db.record_netlify_deploy(uid, pid, ctx["branch"], site_info.get("url") or "")
+
+    await _safe_edit(wait, f"✅ *Готово на Netlify*\n\nСайт:\n{site_info.get('url') or '—'}")
+
+
+@router.callback_query(F.data.startswith("nf_disconnect_site:"))
+async def nf_disconnect_site_ask(cb: CallbackQuery):
+    pid = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await cb.message.answer(
+        "Відключити сайт від проєкту? Сайт на Netlify буде видалено остаточно.",
+        reply_markup=ikb_netlify_disconnect_site_confirm(pid),
+    )
+
+
+@router.callback_query(F.data.startswith("nf_disconnect_site_yes:"))
+async def nf_disconnect_site_yes(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project or not project.get("netlifySiteId"):
+        return await cb.answer("Сайт не знайдено", show_alert=True)
+
+    nf_cred = await netlify_credentials_db.get_credential(uid)
+    nf_token = github_crypto.decrypt_token(nf_cred["encryptedToken"]) if nf_cred else None
+    if nf_token:
+        await netlify_service.delete_site(nf_token, project["netlifySiteId"])
+
+    await github_projects_db.clear_netlify_site(uid, pid)
+    await cb.answer("Відключено")
+    await cb.message.answer("🔌 Сайт відключено від проєкту.")
+
+
+@router.callback_query(F.data.startswith("nf_disconnect_site_no:"))
+async def nf_disconnect_site_no(cb: CallbackQuery):
+    await cb.answer("Скасовано")
+
+
+@router.callback_query(F.data == "nf_token_disconnect")
+async def nf_token_disconnect_ask(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "Відключити Netlify акаунт від бота? Збережені сайти залишаться на Netlify, "
+        "але керувати ними через бота стане неможливо.",
+        reply_markup=ikb_netlify_token_disconnect_confirm(),
+    )
+
+
+@router.callback_query(F.data == "nf_token_disconnect_yes")
+async def nf_token_disconnect_yes(cb: CallbackQuery):
+    await netlify_credentials_db.delete_credential(cb.from_user.id)
+    await cb.answer("Відключено")
+    await cb.message.answer("🔌 Netlify акаунт відключено.", reply_markup=kb_main())
+
+
+@router.callback_query(F.data == "nf_token_disconnect_no")
+async def nf_token_disconnect_no(cb: CallbackQuery):
+    await cb.answer("Скасовано")

@@ -54,6 +54,7 @@ shop_thread_ideas_col = None
 
 github_projects_col = None
 github_credentials_col = None
+netlify_credentials_col = None
 
 websites_col = None
 orders_col = None
@@ -76,7 +77,7 @@ async def init_mongo(mongo_uri: str):
     global worktime_col
     global shops_col, shop_templates_col, shop_examples_col, shop_stickers_col
     global shop_drafts_col, shop_published_posts_col, shop_articles_col, shop_thread_ideas_col
-    global github_projects_col, github_credentials_col
+    global github_projects_col, github_credentials_col, netlify_credentials_col
     global websites_col
     global orders_col
     global templates_col
@@ -142,6 +143,7 @@ async def init_mongo(mongo_uri: str):
 
     github_projects_col = db["github_projects"]
     github_credentials_col = db["github_credentials"]
+    netlify_credentials_col = db["netlify_credentials"]
 
     websites_col = db["websites"]
     orders_col = db["orders"]
@@ -151,6 +153,7 @@ async def init_mongo(mongo_uri: str):
     await ping()
     await _ensure_shop_indexes()
     await _ensure_github_indexes()
+    await _ensure_netlify_indexes()
     await _ensure_websites_indexes()
     await _ensure_orders_indexes()
     await _ensure_templates_indexes()
@@ -180,6 +183,13 @@ async def _ensure_github_indexes():
         await github_projects_col.create_index([("userId", 1), ("updatedAt", -1)], name="user_updated_idx")
     except Exception:
         logger.exception("Failed to ensure github indexes")
+
+
+async def _ensure_netlify_indexes():
+    try:
+        await netlify_credentials_col.create_index([("userId", 1)], unique=True, name="uniq_user_credential")
+    except Exception:
+        logger.exception("Failed to ensure netlify indexes")
 
 
 async def _ensure_websites_indexes():

@@ -84,3 +84,34 @@ async def build_zip(
                     await progress_cb(i, total)
 
     return buf.getvalue()
+
+
+async def fetch_files_dict(
+    token: str,
+    owner: str,
+    repo: str,
+    items: list[dict],
+    progress_cb=None,
+) -> dict[str, bytes]:
+    result: dict[str, bytes] = {}
+    total = len(items)
+
+    async with aiohttp.ClientSession(
+        headers=github_api._headers(token), timeout=aiohttp.ClientTimeout(total=120)
+    ) as session:
+        for i, item in enumerate(items, start=1):
+            try:
+                content = await github_api.get_blob_content(session, owner, repo, item["sha"])
+            except Exception:
+                logger.exception("Failed to fetch blob %s (%s)", item["sha"], item["path"])
+                content = None
+            if content is None:
+                raise DownloadError(
+                    f"Не вдалося завантажити файл {item['path']} з GitHub.",
+                    "Спробуй ще раз.",
+                )
+            result[item["path"]] = content
+            if progress_cb:
+                await progress_cb(i, total)
+
+    return result

@@ -32,6 +32,14 @@ def _extract_site_info(data: dict) -> dict:
     }
 
 
+async def verify_token(token: str) -> dict | None:
+    async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:
+        async with session.get(f"{API_BASE}/user") as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+
+
 async def deploy_new_site(token: str, files: dict[str, "str | bytes"], desired_name: str | None = None) -> dict | None:
     zip_bytes = _build_zip(files)
     async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:

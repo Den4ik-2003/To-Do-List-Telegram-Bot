@@ -71,6 +71,10 @@ async def create_project(uid: int, name: str, owner: str, repo: str, default_bra
         "deployHistory": [],
         "downloadHistory": [],
         "aiChangeHistory": [],
+        "netlifySiteId": None,
+        "netlifyUrl": None,
+        "netlifyAdminUrl": None,
+        "netlifyDeployHistory": [],
     }
     result = await db_call(github_projects_col.insert_one(doc), raise_on_fail=False)
     if result:
@@ -198,3 +202,62 @@ async def get_ai_change_history(uid: int, project_id) -> list[dict]:
     if not project:
         return []
     return project.get("aiChangeHistory") or []
+
+
+async def set_netlify_site(uid: int, project_id, site_id: str, url: str | None, admin_url: str | None) -> bool:
+    try:
+        oid = ObjectId(project_id)
+    except Exception:
+        return False
+    result = await db_call(
+        github_projects_col.update_one(
+            {"_id": oid, "userId": uid},
+            {"$set": {
+                "netlifySiteId": site_id,
+                "netlifyUrl": url,
+                "netlifyAdminUrl": admin_url,
+                "updatedAt": datetime.utcnow().isoformat(),
+            }},
+        ),
+        raise_on_fail=False,
+    )
+    return bool(result and result.matched_count)
+
+
+async def clear_netlify_site(uid: int, project_id) -> bool:
+    try:
+        oid = ObjectId(project_id)
+    except Exception:
+        return False
+    result = await db_call(
+        github_projects_col.update_one(
+            {"_id": oid, "userId": uid},
+            {"$set": {
+                "netlifySiteId": None,
+                "netlifyUrl": None,
+                "netlifyAdminUrl": None,
+                "updatedAt": datetime.utcnow().isoformat(),
+            }},
+        ),
+        raise_on_fail=False,
+    )
+    return bool(result and result.matched_count)
+
+
+async def record_netlify_deploy(uid: int, project_id, branch: str, url: str) -> None:
+    try:
+        oid = ObjectId(project_id)
+    except Exception:
+        return
+    now = datetime.utcnow().isoformat()
+    entry = {"at": now, "branch": branch, "url": url}
+    await db_call(
+        github_projects_col.update_one(
+            {"_id": oid, "userId": uid},
+            {
+                "$set": {"updatedAt": now},
+                "$push": {"netlifyDeployHistory": {"$each": [entry], "$position": 0, "$slice": MAX_HISTORY_ENTRIES}},
+            },
+        ),
+        raise_on_fail=False,
+    )
