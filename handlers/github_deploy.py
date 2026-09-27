@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 
 from aiogram import Router, F, Bot
@@ -30,6 +31,12 @@ _pending_edit: dict[int, dict] = {}
 _pending_download: dict[int, dict] = {}
 _pending_dl_branches: dict[int, list] = {}
 _pending_dl_commits: dict[int, list] = {}
+
+_JUNK_NAME_RE = re.compile(r"^(нова папка|новая папка|new folder|project)(\s*\(\d+\))?$", re.IGNORECASE)
+
+
+def _is_junk_project_name(name: str) -> bool:
+    return bool(_JUNK_NAME_RE.match((name or "").strip()))
 
 
 class GithubDeploy(StatesGroup):
@@ -80,7 +87,29 @@ async def gh_new_start(msg: Message, state: FSMContext):
 async def gh_my_projects(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
         return
-    projects = await github_projects_db.list_projects(msg.from_user.id)
+    uid = msg.from_user.id
+
+    cred = await github_projects_db.get_credential(uid)
+    if cred:
+        token = github_crypto.decrypt_token(cred["encryptedToken"])
+        if token:
+            repos = await github_api.list_repos(token, limit=100)
+            tracked = await github_projects_db.list_projects(uid)
+            tracked_by_key = {(p["githubOwner"], p["githubRepo"]): p for p in tracked}
+            for r in repos:
+                key = (r["owner"], r["name"])
+                existing = tracked_by_key.get(key)
+                if existing is None:
+                    await github_projects_db.create_project(
+                        uid, r["name"], r["owner"], r["name"],
+                        r["default_branch"], f"https://github.com/{r['full_name']}",
+                    )
+                elif _is_junk_project_name(existing.get("projectName", "")):
+                    await github_projects_db.update_project(
+                        uid, existing["_id"], {"projectName": r["name"]},
+                    )
+
+    projects = await github_projects_db.list_projects(uid)
     if not projects:
         return await msg.answer("📭 Ще немає збережених проєктів.", reply_markup=ikb_projects_list([]))
     lines = ["📚 *Мої проєкти*", ""]
@@ -297,6 +326,8 @@ async def _resolve_repo_and_confirm(msg: Message, state: FSMContext, uid: int, o
         if existing:
             pending["project_id"] = str(existing["_id"])
             pending["project_name"] = existing["projectName"]
+        else:
+            pending["project_name"] = repo_info["name"]
 
     pending["owner"] = repo_info["owner"]
     pending["repo"] = repo_info["name"]
