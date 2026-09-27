@@ -9,8 +9,6 @@ from config.constants import LABELS, STATUS_PENDING, STATUS_DONE
 from config.settings import (
     REMINDER_BEFORE_MINUTES,
     DAILY_REPORT_TIME,
-    AI_DAILY_PLAN_TIME,
-    AI_DAILY_PLAN_ENABLED,
     CURRENCY_UPDATE_TIME,
     WEATHER_MORNING_TIME,
     AI_CLEANER_ENABLED,
@@ -188,53 +186,6 @@ async def daily_job_task(bot: Bot):
                     logger.exception("daily_job_task failed for uid %s", uid)
         except Exception:
             logger.exception("daily_job_task outer loop failed")
-
-
-async def ai_morning_plan_task(bot: Bot):
-    while True:
-        if not AI_DAILY_PLAN_ENABLED or not ai_service.is_available():
-            logger.warning("ai_morning_plan_task: AI недоступний (ключ/фіча вимкнені), перевірю знову через 30 хв")
-            await asyncio.sleep(1800)
-            continue
-        try:
-            hh, mm = map(int, AI_DAILY_PLAN_TIME.split(":"))
-        except ValueError:
-            hh, mm = 9, 0
-        now = datetime.now()
-        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        logger.info("ai_morning_plan_task: сплю до %s (локальний час сервера)", target.isoformat())
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            uids = await get_all_uids()
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            logger.info("ai_morning_plan_task: старт розсилки для %d користувачів", len(uids))
-            sent = 0
-            for uid in uids:
-                try:
-                    state = await get_user_state(uid)
-                    if not state.get("ai_morning_enabled", True):
-                        continue
-                    if state.get("last_ai_plan_date") == today_str:
-                        continue
-                    await save_user_state(uid, {
-                        "last_ai_plan_date": today_str,
-                        "awaiting_morning_time": True,
-                        "awaiting_morning_date": today_str,
-                    })
-                    await bot.send_message(
-                        uid,
-                        "🌅 *Доброго ранку! Плануємо сьогодні?*\n\n"
-                        "Скільки часу ти сьогодні маєш для виконання задач?\n\n"
-                        "Напиши, наприклад:\n`3 години`\nабо\n`2 години, з 19:00 до 21:00`",
-                    )
-                    sent += 1
-                except Exception:
-                    logger.exception("ai_morning_plan_task failed for uid %s", uid)
-            logger.info("ai_morning_plan_task: розіслано ранкове питання %d користувачам", sent)
-        except Exception:
-            logger.exception("ai_morning_plan_task outer loop failed")
 
 
 async def proactive_insights_task(bot: Bot):
@@ -468,7 +419,6 @@ def register_scheduler_jobs(bot: Bot):
     _spawn(reminder_task(bot), "reminder_task")
     _spawn(midnight_rollover_task(bot), "midnight_rollover_task")
     _spawn(daily_job_task(bot), "daily_job_task")
-    _spawn(ai_morning_plan_task(bot), "ai_morning_plan_task")
     _spawn(proactive_insights_task(bot), "proactive_insights_task")
     _spawn(currency_update_task(), "currency_update_task")
     _spawn(weather_morning_task(bot), "weather_morning_task")
