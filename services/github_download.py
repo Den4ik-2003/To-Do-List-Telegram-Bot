@@ -8,9 +8,6 @@ from services import github_api
 
 logger = logging.getLogger("tasks_bot")
 
-# Bots uploading a file directly to Telegram (not via URL/file_id) are capped at 50 MB
-# by the standard Bot API. This is a different, separate limit from the 20 MB cap on
-# files a bot can *receive* — see github_zip.MAX_ZIP_SIZE for that one.
 MAX_SEND_ZIP_SIZE = 50 * 1024 * 1024
 
 
@@ -30,8 +27,6 @@ def fmt_size(num_bytes: int) -> str:
 
 
 async def prepare_download(token: str, owner: str, repo: str, commit_sha: str) -> dict:
-    """Resolves the tree for a commit and checks its total size BEFORE fetching any
-    file content, so an oversized repo fails fast with a clear message."""
     tree = await github_api.get_tree_recursive(token, owner, repo, commit_sha)
     if tree is None:
         raise DownloadError(
@@ -66,9 +61,6 @@ async def build_zip(
     root_folder: str,
     progress_cb=None,
 ) -> bytes:
-    """Fetches every blob and packs it into a ZIP under root_folder/, preserving
-    the repo's folder structure. No .git or GitHub-internal metadata is included —
-    the tree API only ever returns tracked project files."""
     buf = io.BytesIO()
     total = len(items)
 

@@ -1,20 +1,3 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: config/settings.py
-
-НОВЕ:
-- JOB_SCORE_BATCH_SIZE — скільки вакансій оцінюється одним AI-запитом
-  (раніше 1 вакансія = 1 запит, 94 вакансії з'їдали денний ліміт).
-- JOB_MAX_SCORE_PER_CYCLE — максимум нових вакансій, які оцінюються за
-  один прогін одного автопошуку. Решта не позначається переглянутою
-  і буде оцінена наступного прогону.
-
-Резервний провайдер (Gemini) підключається ЛИШЕ змінними середовища на
-Render, код міняти не треба:
-  AI_API_KEY_BACKUP  = ключ Google AI Studio
-  AI_BASE_URL_BACKUP = https://generativelanguage.googleapis.com/v1beta/openai/
-  AI_MODEL_BACKUP    = gemini-2.5-flash
-"""
-
 import os
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -26,38 +9,21 @@ DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "21:00")
 
 AI_API_KEY = os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1").strip()
-# Якщо AI_MODEL не задано (або задано порожнім) — беремо роутер безкоштовних
-# моделей OpenRouter. Головну роботу все одно робить авто-добір живих
-# безкоштовних моделей в services/ai_service.py (див. AI_AUTO_FREE_MODELS).
 AI_MODEL = os.environ.get("AI_MODEL", "").strip() or "openrouter/free"
 AI_DAILY_PLAN_TIME = os.environ.get("AI_DAILY_PLAN_TIME", "09:00")
 AI_DAILY_PLAN_ENABLED = os.environ.get("AI_DAILY_PLAN_ENABLED", "true").strip().lower() == "true"
 
 AI_DAILY_LIMIT = int(os.environ.get("AI_DAILY_LIMIT", "10"))
 
-# ВАЖЛИВО: якщо AI_BASE_URL_BACKUP / AI_MODEL_BACKUP не задані, резерв
-# успадковує OpenRouter і ділить з основним ту саму денну квоту (50 запитів).
-# Щоб резерв реально рятував — задай ці змінні на Render (див. докстрінг).
 AI_API_KEY_BACKUP = os.environ.get("AI_API_KEY_BACKUP", "")
 AI_BASE_URL_BACKUP = os.environ.get("AI_BASE_URL_BACKUP", AI_BASE_URL).strip()
 AI_MODEL_BACKUP = os.environ.get("AI_MODEL_BACKUP", "").strip() or AI_MODEL
 
-# --- стійкість AI до "мертвих" безкоштовних моделей ---
-# Таймаут для ЛЕГКИХ запитів (chat, розбір чека, аналіз фото товару).
 AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("AI_REQUEST_TIMEOUT_SECONDS", "30"))
-# Максимальний ЗАГАЛЬНИЙ час однієї спроби генерації сайту (стрімінг).
 AI_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("AI_GENERATE_TIMEOUT_SECONDS", "240"))
-# Скільки секунд дозволено мовчати моделі, яка стрімить відповідь (і чекати
-# першого токена). Зависла модель відсікається за цей час, а не за 240с.
 AI_STREAM_IDLE_TIMEOUT_SECONDS = int(os.environ.get("AI_STREAM_IDLE_TIMEOUT_SECONDS", "60"))
-# Верхня межа довжини відповіді при генерації (реально застосовується
-# лише коли ліміт моделі відомий з каталогу OpenRouter).
 AI_GENERATE_MAX_TOKENS = int(os.environ.get("AI_GENERATE_MAX_TOKENS", "16000"))
-# Скільки МОДЕЛЕЙ максимум пробуємо на один запит, якщо вони "повільно
-# падають" (таймаут / порожньо / обрізано / зламаний JSON). Миттєві відмови
-# (404, 429, 401) у цей ліміт не входять.
 AI_MAX_MODELS_PER_REQUEST = int(os.environ.get("AI_MAX_MODELS_PER_REQUEST", "3"))
-# Авто-добір живих безкоштовних моделей з каталогу OpenRouter.
 AI_AUTO_FREE_MODELS = os.environ.get("AI_AUTO_FREE_MODELS", "true").strip().lower() == "true"
 AI_FREE_MODELS_REFRESH_SECONDS = int(os.environ.get("AI_FREE_MODELS_REFRESH_SECONDS", "3600"))
 AI_FREE_MODELS_MAX = int(os.environ.get("AI_FREE_MODELS_MAX", "8"))
@@ -93,7 +59,6 @@ JOB_AUTOSEARCH_EVENING_TIME = os.environ.get("JOB_AUTOSEARCH_EVENING_TIME", "19:
 
 JOB_MIN_MATCH_PERCENT = int(os.environ.get("JOB_MIN_MATCH_PERCENT", "50"))
 
-# НОВЕ: пакетна оцінка вакансій (економія AI-запитів)
 JOB_SCORE_BATCH_SIZE = int(os.environ.get("JOB_SCORE_BATCH_SIZE", "10"))
 JOB_MAX_SCORE_PER_CYCLE = int(os.environ.get("JOB_MAX_SCORE_PER_CYCLE", "40"))
 
@@ -119,8 +84,10 @@ RESALE_MIN_SCORE_THRESHOLD = int(os.environ.get("RESALE_MIN_SCORE_THRESHOLD", "7
 RESALE_MAX_NOTIFY_PER_CYCLE = int(os.environ.get("RESALE_MAX_NOTIFY_PER_CYCLE", "3"))
 RESALE_DEFAULT_CHECK_INTERVAL_MINUTES = int(os.environ.get("RESALE_DEFAULT_CHECK_INTERVAL_MINUTES", "180"))
 
+
 def _parse_model_list(raw: str) -> list[str]:
     return [m.strip() for m in raw.split(",") if m.strip()]
+
 
 AI_FALLBACK_MODELS = _parse_model_list(os.environ.get("AI_FALLBACK_MODELS", ""))
 
@@ -144,7 +111,6 @@ MAX_PRODUCT_IMAGE_BYTES = int(os.environ.get("MAX_PRODUCT_IMAGE_BYTES", str(1_20
 PRODUCT_IMAGE_MAX_DIM = int(os.environ.get("PRODUCT_IMAGE_MAX_DIM", "1280"))
 ORDERS_DISPLAY_LIMIT = int(os.environ.get("ORDERS_DISPLAY_LIMIT", "20"))
 
-# --- Cloudinary (unsigned upload) для фото товарів ---
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "dbhdmnxlx")
 CLOUDINARY_UPLOAD_PRESET = os.environ.get("CLOUDINARY_UPLOAD_PRESET", "athelonImages")
 

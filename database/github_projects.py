@@ -1,22 +1,3 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: database/github_projects.py
-
-Додано (для фічі "👨‍💻 AI Developer"):
-- create_project(): новий проєкт тепер одразу має порожній "aiChangeHistory": [].
-- record_ai_change(): пише метадані про застосовану AI-зміну (без вмісту
-  файлів — тільки шляхи, summary, commit) у ТОЙ САМИЙ документ проєкту,
-  тим самим патерном $push/$slice, що вже є для deployHistory/downloadHistory.
-  Ніякої нової колекції — щоб нічого не дублювати.
-- get_ai_change_history(): дістати історію AI-змін проєкту.
-
-ВАЖЛИВО: старі проєкти (створені до цієї зміни) НЕ мають поля
-aiChangeHistory в документі. Це не проблема — $push у MongoDB сам створює
-масив, якщо його не було. get_ai_change_history() так само повертає [],
-якщо поля нема. Міграція не потрібна.
-
-Решта функцій файлу — 1:1 як було.
-"""
-
 import logging
 from datetime import datetime
 
@@ -178,10 +159,6 @@ async def record_download(
     )
 
 
-# =========================================================
-# НОВЕ: 👨‍💻 AI Developer — історія AI-змін
-# =========================================================
-
 async def record_ai_change(
     uid: int,
     project_id,
@@ -191,11 +168,6 @@ async def record_ai_change(
     commit_message: str,
     files_changed: list[str],
 ) -> None:
-    """Записує метадані про застосовану AI-зміну в той самий документ
-    проєкту (поле aiChangeHistory), тим самим $push/$slice патерном, що й
-    record_deploy/record_download. Вміст файлів НЕ зберігається тут —
-    тільки шляхи, щоб не роздувати документ; повний "до"-знімок для undo
-    живе окремо в пам'яті процесу (handlers/ai_developer.py)."""
     try:
         oid = ObjectId(project_id)
     except Exception:

@@ -1,17 +1,3 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: services/netlify_service.py
-
-Зміни відносно попередньої версії:
-1. _build_zip() приймає dict[str, str | bytes] — бінарний контент (фото
-   товару) пишеться в архів як є, без utf-8 кодування; рядковий контент
-   (html/css/js) кодується ЯК І РАНІШЕ.
-2. НОВЕ: delete_site() — видаляє Netlify-сайт назавжди (разом з усіма
-   деплоями й доменом).
-
-Усі існуючі виклики deploy_new_site/redeploy_site з чистими текстовими
-файлами поводяться ІДЕНТИЧНО попередній версії — нічого не зламано.
-"""
-
 import io
 import logging
 import zipfile
@@ -101,7 +87,6 @@ async def redeploy_site(token: str, site_id: str, files: dict[str, "str | bytes"
 
 
 async def delete_site(token: str, site_id: str) -> bool:
-    """Видаляє Netlify-сайт НАЗАВЖДИ (разом з усіма деплоями й доменом)."""
     try:
         async with aiohttp.ClientSession(headers=_headers(token), timeout=REQUEST_TIMEOUT) as session:
             async with session.delete(f"{API_BASE}/sites/{site_id}") as resp:

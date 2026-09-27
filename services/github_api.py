@@ -32,11 +32,6 @@ def _headers(token: str) -> dict:
 
 
 def _friendly_error(status: int, data: dict, owner: str = "", repo: str = "") -> str:
-    """
-    Перетворює сиру відповідь GitHub API на зрозуміле користувачу пояснення.
-    GitHub повертає однакові статус-коди (403/404/422) для дуже різних
-    причин, тому розрізняємо їх за текстом message, а не лише за кодом.
-    """
     message = (data or {}).get("message", "") if isinstance(data, dict) else str(data)
     repo_hint = f"{owner}/{repo}" if owner and repo else "цей репозиторій"
 
@@ -131,14 +126,6 @@ async def get_repo(token: str, owner: str, repo: str) -> dict | None:
 
 
 async def check_write_access(token: str, owner: str, repo: str) -> str | None:
-    """
-    Легка перевірка ПЕРЕД деплоєм: чи взагалі токен має право писати
-    в репозиторій. GET /repos/{owner}/{repo} повертає поле "permissions"
-    (push/admin/pull), яке видно навіть без спроби реального запису —
-    це дозволяє показати зрозумілу помилку одразу, а не після того, як
-    користувач уже чекав на прогрес деплою і впав на кроці ініціалізації.
-    Повертає None, якщо все гаразд, або готовий текст помилки для показу.
-    """
     try:
         async with aiohttp.ClientSession(headers=_headers(token)) as session:
             async with session.get(
@@ -204,8 +191,6 @@ async def list_commits(token: str, owner: str, repo: str, branch: str, limit: in
 
 
 async def get_tree_recursive(token: str, owner: str, repo: str, commit_sha: str) -> dict | None:
-    """Resolves a commit's tree recursively. Returns only blob (file) entries,
-    each with its GitHub blob sha and byte size — no content fetched yet."""
     try:
         async with aiohttp.ClientSession(headers=_headers(token)) as session:
             async with session.get(
@@ -237,8 +222,6 @@ async def get_tree_recursive(token: str, owner: str, repo: str, commit_sha: str)
 
 
 async def get_blob_content(session: aiohttp.ClientSession, owner: str, repo: str, sha: str) -> bytes | None:
-    """Fetches one blob's content. Caller supplies an already-open, auth-headered session
-    (see github_download.build_zip) so many blobs can be fetched without reconnecting."""
     async with session.get(f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs/{sha}") as resp:
         if resp.status != 200:
             return None
@@ -314,26 +297,6 @@ async def _init_empty_repo(
     session: aiohttp.ClientSession, owner: str, repo: str, branch: str,
     seed_path: str, seed_content: bytes, message: str,
 ) -> str:
-    """Creates the very first commit on a brand-new, completely empty
-    repository, and the target branch along with it.
-
-    The Git Data API (blobs/trees/commits) has no ref to attach to on an
-    empty repo, so POST .../git/blobs fails with 'Git Repository is empty'
-    no matter what. The Contents API doesn't have that restriction — it can
-    create a single file from nothing, and GitHub creates the branch for it
-    in the same call. This is the API equivalent of:
-
-        echo "..." >> README.md
-        git init
-        git add README.md
-        git commit -m "first commit"
-        git branch -M main
-        git remote add origin https://github.com/<owner>/<repo>.git
-        git push -u origin main
-
-    Returns the sha of the commit that was just created, so the caller can
-    use it as the parent/base_tree for the rest of the files.
-    """
     payload = {
         "message": message,
         "content": base64.b64encode(seed_content).decode(),
@@ -342,10 +305,6 @@ async def _init_empty_repo(
     async with session.put(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{seed_path}", json=payload) as resp:
         data = await resp.json()
         if resp.status not in (200, 201):
-            # ВАЖЛИВО: раніше тут було "initial commit failed: {data}" — сирий
-            # словник від GitHub, який нічого не пояснював користувачу
-            # (саме це й вилізло в логах як голий traceback). Тепер повідомлення
-            # одразу каже, яке саме право токена перевірити.
             raise GithubDeployError(_friendly_error(resp.status, data, owner, repo))
         return data["commit"]["sha"]
 
@@ -373,10 +332,6 @@ async def repo_exists(token: str, owner: str, repo: str) -> bool:
 
 
 async def delete_repo(token: str, owner: str, repo: str) -> bool:
-    """Видаляє репозиторій НАЗАВЖДИ. Потребує, щоб токен мав scope
-    delete_repo (для classic Personal Access Token) або дозвіл
-    Administration: write (для fine-grained token) — без цього GitHub
-    поверне 403, і функція коректно поверне False, не кидаючи виняток."""
     try:
         async with aiohttp.ClientSession(headers=_headers(token)) as session:
             async with session.delete(
@@ -412,10 +367,6 @@ async def deploy_files(
         parent_sha = await _get_branch_sha(session, owner, repo, branch)
 
         if parent_sha is None:
-            # Brand-new / completely empty repo (or the branch doesn't exist
-            # yet): there is no commit for the Git Data API to build on top
-            # of, so bootstrap it first via the Contents API — same result
-            # as `git init && git commit && git push -u origin main`.
             seed_path, seed_content = next(iter(files.items()))
             logger.info(
                 "Repo %s/%s branch %s has no commits yet — bootstrapping via contents API",
@@ -427,9 +378,6 @@ async def deploy_files(
                     "first commit",
                 )
             except GithubDeployError:
-                # ДОДАНО: логуємо саме тут з повним контекстом (owner/repo/branch),
-                # щоб при потребі шукати в логах Render було зрозуміло, який саме
-                # репозиторій і крок впали, не гортаючи весь traceback вручну.
                 logger.error(
                     "GitHub deploy: bootstrap порожнього репо %s/%s@%s не вдався",
                     owner, repo, branch,
@@ -448,7 +396,5 @@ async def deploy_files(
 
         tree_sha = await _create_tree(session, owner, repo, base_tree_sha, tree_items)
         commit_sha = await _create_commit(session, owner, repo, commit_message, tree_sha, parent_sha)
-        # The branch now always exists by this point — either it already did,
-        # or _init_empty_repo just created it — so this is always an update.
         await _update_ref(session, owner, repo, branch, commit_sha, create_branch=False)
         return commit_sha

@@ -1,18 +1,3 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: handlers/github_deploy.py
-
-Єдина зміна (для фічі "👨‍💻 AI Developer"):
-- gh_proj_open(): до вже існуючої клавіатури проєкту (ikb_project_actions)
-  додається ОДНА кнопка "👨‍💻 AI Developer" (callback_data="aidev_open:{pid}"),
-  яку обробляє новий handlers/ai_developer.py. Сама клавіатура
-  (keyboards/github.py → ikb_project_actions) НЕ змінена — рядок додається
-  поверх готового InlineKeyboardMarkup, щоб нічого там не зламати.
-- Додано імпорт InlineKeyboardButton (раніше в цьому файлі не був потрібен
-  напряму — клавіатури збирались лише в keyboards/github.py).
-
-Решта файлу — 1:1 як було.
-"""
-
 import logging
 from datetime import datetime
 
@@ -42,7 +27,6 @@ _pending_repos: dict[int, list] = {}
 _pending_add: dict[int, dict] = {}
 _pending_edit: dict[int, dict] = {}
 
-# --- state for the Download ZIP flow (mirrors the _pending_* pattern above) ---
 _pending_download: dict[int, dict] = {}
 _pending_dl_branches: dict[int, list] = {}
 _pending_dl_commits: dict[int, list] = {}
@@ -59,8 +43,6 @@ class GithubDeploy(StatesGroup):
 
 
 def _md_escape(text: str) -> str:
-    """Escape legacy-Markdown special chars so dynamic text (filenames, repo
-    names, exception messages, e.g. 'node_modules') can't break entity parsing."""
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, "\\" + ch)
     return text
@@ -534,8 +516,6 @@ async def gh_proj_open(cb: CallbackQuery):
         f"GitHub: {project['githubOwner']}/{project['githubRepo']}\n"
         f"Останній деплой: {last_deploy[:16].replace('T', ' ') if last_deploy else 'ще не було'}"
     )
-    # НОВЕ: додаємо кнопку входу в AI Developer поверх готової клавіатури
-    # проєкту, нічого в самій ikb_project_actions не змінюючи.
     kb = ikb_project_actions(project["_id"])
     kb.inline_keyboard.insert(0, [InlineKeyboardButton(text="👨‍💻 AI Developer", callback_data=f"aidev_open:{pid}")])
     await cb.message.answer(text, reply_markup=kb)
@@ -743,11 +723,6 @@ async def gh_proj_history(cb: CallbackQuery):
     await cb.message.answer("\n".join(lines))
 
 
-# ============================================================================
-# Download ZIP — вибір проєкту вже зроблено (ikb_project_actions), звідси
-# користувач обирає branch → версію (остання / конкретний commit) → отримує ZIP.
-# ============================================================================
-
 @router.callback_query(F.data.startswith("ghproj_download:"))
 async def gh_download_start(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -866,8 +841,6 @@ async def gh_download_cancel(cb: CallbackQuery):
 
 
 async def _gh_download_execute(cb: CallbackQuery, commit_sha: str | None):
-    """Shared tail for both 'latest version' and 'chosen commit' paths:
-    resolve tree → size-check → fetch blobs → zip → send → log history."""
     uid = cb.from_user.id
     session = _pending_download.pop(uid, None)
     _pending_dl_branches.pop(uid, None)

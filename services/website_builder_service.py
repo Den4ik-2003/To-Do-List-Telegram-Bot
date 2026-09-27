@@ -28,8 +28,6 @@ _FETCH_UAS = [
     "Mozilla/5.0 (compatible; AiWebsiteBuilder/2.0; +https://example.com/bot)",
 ]
 
-# Скільки зовнішніх CSS-файлів максимум тягнемо для одного клону і який
-# загальний обсяг тексту з них використовуємо для аналізу кольорів/шрифтів.
 MAX_CSS_FILES = 5
 MAX_CSS_TOTAL_CHARS = 60000
 _CSS_FETCH_TIMEOUT_SEC = 8
@@ -256,11 +254,6 @@ async def _fetch_html(url: str) -> tuple[str | None, str | int | None]:
 
 
 async def _fetch_external_css(html: str, base_url: str) -> str:
-    """Тягне до MAX_CSS_FILES зовнішніх <link rel="stylesheet"> файлів
-    сайту, щоб кольори/шрифти визначались не лише з inline-стилів у
-    HTML, а й з реальних CSS-файлів (де вони найчастіше й лежать).
-    Best-effort: будь-яка проблема з окремим файлом просто пропускається,
-    не ламаючи весь клон."""
     try:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
