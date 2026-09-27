@@ -15,6 +15,7 @@ from keyboards.github import (
     ikb_github_settings, ikb_disconnect_confirm, ikb_repo_choice, ikb_deploy_confirm,
     ikb_projects_list, ikb_project_actions, ikb_project_delete_confirm, ikb_edit_fields,
     ikb_download_branches, ikb_download_version_choice, ikb_download_commits,
+    ikb_gitlog_branches,
 )
 from handlers.common import require_auth
 
@@ -31,6 +32,9 @@ _pending_edit: dict[int, dict] = {}
 _pending_download: dict[int, dict] = {}
 _pending_dl_branches: dict[int, list] = {}
 _pending_dl_commits: dict[int, list] = {}
+
+_pending_gitlog_branches: dict[int, list] = {}
+_pending_gitlog_ctx: dict[int, dict] = {}
 
 _JUNK_NAME_RE = re.compile(r"^(нова папка|новая папка|new folder|project)(\s*\(\d+\))?$", re.IGNORECASE)
 
@@ -93,7 +97,7 @@ async def gh_my_projects(msg: Message, state: FSMContext):
     if cred:
         token = github_crypto.decrypt_token(cred["encryptedToken"])
         if token:
-            repos = await github_api.list_repos(token, limit=100)
+            repos = await github_api.list_repos(token, limit=500)
             tracked = await github_projects_db.list_projects(uid)
             tracked_by_key = {(p["githubOwner"], p["githubRepo"]): p for p in tracked}
             for r in repos:
@@ -752,6 +756,71 @@ async def gh_proj_history(cb: CallbackQuery):
                 f"Commit: {short_sha}\n{h.get('fileCount', '?')} файлів, {size}"
             )
     await cb.message.answer("\n".join(lines))
+
+
+@router.callback_query(F.data.startswith("ghproj_gitlog:"))
+async def gh_proj_gitlog_start(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pid = cb.data.split(":", 1)[1]
+    project = await github_projects_db.get_project(uid, pid)
+    if not project:
+        return await cb.answer("Проєкт не знайдено", show_alert=True)
+    await cb.answer()
+
+    cred = await github_projects_db.get_credential(uid)
+    if not cred:
+        return await cb.message.answer("🔐 Спочатку підключи GitHub у «⚙️ Налаштування GitHub».")
+    token = github_crypto.decrypt_token(cred["encryptedToken"])
+    if not token:
+        return await cb.message.answer(_fail_text(
+            "Не вдалося розшифрувати токен.", "Підключи GitHub заново в налаштуваннях.",
+        ))
+
+    wait = await cb.message.answer("⏳ Отримую branches з GitHub...")
+
+    branches = await github_api.list_branches(token, project["githubOwner"], project["githubRepo"])
+    if not branches:
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося отримати список branch.", "Перевір права токена і спробуй ще раз.",
+        ))
+
+    _pending_gitlog_branches[uid] = branches
+    _pending_gitlog_ctx[uid] = {
+        "owner": project["githubOwner"], "repo": project["githubRepo"], "token": token,
+    }
+
+    await _safe_edit(
+        wait, "🌿 Обери branch, щоб побачити реальну історію комітів на GitHub:",
+        reply_markup=ikb_gitlog_branches(branches, project["defaultBranch"], project["_id"]),
+    )
+
+
+@router.callback_query(F.data.startswith("ghlog_branch:"))
+async def gh_gitlog_branch_pick(cb: CallbackQuery):
+    uid = cb.from_user.id
+    _, pid, idx_str = cb.data.split(":", 2)
+    idx = int(idx_str)
+    branches = _pending_gitlog_branches.get(uid) or []
+    ctx = _pending_gitlog_ctx.get(uid)
+    if idx >= len(branches) or not ctx:
+        return await cb.answer("Сесія застаріла", show_alert=True)
+    branch = branches[idx]["name"]
+    await cb.answer()
+
+    wait = await cb.message.answer(f"⏳ Отримую коміти branch «{branch}»...")
+    commits = await github_api.list_commits(ctx["token"], ctx["owner"], ctx["repo"], branch, limit=20)
+    if not commits:
+        return await _safe_edit(wait, _fail_text(
+            "Не вдалося отримати коміти або їх немає.", "Спробуй інший branch.",
+        ))
+
+    lines = [f"🕐 *Реальна історія GitHub* — {ctx['owner']}/{ctx['repo']} ({branch})\n"]
+    for c in commits:
+        lines.append(f"`{c['short_sha']}` — {c['message']}")
+
+    project = await github_projects_db.find_by_repo(uid, ctx["owner"], ctx["repo"])
+    kb = ikb_project_actions(project["_id"]) if project else None
+    await _safe_edit(wait, "\n".join(lines), reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ghproj_download:"))

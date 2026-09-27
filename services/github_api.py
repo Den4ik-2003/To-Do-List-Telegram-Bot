@@ -76,27 +76,41 @@ async def verify_token(token: str) -> dict | None:
         return None
 
 
-async def list_repos(token: str, limit: int = 50) -> list[dict]:
+async def list_repos(token: str, limit: int = 500) -> list[dict]:
     try:
+        all_repos: list[dict] = []
+        page = 1
         async with aiohttp.ClientSession(headers=_headers(token)) as session:
-            async with session.get(
-                f"{GITHUB_API}/user/repos",
-                params={"per_page": str(limit), "sort": "updated", "affiliation": "owner,collaborator"},
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                return [
-                    {
-                        "full_name": r["full_name"],
-                        "owner": r["owner"]["login"],
-                        "name": r["name"],
-                        "default_branch": r.get("default_branch", "main"),
-                        "private": r.get("private", False),
-                    }
-                    for r in data
-                ]
+            while len(all_repos) < limit:
+                async with session.get(
+                    f"{GITHUB_API}/user/repos",
+                    params={
+                        "per_page": "100",
+                        "page": str(page),
+                        "sort": "updated",
+                        "affiliation": "owner,collaborator,organization_member",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    if not data:
+                        break
+                    all_repos.extend(data)
+                    if len(data) < 100:
+                        break
+                    page += 1
+        return [
+            {
+                "full_name": r["full_name"],
+                "owner": r["owner"]["login"],
+                "name": r["name"],
+                "default_branch": r.get("default_branch", "main"),
+                "private": r.get("private", False),
+            }
+            for r in all_repos[:limit]
+        ]
     except Exception:
         logger.exception("GitHub list_repos failed")
         return []
