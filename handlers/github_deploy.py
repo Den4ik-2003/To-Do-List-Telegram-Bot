@@ -38,6 +38,9 @@ _pending_gitlog_ctx: dict[int, dict] = {}
 
 _JUNK_NAME_RE = re.compile(r"^(нова папка|новая папка|new folder|project)(\s*\(\d+\))?$", re.IGNORECASE)
 
+TELEGRAM_MSG_LIMIT = 4096
+_SAFE_CHUNK = 4000  # leave headroom for markdown entity edge cases
+
 
 def _is_junk_project_name(name: str) -> bool:
     return bool(_JUNK_NAME_RE.match((name or "").strip()))
@@ -71,6 +74,34 @@ async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
         return await target.edit_text(text, **kwargs)
     except TelegramBadRequest:
         return await target.answer(text, **kwargs)
+
+
+def _chunk_lines(lines: list[str], limit: int = _SAFE_CHUNK) -> list[str]:
+    """Group lines into chunks each under `limit` chars when joined with '\n'."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 for the joining newline
+        if current and current_len + line_len > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+async def _answer_chunked(msg: Message, lines: list[str], reply_markup=None, **kwargs) -> None:
+    """Send `lines` as one or more messages, each under Telegram's length limit.
+    Any reply_markup is attached only to the last chunk."""
+    chunks = _chunk_lines(lines)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await msg.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
 
 
 @router.message(F.text == "📦 Новий проєкт")
@@ -119,7 +150,7 @@ async def gh_my_projects(msg: Message, state: FSMContext):
     lines = ["📚 *Мої проєкти*", ""]
     for i, p in enumerate(projects, 1):
         lines.append(f"{i}. 🟢 {p['projectName']}\n   GitHub: {p['githubOwner']}/{p['githubRepo']}")
-    await msg.answer("\n".join(lines), reply_markup=ikb_projects_list(projects))
+    await _answer_chunked(msg, lines, reply_markup=ikb_projects_list(projects))
 
 
 @router.message(F.text == "⚙️ Налаштування GitHub")
@@ -755,7 +786,7 @@ async def gh_proj_history(cb: CallbackQuery):
                 f"\n📥 Download — {at}\nBranch: {h.get('branch', '?')}\n"
                 f"Commit: {short_sha}\n{h.get('fileCount', '?')} файлів, {size}"
             )
-    await cb.message.answer("\n".join(lines))
+    await _answer_chunked(cb.message, lines)
 
 
 @router.callback_query(F.data.startswith("ghproj_gitlog:"))
@@ -820,7 +851,7 @@ async def gh_gitlog_branch_pick(cb: CallbackQuery):
 
     project = await github_projects_db.find_by_repo(uid, ctx["owner"], ctx["repo"])
     kb = ikb_project_actions(project["_id"]) if project else None
-    await _safe_edit(wait, "\n".join(lines), reply_markup=kb)
+    await _answer_chunked(cb.message, lines, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ghproj_download:"))

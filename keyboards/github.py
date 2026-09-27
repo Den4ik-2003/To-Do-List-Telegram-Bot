@@ -97,3 +97,13 @@ def ikb_download_commits(commits: list[dict]) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="ghdl_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ikb_gitlog_branches(branches: list[dict], default_branch: str, project_id) -> InlineKeyboardMarkup:
+    pid = str(project_id)
+    rows = []
+    for i, b in enumerate(branches[:25]):
+        label = f"🌿 {b['name']}" + (" (default)" if b["name"] == default_branch else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"ghlog_branch:{pid}:{i}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ghproj:{pid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
