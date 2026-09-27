@@ -1,21 +1,19 @@
 """
-ЗМІНЕНИЙ ФАЙЛ: services/olx_service.py
+services/olx_service.py
 
-НОВЕ (пошук, search_listings):
-- Запит із комами/крапками з комою ("покерний набір,покер,фішки") ділиться
-  на окремі пошуки (до MAX_SUBQUERIES), результати об'єднуються без дублів.
-  Раніше вся фраза з комами йшла в OLX як один рядок і давала 0 збігів.
-- Пошук у кілька ступенів (кожен наступний — запасний):
-    1) JSON-ендпоінт OLX /api/v1/offers/
-    2) HTML: картки [data-cy="l-card"]
-    3) HTML: картки за посиланнями "-ID....html"
-    4) HTML: дані з window.__PRERENDERED_STATE__
-- Якщо карток немає, а сторінка не схожа на «нічого не знайдено» (блок /
-  антибот / нова розмітка), у лог іде діагностика, а функція повертає None
-  (технічний збій), а не [] («0 оголошень»). Так збій парсера більше не
-  маскується під «нічого вигідного не знайшов».
+НОВЕ (виправлення бага "129 знайдено -> 0 відібрано"):
+- normalize_price_text(): єдина функція нормалізації тексту ціни (п.6 ТЗ),
+  розрізняє "договірна"/"обмін"/"безкоштовно" від справжньої відсутності
+  ціни, замість того щоб все зводити до None.
+- _offer_price(): пробує більше форматів JSON-відповіді OLX API (пряма
+  форма price.value без обгортки regularPrice, рядкова ціна, альтернативні
+  ключі salePrice/priceBudget/priceValue). Якщо жоден формат не підійшов —
+  пишеться один раз у лог OLX_API_PRICE_SCHEMA_UNRECOGNIZED з фрагментом
+  сирого offer, щоб було видно, що саме змінилося в API OLX.
+- _parse_listing_html(): тепер заповнює price_type ("fixed"/"negotiable"/
+  "exchange"/"free"/"unknown") поряд із price/currency.
 
-Решта функцій (деталі оголошення, фото, аудит) — без змін.
+Решта функцій (пошук, пагінація, деталі оголошення, фото, аудит) — БЕЗ ЗМІН.
 """
 
 import json
@@ -25,6 +23,8 @@ from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
+
+from config.settings import RESALE_DEBUG_LOGGING
 
 logger = logging.getLogger("tasks_bot")
 
@@ -47,6 +47,12 @@ CURRENCY_MAP = {
     "€": "EUR", "EUR": "EUR",
     "$": "USD", "USD": "USD",
 }
+
+# НОВЕ (п.6 ТЗ): маркери типу ціни, які не є "звичайним числом", але й НЕ є
+# відсутністю даних — їх треба відрізняти від справжнього "ціна не вказана".
+NEGOTIABLE_WORDS = ("договірна", "договірний", "do negocjacji", "cena do negocjacji")
+EXCHANGE_WORDS = ("обмін", "обмен", "zamiana")
+FREE_WORDS = ("безкоштовно", "даром", "za darmo")
 
 DOMAIN_CONFIG = {
     "olx.ua": {"list_path": "/uk/list/q-", "referer": "https://www.olx.ua/", "default_currency": "UAH"}
@@ -79,6 +85,11 @@ FALLBACK_REASON_MARKERS = (
     "extendedsearchnoresultslastresort",
 )
 
+# Скільки різних offer-ів без розпізнаної ціни залогувати за раз процесу
+# (щоб не спамити лог, якщо OLX справді змінив схему для всього API).
+_MAX_PRICE_SCHEMA_WARNINGS = 5
+_price_schema_warned: set[str] = set()
+
 
 def _parse_price(text: str) -> tuple[float, str] | None:
     if not text:
@@ -92,6 +103,33 @@ def _parse_price(text: str) -> tuple[float, str] | None:
         return float(number), currency
     except ValueError:
         return None
+
+
+def normalize_price_text(text: str | None) -> dict:
+    """
+    НОВЕ (п.6 ТЗ): єдина точка класифікації тексту ціни. Повертає
+    {"price": float|None, "currency": str|None,
+     "price_type": "fixed"|"negotiable"|"exchange"|"free"|"unknown"}.
+
+    Не замінює наявний _parse_price (щоб не ламати існуючі виклики), а
+    доповнює його — розрізняє "договірна"/"обмін"/"безкоштовно" від
+    справжньої відсутності даних. Раніше все це зводилось просто до
+    price=None, і такі оголошення неможливо було відрізнити від зламаного
+    парсера.
+    """
+    if not text:
+        return {"price": None, "currency": None, "price_type": "unknown"}
+    low = text.strip().lower()
+    if any(w in low for w in FREE_WORDS):
+        return {"price": 0.0, "currency": None, "price_type": "free"}
+    if any(w in low for w in EXCHANGE_WORDS):
+        return {"price": None, "currency": None, "price_type": "exchange"}
+    if any(w in low for w in NEGOTIABLE_WORDS):
+        return {"price": None, "currency": None, "price_type": "negotiable"}
+    parsed = _parse_price(text)
+    if parsed:
+        return {"price": parsed[0], "currency": parsed[1], "price_type": "fixed"}
+    return {"price": None, "currency": None, "price_type": "unknown"}
 
 
 def _domain_headers(domain: str) -> dict:
@@ -167,14 +205,18 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
         "price": None, "currency": default_currency, "title": None,
         "description": None, "location_text": None, "views": None,
         "photos": [], "photos_count": None, "params": [],
+        "price_type": "unknown",  # НОВЕ (п.6 ТЗ)
     }
 
     price_el = soup.select_one('[data-testid="ad-price-container"]') or soup.select_one('[data-testid="ad-price"]')
     price_text = price_el.get_text(" ", strip=True) if price_el else None
     if price_text:
-        parsed = _parse_price(price_text)
-        if parsed:
-            result["price"], result["currency"] = parsed
+        norm = normalize_price_text(price_text)
+        result["price_type"] = norm["price_type"]
+        if norm["price"] is not None:
+            result["price"] = norm["price"]
+            if norm["currency"]:
+                result["currency"] = norm["currency"]
     if result["price"] is None:
         meta = soup.find("meta", {"property": "product:price:amount"})
         if meta and meta.get("content"):
@@ -182,6 +224,7 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
             try:
                 result["price"] = float(meta["content"])
                 result["currency"] = currency_meta["content"] if currency_meta else default_currency
+                result["price_type"] = "fixed"
             except (ValueError, KeyError):
                 pass
 
@@ -259,7 +302,10 @@ async def fetch_listing_details(url: str) -> dict | None:
     details = _parse_listing_html(html, default_currency)
     if details["price"] is None:
         title_tag_text = details.get("title")
-        logger.warning("OLX listing: price not found. page_title=%r, snippet=%r", title_tag_text, html[:500])
+        logger.warning(
+            "OLX listing: price not found (price_type=%s). page_title=%r, snippet=%r",
+            details.get("price_type"), title_tag_text, html[:500],
+        )
         return None
     return details
 
@@ -326,7 +372,7 @@ def _build_search_url(
 
 
 # =========================================================
-# НОВЕ: пошук оголошень (багатоступеневий)
+# Пошук оголошень (багатоступеневий)
 # =========================================================
 
 def _split_queries(title_query: str) -> list[str]:
@@ -360,8 +406,14 @@ def _listing_id(url: str, fallback=None) -> str:
 
 
 def _offer_price(offer: dict) -> tuple[float, str | None] | None:
-    """Ціна з offer: або params[key=price].value (JSON API), або
-    price.regularPrice (prerendered state), або просто число."""
+    """
+    ЗМІНЕНО: тепер пробує більше форматів ціни в JSON-відповіді OLX API.
+    Раніше, якщо OLX повертав ціну у форматі, який тут не розпізнавався,
+    функція давала None для КОЖНОГО offer в результатах — а виклик
+    _scan() в resale_service.py тоді одразу відкидав усі оголошення ще ДО
+    спроби довантажити повну сторінку. Саме це й було причиною бага
+    "129 знайдено -> 0 відібрано, 0 проаналізовано".
+    """
     for p in offer.get("params") or []:
         if isinstance(p, dict) and p.get("key") == "price":
             val = p.get("value") or {}
@@ -373,14 +425,39 @@ def _offer_price(offer: dict) -> tuple[float, str | None] | None:
 
     price = offer.get("price")
     if isinstance(price, dict):
-        reg = price.get("regularPrice") or price
+        reg = price.get("regularPrice")
         if isinstance(reg, dict) and reg.get("value") is not None:
             try:
                 return float(reg["value"]), reg.get("currencyCode") or reg.get("currency")
             except (TypeError, ValueError):
                 pass
+        # НОВЕ: пряма форма {"value": ..., "currencyCode"/"currency": ...}
+        # без обгортки regularPrice — трапляється в спрощених відповідях API.
+        if price.get("value") is not None:
+            try:
+                return float(price["value"]), price.get("currencyCode") or price.get("currency")
+            except (TypeError, ValueError):
+                pass
     elif isinstance(price, (int, float)):
         return float(price), None
+    elif isinstance(price, str):
+        # НОВЕ: рядкова ціна прямо в полі "price" ("1 200 грн", "договірна" тощо)
+        parsed = _parse_price(price)
+        if parsed:
+            return parsed
+
+    # НОВЕ: додаткові альтернативні ключі, якими різні версії API OLX іноді
+    # позначають ціну замість "price".
+    for alt_key in ("salePrice", "priceBudget", "priceValue"):
+        alt = offer.get(alt_key)
+        if isinstance(alt, (int, float)):
+            return float(alt), None
+        if isinstance(alt, dict) and alt.get("value") is not None:
+            try:
+                return float(alt["value"]), alt.get("currency")
+            except (TypeError, ValueError):
+                pass
+
     return None
 
 
@@ -392,6 +469,25 @@ def _offer_location(offer: dict) -> str:
     if isinstance(city, dict) and city.get("name"):
         return str(city["name"])
     return str(loc.get("cityName") or loc.get("pathName") or "")
+
+
+def _warn_price_schema_once(offer: dict, offer_id) -> None:
+    """НОВЕ: якщо ціну з JSON-offer не вдалось розпізнати жодним із
+    відомих форматів — логуємо (обмежено, щоб не заспамити) фрагмент
+    сирого offer. Це реалізує ідею п.46 ТЗ (PARSER_SCHEMA_CHANGED):
+    якщо OLX змінив структуру API, це буде видно в логах одразу, а не
+    приховано за тихим "0 можливостей"."""
+    if not RESALE_DEBUG_LOGGING:
+        return
+    key = str(offer_id)
+    if key in _price_schema_warned or len(_price_schema_warned) >= _MAX_PRICE_SCHEMA_WARNINGS:
+        return
+    _price_schema_warned.add(key)
+    try:
+        snippet = json.dumps(offer, ensure_ascii=False)[:600]
+    except Exception:
+        snippet = str(offer)[:600]
+    logger.warning("OLX_API_PRICE_SCHEMA_UNRECOGNIZED offer_id=%s raw=%s", offer_id, snippet)
 
 
 def _offer_to_result(offer: dict, domain: str, cfg: dict) -> dict | None:
@@ -407,6 +503,8 @@ def _offer_to_result(offer: dict, domain: str, cfg: dict) -> dict | None:
         return None
 
     price_info = _offer_price(offer)
+    if price_info is None:
+        _warn_price_schema_once(offer, offer.get("id") or url)
     price = price_info[0] if price_info else None
     raw_currency = price_info[1] if price_info else None
     currency = CURRENCY_MAP.get(str(raw_currency or "").upper(), cfg["default_currency"])
@@ -454,7 +552,11 @@ async def _search_via_api(query: str, max_price: float | None, condition: str | 
         if item:
             results.append(item)
 
-    logger.info("OLX API search OK query=%r offers=%s parsed=%s", query, len(offers), len(results))
+    n_no_price = sum(1 for r in results if r.get("price") is None)
+    logger.info(
+        "OLX API search OK query=%r offers=%s parsed=%s без_ціни=%s",
+        query, len(offers), len(results), n_no_price,
+    )
     return results
 
 

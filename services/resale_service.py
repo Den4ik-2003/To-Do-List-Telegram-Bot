@@ -1,5 +1,4 @@
 
-
 import asyncio
 import logging
 import re
@@ -37,6 +36,22 @@ def _max_ai_per_run() -> int:
 
 def _min_score() -> float:
     return float(_cfg("RESALE_MIN_CANDIDATE_SCORE", 30))
+
+
+def _relaxed_enabled() -> bool:
+    return bool(_cfg("RESALE_RELAXED_FALLBACK_ENABLED", True))
+
+
+def _relaxed_margin_drop() -> float:
+    return float(_cfg("RESALE_RELAXED_MARGIN_DROP_PERCENT", 5))
+
+
+def _relaxed_profit_drop() -> float:
+    return float(_cfg("RESALE_RELAXED_PROFIT_DROP_PERCENT", 30))
+
+
+def _stale_recheck_days() -> int:
+    return int(_cfg("RESALE_STALE_RECONSIDER_DAYS", 30))
 
 
 # ---------------------------------------------------------
@@ -331,6 +346,65 @@ def build_opportunity(
 
 
 # ---------------------------------------------------------
+# Дебаг-звіт причин відсіву (НОВЕ)
+# ---------------------------------------------------------
+
+_REJECT_LABELS = {
+    "reject_currency": "не в гривні",
+    "reject_min_price": "ціна нижча мінімуму",
+    "reject_max_price": "ціна вища максимуму",
+    "reject_junk": "виключне слово / сміттєве оголошення",
+    "reject_location": "не збігається місто",
+    "reject_already_shown": "вже показувалось раніше",
+    "reject_known_recent": "вже відомо (недавно оброблено)",
+    "reject_known_same_price": "вже відхилено раніше, ціна не змінилась",
+    "reject_fetch_failed": "не вдалось відкрити оголошення",
+    "reject_no_price_after_fetch": "ціна не вказана (договірна/обмін тощо)",
+    "reject_price_range_after_fetch": "реальна ціна поза діапазоном",
+    "reject_ai_error": "збій AI-аналізу",
+    "reject_ai_empty": "AI не дав відповіді",
+    "reject_no_price": "немає ціни для розрахунку",
+    "reject_no_analysis": "немає AI-аналізу",
+    "reject_blocked": "у списку заблокованих товарів",
+    "reject_fake": "підозра на підробку",
+    "reject_risk": "високий ризик",
+    "reject_verdict": "AI порадив не купувати",
+    "reject_low_demand": "низький попит",
+    "reject_low_confidence": "AI недостатньо впевнений",
+    "reject_bad_condition": "поганий стан товару",
+    "reject_suspiciously_cheap": "підозріло дешево (потрібна перевірка)",
+    "reject_no_estimate": "не вдалось оцінити ринкову ціну",
+    "reject_unverified": "ринкова ціна не підтверджена",
+    "reject_low_profit": "замалий прибуток",
+    "reject_low_margin": "замала маржа",
+    "reject_low_resale": "занизька ціна перепродажу",
+    "reject_low_score": "низький opportunity score",
+}
+
+
+def _bump(debug: dict, key: str) -> None:
+    debug[key] = debug.get(key, 0) + 1
+
+
+def format_debug_breakdown(debug: dict) -> str:
+    """НОВЕ: людяний опис того, на якому етапі pipeline відсіялись
+    оголошення (п.22/п.32/п.45 ТЗ) — щоб "0 можливостей" не було чорною
+    скринькою."""
+    if not debug:
+        return ""
+    lines = ["🔎 *Чому нічого не пройшло:*"]
+    lines.append(
+        f"Знайдено: {debug.get('pool', 0)}, після базових фільтрів: {debug.get('fresh', 0)}, "
+        f"відправлено в AI: {debug.get('batch', 0)}"
+    )
+    reasons = {k: v for k, v in debug.items() if k.startswith("reject_") and v}
+    for key, count in sorted(reasons.items(), key=lambda kv: -kv[1])[:8]:
+        label = _REJECT_LABELS.get(key, key)
+        lines.append(f"• {count} — {label}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------
 # 1. ЗБІР (денний пошук)
 # ---------------------------------------------------------
 
@@ -344,17 +418,30 @@ def _slim_listing(listing: dict) -> dict:
 
 async def scan_monitor(monitor: dict) -> dict:
     """Збирає і оцінює нові оголошення, зберігає кандидатів у БД. Нічого не надсилає."""
-    res = {"error": None, "scanned": 0, "analyzed": 0, "selected": 0, "rejected": 0, "ai_limit_hit": False}
+    res = {
+        "error": None, "scanned": 0, "analyzed": 0, "selected": 0, "rejected": 0,
+        "ai_limit_hit": False, "debug": {}, "selected_relaxed": 0,
+    }
     uid = monitor["uid"]
     mid = str(monitor["_id"])
     try:
         await _scan(monitor, uid, mid, res)
     finally:
-        await resale_db.set_run_info(mid, {k: res[k] for k in ("scanned", "analyzed", "selected", "error")})
+        await resale_db.set_run_info(mid, {
+            "scanned": res.get("scanned", 0),
+            "analyzed": res.get("analyzed", 0),
+            "selected": res.get("selected", 0),
+            "selected_relaxed": res.get("selected_relaxed", 0),
+            "error": res.get("error"),
+            "debug": res.get("debug") or {},
+        })
     return res
 
 
 async def _scan(monitor: dict, uid: int, mid: str, res: dict):
+    debug: dict = res.get("debug") if isinstance(res.get("debug"), dict) else {}
+    res["debug"] = debug
+
     query = build_query(monitor)
     if not query:
         res["error"] = "no_query"
@@ -386,57 +473,108 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict):
             if r.get("url"):
                 pool.setdefault(r["url"], r)
     res["scanned"] = len(pool)
+    debug["pool"] = len(pool)
     if not pool:
         return
 
     market_prices = [r["price"] for r in market_results if r.get("price") and (r.get("currency") or "UAH") == "UAH"]
     median, market_n = market_stats(market_prices)
+    debug["market_n"] = market_n
+    debug["market_median"] = median
 
     exclude = split_words(monitor.get("exclude_words")) + [b.lower() for b in (monitor.get("blocked_similar") or [])]
     city = location.strip().lower()
     shown = resale_db.shown_map(monitor)
     known = await resale_db.get_known_candidates(mid)
+    stale_cutoff = (datetime.now() - timedelta(days=_stale_recheck_days())).isoformat()
 
     fresh: list[tuple[dict, float | None]] = []
     for url, r in pool.items():
         price = r.get("price")
-        if price is None or (r.get("currency") or "UAH") != "UAH":
+        currency = r.get("currency") or "UAH"
+        if currency != "UAH":
+            _bump(debug, "reject_currency")
             continue
-        if min_price and price < min_price:
-            continue
-        if max_price and price > max_price:
-            continue
+
+        # ГОЛОВНИЙ ФІКС БАГА "129 -> 0": раніше тут стояло
+        #   if price is None or currency != "UAH": continue
+        # тобто оголошення без розпізнаної ціни (наприклад, якщо OLX API
+        # повернув ціну у форматі, який _offer_price() у olx_service.py не
+        # розпізнавав) відкидались ще ДО спроби довантажити повну сторінку
+        # оголошення, де парсер ціни надійніший (кілька CSS-селекторів +
+        # meta-теги, див. fetch_listing_details). Якщо це трапляється для
+        # ВСІХ 129 оголошень одразу — результат саме "129 знайдено,
+        # 0 відібрано, 0 проаналізовано".
+        #
+        # Тепер: якщо ціна вже відома з картки/API — перевіряємо межі тут
+        # (щоб не гаяти AI-ліміт на явно дорогі/дешеві товари). Якщо ціни
+        # ще немає — НЕ відкидаємо, а даємо шанс дізнатись реальну ціну з
+        # повної сторінки оголошення нижче (цикл по `fetched`).
+        if price is not None:
+            if min_price and price < min_price:
+                _bump(debug, "reject_min_price")
+                continue
+            if max_price and price > max_price:
+                _bump(debug, "reject_max_price")
+                continue
+
         title = (r.get("title") or "").lower()
         if any(w in title for w in exclude) or _JUNK_RE.search(title):
+            _bump(debug, "reject_junk")
             continue
         loc_text = (r.get("location_text") or "").lower()
         if city and loc_text and city not in loc_text:
+            _bump(debug, "reject_location")
             continue
 
         drop_from = None
         if url in shown:
             old = shown[url]
-            if old and price <= old * PRICE_DROP_RATIO:
+            if old and price is not None and price <= old * PRICE_DROP_RATIO:
                 drop_from = old      # ціна суттєво впала — можна показати знову
             else:
+                _bump(debug, "reject_already_shown")
                 continue
         k = known.get(url)
         if k and not drop_from:
+            # НОВЕ: старі rejected/dismissed/gone не блокують показ
+            # НАЗАВЖДИ — після RESALE_STALE_RECONSIDER_DAYS даємо їм ще
+            # один шанс (щоб автопошук не "застряг" на 0 через колись
+            # завищені/помилкові критерії відсіву).
+            updated = k.get("updated_at")
+            is_stale = True
+            if updated:
+                try:
+                    is_stale = updated < stale_cutoff
+                except TypeError:
+                    is_stale = True
             st = k.get("status")
-            if st in ("new", "shown", "dismissed", "gone"):
+            if st in ("new", "shown", "dismissed", "gone") and not is_stale:
+                _bump(debug, "reject_known_recent")
                 continue
-            if st == "rejected":
+            if st == "rejected" and not is_stale:
                 old_price = k.get("price") or 0
-                if old_price and abs(price - old_price) / old_price < SAME_PRICE_TOLERANCE:
+                if old_price and price is not None and abs(price - old_price) / old_price < SAME_PRICE_TOLERANCE:
+                    _bump(debug, "reject_known_same_price")
                     continue
         fresh.append((r, drop_from))
 
+    debug["fresh"] = len(fresh)
     if not fresh:
         return
 
-    # Спершу найдешевші відносно ринку — там найбільша ймовірність вигоди.
-    fresh.sort(key=lambda x: (x[0]["price"] / median) if median else x[0]["price"])
+    # Спершу найдешевші відносно ринку; оголошення без ціни (ще невідомо,
+    # вигідні чи ні) відправляємо в кінець черги, а не викидаємо.
+    def _sort_key(item):
+        r0 = item[0]
+        p = r0.get("price")
+        if p is None:
+            return float("inf")
+        return (p / median) if median else p
+
+    fresh.sort(key=_sort_key)
     batch = fresh[: _max_ai_per_run()]
+    debug["batch"] = len(batch)
     drops = {r["url"]: d for r, d in batch}
 
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
@@ -452,12 +590,31 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict):
     fetched = await asyncio.gather(*[_fetch(r) for r, _ in batch])
     day = datetime.now().strftime("%Y-%m-%d")
 
+    # (listing, analysis, price) — кандидати, відхилені ЛИШЕ через
+    # min_profit/min_margin/low_score, для relaxed fallback нижче (п.38 ТЗ).
+    relaxed_pool: list[tuple[dict, dict, float]] = []
+
     for r, details in fetched:
         url = r["url"]
-        if not details or details.get("price") is None:
+        if not details:
+            _bump(debug, "reject_fetch_failed")
             continue
-        price = details["price"]
+        price = details.get("price")
+        if price is None:
+            _bump(debug, "reject_no_price_after_fetch")
+            await resale_db.upsert_candidate(mid, uid, url, {
+                "status": "rejected", "reject_reason": "no_price",
+                "title": details.get("title") or r.get("title"), "day": day,
+            })
+            res["rejected"] += 1
+            continue
         if (min_price and price < min_price) or (max_price and price > max_price):
+            _bump(debug, "reject_price_range_after_fetch")
+            await resale_db.upsert_candidate(mid, uid, url, {
+                "status": "rejected", "reject_reason": "price_range",
+                "price": price, "title": details.get("title") or r.get("title"), "day": day,
+            })
+            res["rejected"] += 1
             continue
         if await ai_usage_db.get_remaining(uid, AI_DAILY_LIMIT) <= 0:
             res["ai_limit_hit"] = True
@@ -480,8 +637,10 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict):
             analysis = await resale_engine.analyze_listing(listing, monitor.get("min_margin_percent"))
         except Exception:
             logger.exception("resale: analyze_listing упав для %s", url)
+            _bump(debug, "reject_ai_error")
             continue
         if not analysis:
+            _bump(debug, "reject_ai_empty")
             continue
         await ai_usage_db.increment_usage(uid)
         res["analyzed"] += 1
@@ -504,11 +663,52 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict):
             })
             res["selected"] += 1
         else:
+            _bump(debug, f"reject_{reason}")
             await resale_db.upsert_candidate(mid, uid, url, {
                 "status": "rejected", "reject_reason": reason,
                 "price": price, "title": listing["title"], "day": day,
             })
             res["rejected"] += 1
+            if reason in ("low_profit", "low_margin", "low_score"):
+                relaxed_pool.append((listing, analysis, price))
+
+    # ---- НОВЕ (п.38 ТЗ): RELAXED SEARCH. Якщо за основними критеріями 0
+    # можливостей — пробуємо ті самі вже проаналізовані оголошення (AI вже
+    # викликано, ДОДАТКОВИХ запитів немає) з послабленими
+    # min_profit/min_margin, і чесно позначаємо результат як "relaxed".
+    if res["selected"] == 0 and relaxed_pool and _relaxed_enabled():
+        relaxed_monitor = dict(monitor)
+        base_profit = _num(monitor.get("min_profit"))
+        base_profit = DEFAULT_MIN_PROFIT if base_profit is None else base_profit
+        base_margin = _num(monitor.get("min_margin_percent"))
+        base_margin = DEFAULT_MIN_MARGIN if base_margin is None else base_margin
+        relaxed_monitor["min_profit"] = base_profit * (1 - _relaxed_profit_drop() / 100)
+        relaxed_monitor["min_margin_percent"] = base_margin * (1 - _relaxed_margin_drop() / 100)
+
+        relaxed_selected = 0
+        for listing, analysis, price in relaxed_pool:
+            opp, reason = build_opportunity(listing, analysis, relaxed_monitor, median, market_n, us)
+            if opp:
+                now = datetime.now().isoformat()
+                await resale_db.upsert_candidate(mid, uid, listing["url"], {
+                    **opp,
+                    "title": listing["title"],
+                    "currency": listing["currency"],
+                    "condition_text": _short(str(analysis.get("item_condition") or ""), 50),
+                    "listing": _slim_listing(listing),
+                    "analysis": analysis,
+                    "status": "new",
+                    "day": day,
+                    "found_at": now,
+                    "relaxed": True,
+                    "recheck_fail": 0,
+                })
+                relaxed_selected += 1
+        if relaxed_selected:
+            res["selected_relaxed"] = relaxed_selected
+            debug["relaxed_selected"] = relaxed_selected
+
+    logger.info("resale debug monitor=%s query=%r: %s", mid, query, debug)
 
 
 # ---------------------------------------------------------
@@ -584,8 +784,14 @@ def format_report(monitor: dict, items: list[dict], day: dict, us: dict, error: 
     if not items:
         lines.append("😐 Сьогодні якісних варіантів для перепродажу не знайшов.")
         lines.append("Слабкі й сумнівні оголошення я навмисно не додаю.")
+        last_debug = (monitor.get("last_run") or {}).get("debug") or {}
+        breakdown = format_debug_breakdown(last_debug)
+        if breakdown:
+            lines.append("")
+            lines.append(breakdown)
     for i, c in enumerate(items, 1):
-        lines.append(f"{i}. *{esc(_short(c.get('title'), 70))}* — {_money(c.get('price'))} грн")
+        tag = " ⚠️ _(послаблені критерії)_" if c.get("relaxed") else ""
+        lines.append(f"{i}. *{esc(_short(c.get('title'), 70))}*{tag} — {_money(c.get('price'))} грн")
         lines.append(f"   Очікуваний перепродаж: ~{_money(c.get('est_sale'))} грн")
         lines.append(f"   Потенційний прибуток: ~{_money(c.get('profit'))} грн")
         lines.append(f"   Маржа: ~{c.get('margin', 0):.0f}%")
@@ -671,8 +877,16 @@ def format_scan_summary(res: dict, first: bool = False) -> str:
         f"проаналізовано AI {res.get('analyzed', 0)}, відібрано {res.get('selected', 0)}.\n"
         f"Звіт надійде ввечері (~{eh:02d}:{em:02d})."
     )
+    if res.get("selected_relaxed"):
+        text += (
+            f"\nℹ️ За основними критеріями нічого не пройшло, але знайдено "
+            f"{res['selected_relaxed']} варіант(и) після послаблення фільтрів — побачиш їх у звіті."
+        )
     if res.get("selected", 0) == 0:
         text += "\nПоки нічого вартого уваги, це нормально: я показую лише реально вигідні варіанти."
+        breakdown = format_debug_breakdown(res.get("debug") or {})
+        if breakdown:
+            text += "\n\n" + breakdown
     return text
 
 
@@ -715,6 +929,11 @@ def format_monitor_card(m: dict, day: dict) -> str:
         f"🕒 Останній запуск: {_fmt_dt(m.get('last_checked_at'))}",
         f"⏭ Наступний: {next_run_text() if active else '— (на паузі)'}",
     ]
+    if last.get("selected", 0) == 0 and last.get("debug"):
+        breakdown = format_debug_breakdown(last["debug"])
+        if breakdown:
+            lines.append("")
+            lines.append(breakdown)
     return "\n".join(lines)
 
 

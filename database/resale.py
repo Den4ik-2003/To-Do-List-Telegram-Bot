@@ -1,5 +1,4 @@
 
-
 from datetime import datetime, timedelta
 
 from bson import ObjectId
@@ -252,9 +251,17 @@ async def upsert_candidate(monitor_id, uid: int, url: str, fields: dict):
 
 
 async def get_known_candidates(monitor_id) -> dict:
-    """url -> {status, price} усіх відомих кандидатів автопошуку."""
+    """url -> {status, price, updated_at} усіх відомих кандидатів автопошуку.
+
+    НОВЕ: додано updated_at у проекцію — потрібно для _scan()
+    (services/resale_service.py), щоб оголошення, позначені колись
+    rejected/dismissed/gone, не блокувались НАЗАВЖДИ, якщо минуло вже
+    багато днів (RESALE_STALE_RECONSIDER_DAYS) — інакше автопошук міг
+    "застрягти" на 0 результатах навіть після виправлення інших багів,
+    просто тому що всі оголошення вже колись помилково відхилені.
+    """
     cursor = resale_candidates_col.find(
-        {"monitor_id": str(monitor_id)}, {"url": 1, "status": 1, "price": 1}
+        {"monitor_id": str(monitor_id)}, {"url": 1, "status": 1, "price": 1, "updated_at": 1}
     )
     docs = await db_call(cursor.to_list(length=5000), raise_on_fail=False) or []
     return {d["url"]: d for d in docs if d.get("url")}

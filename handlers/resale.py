@@ -1,5 +1,4 @@
 
-
 import asyncio
 import logging
 from datetime import datetime
@@ -130,6 +129,9 @@ def _ikb_monitor(m: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
         [InlineKeyboardButton(text="🔍 Знайти зараз", callback_data=f"rsm_run:{mid}"),
          InlineKeyboardButton(text="📊 Статистика", callback_data=f"rsm_mstats:{mid}")],
+        # НОВЕ (п.33 ТЗ): дебаг-команда — показує розбивку причин відсіву
+        # останнього запуску без потреби лізти в логи сервера.
+        [InlineKeyboardButton(text="🐞 Діагностика", callback_data=f"rsm_debug:{mid}")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"rsm_del:{mid}")],
     ])
 
@@ -404,6 +406,28 @@ async def resale_monitor_stats_cb(cb: CallbackQuery):
         f"⭐ Збережено: {stats.get('saved', 0)}\n"
         f"🛒 Куплено: {stats.get('bought', 0)}\n"
         f"💰 Перепродано: {stats.get('sold', 0)}"
+    )
+
+
+@router.callback_query(F.data.startswith("rsm_debug:"))
+async def resale_debug_cb(cb: CallbackQuery):
+    """НОВЕ (п.33 ТЗ): показує розбивку причин відсіву останнього запуску
+    без потреби лізти в серверні логи."""
+    mid = cb.data.split(":", 1)[1]
+    monitor = await _own_monitor(mid, cb.from_user.id)
+    await cb.answer()
+    if not monitor:
+        return await cb.message.answer("⚠️ Автопошук не знайдено.")
+    last = monitor.get("last_run") or {}
+    breakdown = resale_service.format_debug_breakdown(last.get("debug") or {})
+    if not breakdown:
+        return await cb.message.answer(
+            "ℹ️ Дебаг-даних ще немає — запусти пошук хоча б раз («🔍 Знайти зараз»)."
+        )
+    await cb.message.answer(
+        f"🐞 *Діагностика останнього запуску*\n\n{breakdown}\n\n"
+        f"Знайдено: {last.get('scanned', 0)}, проаналізовано: {last.get('analyzed', 0)}, "
+        f"відібрано: {last.get('selected', 0)}, з послабленими критеріями: {last.get('selected_relaxed', 0)}"
     )
 
 
