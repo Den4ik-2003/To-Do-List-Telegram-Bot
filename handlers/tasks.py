@@ -1,39 +1,9 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: handlers/tasks.py
-
-Додано (для фічі "🏆 Мій прогрес"):
-- progress_view — новий екран "🏆 Мій прогрес": рівень, XP, прогрес-бар,
-  скільки XP до наступного рівня, кількість виконаних задач, останні
-  отримані XP. Формула рівня/XP НЕ змінена — усе так само рахується
-  через level_progress() з handlers/common.py; новий екран лише читає
-  вже наявні users_db.get_user_state()/tasks_db.get_user_tasks() і
-  форматує через build_progress_text() (теж у handlers/common.py).
-- task_done(): нарахування XP і сам gain — БЕЗ ЗМІН. Змінено лише подачу
-  повідомлення про новий рівень — за ТЗ воно тепер надсилається окремим
-  повідомленням у форматі "🎉 Новий рівень!\\nТи досяг {N} рівня 🏆"
-  замість дописування рядка "🏆 Новий рівень: N!" в те саме повідомлення
-  про виконання задачі.
-
-Раніше додано (для фічі "📅 Автоперенесення задач"):
-- rollover_digest_cache — module-level кеш {uid: [task_id, ...]} для
-  групового нічного повідомлення (заповнює scheduler/daily_jobs.py,
-  читають нові callback-хендлери тут; той самий патерн, що вже
-  використовується для user_list_cache в handlers/common.py).
-- autoresched_cb — "📅 Найближчий вільний" (працює і з картки задачі,
-  і з нічної пропозиції — та сама callback_data "autoresched:{tid}").
-- dismiss_rollover_cb — "🔕 Залишити" на одиночній нічній пропозиції.
-- resched_all_cb / resched_pick_cb / dismiss_all_cb — три дії групового
-  дайджесту, коли невиконаних задач за ніч декілька.
-- view_day_cb — "📋 Переглянути день" після підтвердження перенесення
-  (нового екрана для цього не було — перевикористовує вже наявний
-  ikb_tasks_list).
-
-Решта файлу — без змін, жодна існуюча функція не видалена і не
-перейменована.
-"""
-
+import asyncio
+import difflib
 import logging
+import re
 import secrets
+from collections import Counter
 from datetime import datetime, date, timedelta
 
 from aiogram import Router, F
@@ -51,13 +21,16 @@ from database.mongo import DBUnavailable
 from database import tasks as tasks_db
 from database import users as users_db
 from database import projects as projects_db
-from services import reschedule_service
+from services import reschedule_service, ai_service
+from utils.dates import now_local, describe_schedule, build_schedule, DEFAULT_TZ
 from keyboards.main_menu import kb_main, kb_cancel
 from keyboards.tasks import (
     kb_tasks_menu, kb_label, label_from_text, kb_category, category_from_text,
     kb_date, kb_project_select, project_from_text,
     ikb_task_actions, ikb_edit_fields, ikb_tasks_list, ikb_categories,
-    ikb_view_day,
+    ikb_view_day, ikb_recurring_notice, ikb_recurring_move, ikb_recurring_suggestion,
+    ikb_rc_schedule, ikb_rc_days, ikb_recurring_list, ikb_recurring_card,
+    ikb_recurring_edit, ikb_rc_category, ikb_rc_priority, ikb_rc_confirm_delete,
 )
 from handlers.common import (
     require_auth, user_list_cache, fmt_task, fmt_due, parse_due,
@@ -72,9 +45,6 @@ CANCEL_TEXT = "❌ Скасувати"
 NO_DUE_TEXT = "⏭ Без терміну"
 NO_PROJECT_TEXT = "📋 Без проекту"
 
-# НОВЕ: кеш task_id-ів групового нічного дайджесту, ключ — uid.
-# Наповнює scheduler/daily_jobs.py (import цього словника звідти),
-# читають resched_all_cb / resched_pick_cb / dismiss_all_cb нижче.
 rollover_digest_cache: dict[int, list[int]] = {}
 
 
@@ -90,6 +60,31 @@ class AddTask(StatesGroup):
 
 class EditField(StatesGroup):
     typing = State()
+
+
+class RecEdit(StatesGroup):
+    typing = State()
+    interval = State()
+    monthday = State()
+
+
+FREQ_HINT = {"daily": "щодня", "weekdays": "по буднях", "weekly": "щотижня", "monthly": "щомісяця"}
+SUGGEST_MIN_COUNT = 3
+SUGGEST_MIN_CONFIDENCE = 0.75
+DECLINE_COOLDOWN_DAYS = 14
+ANALYSIS_INTERVAL_HOURS = 12
+HISTORY_DAYS = 60
+
+RC_PROMPTS = {
+    "title": "Введіть нову *назву*:",
+    "description": "Введіть *опис* (або «-», щоб очистити):",
+    "time": "Введіть *час* як *гг:хх*:",
+    "start": "Введіть *дату початку* як *дд.мм.рррр*:",
+    "end": "Введіть *дату завершення* як *дд.мм.рррр* (або «-», щоб прибрати):",
+    "reminder": "За скільки *хвилин* нагадувати? Введіть число (0 — стандартне нагадування):",
+}
+
+_bg_tasks: set = set()
 
 
 def is_cancel(text: str | None) -> bool:
@@ -113,12 +108,12 @@ async def _fmt_task_full(t: dict) -> str:
     title = await _project_title(t.get("project_id"))
     if title:
         text += f"\n📁 Проєкт: {title}"
+    if t.get("recurring_task_id"):
+        text += "\n🔁 Повторювана таска"
+    if t.get("description"):
+        text += f"\n📄 {_md(t['description'])}"
     return text
 
-
-# =========================================================
-# ВХІД У РОЗДІЛ
-# =========================================================
 
 @router.message(F.text == "📋 Мої задачі")
 async def tasks_menu(msg: Message, state: FSMContext):
@@ -136,10 +131,6 @@ async def tasks_menu_cb(cb: CallbackQuery):
     await cb.message.answer("Обери дію:", reply_markup=kb_tasks_menu())
     await cb.answer()
 
-
-# =========================================================
-# НОВЕ: 🏆 МІЙ ПРОГРЕС
-# =========================================================
 
 @router.message(F.text == "🏆 Мій прогрес")
 async def progress_view(msg: Message, state: FSMContext):
@@ -160,10 +151,6 @@ async def progress_view(msg: Message, state: FSMContext):
         logger.exception("progress_view failed")
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
 
-
-# =========================================================
-# ДОДАВАННЯ ЗАДАЧІ
-# =========================================================
 
 @router.message(F.text == "➕ Додати задачу")
 async def new_task_start(msg: Message, state: FSMContext):
@@ -329,11 +316,8 @@ async def _save_task(msg: Message, state: FSMContext, due: str):
 
     note = "" if due else " (без терміну)"
     await msg.answer(f"✅ *Завдання додано{note}!*\n\n{await _fmt_task_full(saved)}", reply_markup=kb_tasks_menu())
+    _spawn_bg(maybe_suggest_recurring(msg.bot, msg.from_user.id, saved))
 
-
-# =========================================================
-# СПИСКИ
-# =========================================================
 
 @router.message(F.text == "📋 Сьогодні")
 async def today_tasks(msg: Message, state: FSMContext):
@@ -481,12 +465,10 @@ async def view_task(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
-# НОВЕ: перегляд усіх задач конкретного дня (кнопка "📋 Переглянути день"
-# після підтвердження перенесення). Перевикористовує ikb_tasks_list.
 @router.callback_query(F.data.startswith("viewday:"))
 async def view_day_cb(cb: CallbackQuery):
     try:
-        date_str = cb.data.split(":", 1)[1]  # YYYY-MM-DD (date.isoformat())
+        date_str = cb.data.split(":", 1)[1]
         target = datetime.strptime(date_str, "%Y-%m-%d").date()
         uid = cb.from_user.id
 
@@ -505,10 +487,6 @@ async def view_day_cb(cb: CallbackQuery):
         logger.exception("view_day_cb failed")
         await _safe_alert(cb)
 
-
-# =========================================================
-# ДІЇ НАД ЗАДАЧЕЮ
-# =========================================================
 
 @router.callback_query(F.data.startswith("done:"))
 async def task_done(cb: CallbackQuery):
@@ -532,7 +510,6 @@ async def task_done(cb: CallbackQuery):
         })
         t = await tasks_db.get_task(tid)
 
-        # НЕ ЗМІНЕНО: сам gain і апдейт XP/рівня — та сама логіка, що й раніше.
         extra = f"\n\n✨ +{gain} XP"
 
         try:
@@ -541,9 +518,6 @@ async def task_done(cb: CallbackQuery):
             await cb.message.answer(f"✅ *Виконано!*\n\n{await _fmt_task_full(t)}{extra}")
         await cb.answer("✅ Виконано!")
 
-        # ЗМІНЕНО за ТЗ "🏆 XP-система": повідомлення про новий рівень тепер
-        # надсилається ОКРЕМИМ повідомленням у форматі з ТЗ, а не рядком,
-        # дописаним до картки виконаної задачі.
         if new_level > old_level:
             try:
                 await cb.message.answer(f"🎉 *Новий рівень!*\nТи досяг {new_level} рівня 🏆")
@@ -604,8 +578,6 @@ async def postpone_tomorrow(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
-# НОВЕ: "📅 Найближчий вільний" — і з картки задачі (ikb_task_actions), і
-# з нічної пропозиції (ikb_rollover_actions) — та сама callback_data.
 @router.callback_query(F.data.startswith("autoresched:"))
 async def auto_reschedule_cb(cb: CallbackQuery):
     try:
@@ -632,8 +604,6 @@ async def auto_reschedule_cb(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
-# НОВЕ: "🔕 Залишити" на одиночній нічній пропозиції — позначає, що
-# пропозицію вже показали сьогодні (не змінює саму задачу інакше).
 @router.callback_query(F.data.startswith("dismiss_rollover:"))
 async def dismiss_rollover_cb(cb: CallbackQuery):
     try:
@@ -649,7 +619,6 @@ async def dismiss_rollover_cb(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
-# НОВЕ: групові дії дайджесту "У тебе залишилось N невиконаних задач"
 @router.callback_query(F.data == "resched_all")
 async def resched_all_cb(cb: CallbackQuery):
     try:
@@ -771,10 +740,6 @@ async def unpin_task(cb: CallbackQuery):
         await _safe_alert(cb)
 
 
-# =========================================================
-# ПІДЗАДАЧІ
-# =========================================================
-
 def _render_subtasks(tid: int, t: dict):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     subtasks = t.get("subtasks") or []
@@ -829,10 +794,6 @@ async def subtask_toggle(cb: CallbackQuery):
         logger.exception("subtask_toggle failed")
         await _safe_alert(cb)
 
-
-# =========================================================
-# РЕДАГУВАННЯ
-# =========================================================
 
 @router.callback_query(F.data.startswith("edit:"))
 async def edit_task_cb(cb: CallbackQuery):
@@ -950,3 +911,763 @@ async def _safe_alert(cb: CallbackQuery):
         await cb.answer(DB_ERROR_TEXT, show_alert=True)
     except TelegramAPIError:
         pass
+
+
+def _md(text: str) -> str:
+    return re.sub(r"([_*`\[])", r"\\\1", text or "")
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def _pretty_date(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    return date.fromisoformat(iso).strftime("%d.%m.%Y")
+
+
+def _rc_status(rec: dict) -> str:
+    if rec.get("paused"):
+        return "⏸ На паузі"
+    if not rec.get("active"):
+        return "⚪ Завершена"
+    return "🟢 Активна"
+
+
+def _fmt_recurring(rec: dict) -> str:
+    cat = CATEGORIES.get(rec.get("category"), {})
+    lab = LABELS.get(rec.get("priority"), {})
+    lines = [f"🔁 *{_md(rec.get('title', ''))}*"]
+    if rec.get("description"):
+        lines.append(_md(rec["description"]))
+    lines += [
+        "",
+        describe_schedule(rec["schedule"]),
+        f"📅 Наступне: {_pretty_date(rec.get('next_date'))}",
+        f"{cat.get('emoji', '')} {cat.get('name', '')}  {lab.get('emoji', '')} {lab.get('name', '')}",
+        f"▶️ Початок: {_pretty_date(rec.get('start_date'))}",
+    ]
+    if rec.get("end_date"):
+        lines.append(f"🏁 Завершення: {_pretty_date(rec['end_date'])}")
+    rm = rec.get("reminder_minutes")
+    lines.append(f"⏰ Нагадування: за {rm} хв" if rm else "⏰ Нагадування: стандартне")
+    lines.append(_rc_status(rec))
+    return "\n".join(lines)
+
+
+async def _rc_edit(cb: CallbackQuery, text: str, kb=None) -> None:
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except TelegramAPIError:
+        await cb.message.answer(text, reply_markup=kb)
+
+
+async def _own_rec(cb: CallbackQuery, rid: str) -> dict | None:
+    rec = await tasks_db.get_recurring(rid)
+    if not rec or rec.get("uid") != cb.from_user.id:
+        await cb.answer("Не знайдено!", show_alert=True)
+        return None
+    return rec
+
+
+async def _recurring_list_view(uid: int):
+    recs = await tasks_db.list_recurring(uid)
+    if not recs:
+        text = (
+            "🔁 *Повторювані таски*\n\nПоки що немає. Бот запропонує, коли помітить регулярні дії, "
+            "або натисни «🔁 Зробити повторюваною» на картці задачі."
+        )
+        return text, ikb_recurring_list([])
+    blocks = ["🔁 *Повторювані таски*", ""]
+    for r in recs:
+        blocks.append(f"🔁 {_md(r.get('title', ''))}\n{describe_schedule(r['schedule'])}\n{_rc_status(r)}\n")
+    return "\n".join(blocks), ikb_recurring_list(recs)
+
+
+@router.message(F.text == "🔁 Повторювані таски")
+async def recurring_menu(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state):
+        return
+    try:
+        text, kb = await _recurring_list_view(msg.from_user.id)
+        await msg.answer(text, reply_markup=kb)
+    except Exception:
+        logger.exception("recurring_menu failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_tasks_menu())
+
+
+@router.callback_query(F.data == "rc_list")
+async def rc_list_cb(cb: CallbackQuery):
+    try:
+        text, kb = await _recurring_list_view(cb.from_user.id)
+        await _rc_edit(cb, text, kb)
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_list_cb failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcv:"))
+async def rc_view(cb: CallbackQuery):
+    try:
+        rec = await _own_rec(cb, cb.data.split(":", 1)[1])
+        if not rec:
+            return
+        await _rc_edit(cb, _fmt_recurring(rec), ikb_recurring_card(rec))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_view failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcp:"))
+async def rc_pause(cb: CallbackQuery):
+    try:
+        rid = cb.data.split(":", 1)[1]
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        if rec.get("paused"):
+            await tasks_db.update_recurring(rid, {"paused": False})
+            rec = await tasks_db.replan_recurring(rid)
+            note = "▶️ Повторення відновлено"
+        else:
+            await tasks_db.update_recurring(rid, {"paused": True})
+            rec = await tasks_db.get_recurring(rid)
+            note = "⏸ Повторення призупинено"
+        await _rc_edit(cb, f"{note}\n\n{_fmt_recurring(rec)}", ikb_recurring_card(rec))
+        await cb.answer(note)
+    except Exception:
+        logger.exception("rc_pause failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcn:"))
+async def rc_skip_next(cb: CallbackQuery):
+    try:
+        rid = cb.data.split(":", 1)[1]
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        res = await tasks_db.skip_next_recurring(rid)
+        if not res:
+            return await cb.answer("Немає наступного виконання.", show_alert=True)
+        skipped, _ = res
+        rec = await tasks_db.get_recurring(rid)
+        await _rc_edit(
+            cb,
+            f"❌ Пропущено виконання {skipped.strftime('%d.%m.%Y')}\n\n{_fmt_recurring(rec)}",
+            ikb_recurring_card(rec),
+        )
+        await cb.answer("Пропущено")
+    except Exception:
+        logger.exception("rc_skip_next failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcd:"))
+async def rc_delete_ask(cb: CallbackQuery):
+    try:
+        rid = cb.data.split(":", 1)[1]
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        await _rc_edit(
+            cb,
+            f"🗑 Видалити повторення *{_md(rec.get('title', ''))}*?\n\nВже створені таски залишаться як звичайні.",
+            ikb_rc_confirm_delete(rid),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_delete_ask failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcdy:"))
+async def rc_delete_confirm(cb: CallbackQuery):
+    try:
+        rid = cb.data.split(":", 1)[1]
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        await tasks_db.delete_recurring(rid)
+        await _rc_edit(cb, "🗑 Повторення видалено. Вже створені таски залишились як звичайні.")
+        await cb.answer("Видалено")
+    except Exception:
+        logger.exception("rc_delete_confirm failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rce:"))
+async def rc_edit_menu(cb: CallbackQuery):
+    try:
+        rid = cb.data.split(":", 1)[1]
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        await _rc_edit(cb, f"✏️ *Редагування*\n\n{_fmt_recurring(rec)}", ikb_recurring_edit(rid))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_edit_menu failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcf:"))
+async def rc_field(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, rid, field = cb.data.split(":", 2)
+        rec = await _own_rec(cb, rid)
+        if not rec:
+            return
+        if field == "category":
+            await _rc_edit(cb, "🏷 Оберіть категорію:", ikb_rc_category(rid))
+        elif field == "priority":
+            await _rc_edit(cb, "🎨 Оберіть пріоритет:", ikb_rc_priority(rid))
+        elif field in RC_PROMPTS:
+            await state.set_state(RecEdit.typing)
+            await state.update_data(rc_rid=rid, rc_field=field)
+            await cb.message.answer(RC_PROMPTS[field], reply_markup=kb_cancel())
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_field failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcfc:"))
+async def rc_set_category(cb: CallbackQuery):
+    try:
+        _, rid, key = cb.data.split(":", 2)
+        if not await _own_rec(cb, rid):
+            return
+        if key not in CATEGORIES:
+            return await cb.answer("Невідома категорія", show_alert=True)
+        await tasks_db.update_recurring(rid, {"category": key})
+        rec = await tasks_db.get_recurring(rid)
+        await _rc_edit(cb, f"✅ Оновлено\n\n{_fmt_recurring(rec)}", ikb_recurring_card(rec))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_set_category failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcfl:"))
+async def rc_set_priority(cb: CallbackQuery):
+    try:
+        _, rid, key = cb.data.split(":", 2)
+        if not await _own_rec(cb, rid):
+            return
+        if key not in LABELS:
+            return await cb.answer("Невідомий пріоритет", show_alert=True)
+        await tasks_db.update_recurring(rid, {"priority": key})
+        rec = await tasks_db.get_recurring(rid)
+        await _rc_edit(cb, f"✅ Оновлено\n\n{_fmt_recurring(rec)}", ikb_recurring_card(rec))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_set_priority failed")
+        await _safe_alert(cb)
+
+
+@router.message(StateFilter(RecEdit.typing))
+async def rc_edit_save(msg: Message, state: FSMContext):
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    fd = await state.get_data()
+    rid, field = fd.get("rc_rid"), fd.get("rc_field")
+    rec = await tasks_db.get_recurring(rid) if rid else None
+    if not rec or rec.get("uid") != msg.from_user.id:
+        await state.clear()
+        return await msg.answer("Не знайдено.", reply_markup=kb_tasks_menu())
+
+    raw = (msg.text or "").strip()
+    fields: dict = {}
+    replan = False
+
+    if field == "title":
+        if not raw:
+            return await msg.answer("⚠️ Введіть назву:", reply_markup=kb_cancel())
+        fields["title"] = raw[:200]
+    elif field == "description":
+        fields["description"] = "" if raw == "-" else raw[:1000]
+    elif field == "time":
+        try:
+            hhmm = datetime.strptime(raw, "%H:%M").strftime("%H:%M")
+        except ValueError:
+            return await msg.answer("⚠️ Невірний формат. Введіть як *гг:хх*:", reply_markup=kb_cancel())
+        schedule = dict(rec["schedule"])
+        schedule["time"] = hhmm
+        fields["schedule"] = schedule
+        replan = True
+    elif field == "start":
+        try:
+            fields["start_date"] = datetime.strptime(raw, "%d.%m.%Y").date().isoformat()
+        except ValueError:
+            return await msg.answer("⚠️ Невірний формат. Введіть як *дд.мм.рррр*:", reply_markup=kb_cancel())
+        replan = True
+    elif field == "end":
+        if raw == "-":
+            fields["end_date"] = None
+        else:
+            try:
+                fields["end_date"] = datetime.strptime(raw, "%d.%m.%Y").date().isoformat()
+            except ValueError:
+                return await msg.answer(
+                    "⚠️ Невірний формат. Введіть як *дд.мм.рррр* або «-»:", reply_markup=kb_cancel()
+                )
+        replan = True
+    elif field == "reminder":
+        if not raw.isdigit() or int(raw) > 1440:
+            return await msg.answer("⚠️ Введіть число хвилин від 0 до 1440:", reply_markup=kb_cancel())
+        fields["reminder_minutes"] = int(raw) or None
+
+    await tasks_db.update_recurring(rid, fields)
+    rec = await tasks_db.replan_recurring(rid) if replan else await tasks_db.get_recurring(rid)
+    await state.clear()
+    await msg.answer("✅ Оновлено!", reply_markup=kb_tasks_menu())
+    await msg.answer(_fmt_recurring(rec), reply_markup=ikb_recurring_card(rec))
+
+
+async def _apply_schedule(uid: int, ctx: str, kind: str, days=None, interval: int = 1, day: int | None = None):
+    kind_ctx, ref = ctx[0], ctx[1:]
+    sug = rec = task = None
+    tz = DEFAULT_TZ
+    if kind_ctx == "s":
+        sug = await tasks_db.get_suggestion(ref)
+        if not sug or sug.get("uid") != uid or sug.get("status") == "accepted":
+            return None
+        hhmm = sug.get("time") or "18:00"
+    elif kind_ctx == "r":
+        rec = await tasks_db.get_recurring(ref)
+        if not rec or rec.get("uid") != uid:
+            return None
+        hhmm = rec["schedule"]["time"]
+        tz = rec["schedule"].get("tz") or DEFAULT_TZ
+    else:
+        task = await tasks_db.get_task(int(ref))
+        if not task or task.get("uid") != uid:
+            return None
+        due = parse_due(task.get("due", ""))
+        hhmm = due.strftime("%H:%M") if due else "18:00"
+
+    schedule = build_schedule(kind, hhmm, tz, days=days, interval=interval, day=day)
+
+    if kind_ctx == "r":
+        await tasks_db.update_recurring(ref, {"schedule": schedule})
+        return await tasks_db.replan_recurring(ref)
+
+    start = now_local(tz).date() + timedelta(days=1)
+    if task:
+        due = parse_due(task.get("due", ""))
+        if due:
+            start = max(start, due.date() + timedelta(days=1))
+
+    if kind_ctx == "s":
+        created = await tasks_db.create_recurring(
+            uid, sug["title"], sug.get("category") or "other", sug.get("label") or "medium",
+            schedule, ai_confidence=sug.get("confidence"), start_date=start,
+        )
+        await tasks_db.update_suggestion(ref, {"status": "accepted", "recurring_task_id": str(created["_id"])})
+        return created
+
+    return await tasks_db.create_recurring(
+        uid, task["text"], task.get("category") or "other", task.get("label") or "medium",
+        schedule, start_date=start,
+    )
+
+
+async def _after_schedule(cb: CallbackQuery, ctx: str, rec: dict | None) -> None:
+    if not rec:
+        return await cb.answer("Вже оброблено або не знайдено.", show_alert=True)
+    header = "✅ Графік збережено" if ctx[0] == "r" else "✅ Повторювану таску створено"
+    await _rc_edit(cb, f"{header}\n\n{_fmt_recurring(rec)}", ikb_recurring_card(rec))
+    await cb.answer()
+
+
+async def _after_schedule_msg(msg: Message, ctx: str | None, rec: dict | None) -> None:
+    if not rec:
+        return await msg.answer("Не знайдено.", reply_markup=kb_tasks_menu())
+    header = "✅ Графік збережено" if ctx and ctx[0] == "r" else "✅ Повторювану таску створено"
+    await msg.answer(header, reply_markup=kb_tasks_menu())
+    await msg.answer(_fmt_recurring(rec), reply_markup=ikb_recurring_card(rec))
+
+
+@router.callback_query(F.data.startswith("rcsch_open:"))
+async def rc_sched_open(cb: CallbackQuery):
+    try:
+        ctx = cb.data.split(":", 1)[1]
+        await _rc_edit(cb, "📅 *Оберіть графік повторення:*", ikb_rc_schedule(ctx))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_sched_open failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcsch_x:"))
+async def rc_sched_cancel(cb: CallbackQuery):
+    try:
+        ctx = cb.data.split(":", 1)[1]
+        kind_ctx, ref = ctx[0], ctx[1:]
+        if kind_ctx == "r":
+            rec = await _own_rec(cb, ref)
+            if not rec:
+                return
+            await _rc_edit(cb, _fmt_recurring(rec), ikb_recurring_card(rec))
+        elif kind_ctx == "t":
+            t = await tasks_db.get_task(int(ref))
+            if not t:
+                return await cb.answer("Не знайдено!", show_alert=True)
+            await _rc_edit(cb, await _fmt_task_full(t), ikb_task_actions(t["id"], t))
+        else:
+            await _rc_edit(cb, "Ок, нічого не змінено.")
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_sched_cancel failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcsch:"))
+async def rc_sched_pick(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, ctx, kind = cb.data.split(":", 2)
+        if kind in ("weekly", "biweekly", "days"):
+            await state.update_data(rc_ctx=ctx, rc_kind=kind, rc_days=[])
+            await _rc_edit(cb, "📅 Оберіть дні тижня:", ikb_rc_days([]))
+            return await cb.answer()
+        if kind == "every_n":
+            await state.set_state(RecEdit.interval)
+            await state.update_data(rc_ctx=ctx)
+            await cb.message.answer("Кожні скільки днів? Введіть число:", reply_markup=kb_cancel())
+            return await cb.answer()
+        if kind == "monthday":
+            await state.set_state(RecEdit.monthday)
+            await state.update_data(rc_ctx=ctx)
+            await cb.message.answer("Якого числа місяця? Введіть число від 1 до 31:", reply_markup=kb_cancel())
+            return await cb.answer()
+        rec = await _apply_schedule(cb.from_user.id, ctx, kind)
+        await _after_schedule(cb, ctx, rec)
+    except Exception:
+        logger.exception("rc_sched_pick failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcdw:"))
+async def rc_days_toggle(cb: CallbackQuery, state: FSMContext):
+    try:
+        fd = await state.get_data()
+        if not fd.get("rc_ctx"):
+            return await cb.answer("Сесія застаріла, почни знову.", show_alert=True)
+        n = int(cb.data.split(":")[1])
+        days = set(fd.get("rc_days") or [])
+        days ^= {n}
+        await state.update_data(rc_days=sorted(days))
+        await cb.message.edit_reply_markup(reply_markup=ikb_rc_days(days))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_days_toggle failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data == "rcdw_ok")
+async def rc_days_done(cb: CallbackQuery, state: FSMContext):
+    try:
+        fd = await state.get_data()
+        ctx, kind, days = fd.get("rc_ctx"), fd.get("rc_kind"), fd.get("rc_days") or []
+        if not ctx or not kind:
+            return await cb.answer("Сесія застаріла, почни знову.", show_alert=True)
+        if not days:
+            return await cb.answer("Оберіть хоча б один день.", show_alert=True)
+        await state.clear()
+        rec = await _apply_schedule(cb.from_user.id, ctx, kind, days=days)
+        await _after_schedule(cb, ctx, rec)
+    except Exception:
+        logger.exception("rc_days_done failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data == "rcdw_cancel")
+async def rc_days_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _rc_edit(cb, "Скасовано.")
+    await cb.answer()
+
+
+@router.message(StateFilter(RecEdit.interval))
+async def rc_interval_save(msg: Message, state: FSMContext):
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    raw = (msg.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 365:
+        return await msg.answer("⚠️ Введіть число від 1 до 365:", reply_markup=kb_cancel())
+    ctx = (await state.get_data()).get("rc_ctx")
+    await state.clear()
+    rec = await _apply_schedule(msg.from_user.id, ctx, "every_n", interval=int(raw)) if ctx else None
+    await _after_schedule_msg(msg, ctx, rec)
+
+
+@router.message(StateFilter(RecEdit.monthday))
+async def rc_monthday_save(msg: Message, state: FSMContext):
+    if is_cancel(msg.text):
+        return await _cancel(msg, state)
+    raw = (msg.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 31:
+        return await msg.answer("⚠️ Введіть число від 1 до 31:", reply_markup=kb_cancel())
+    ctx = (await state.get_data()).get("rc_ctx")
+    await state.clear()
+    rec = await _apply_schedule(msg.from_user.id, ctx, "monthday", day=int(raw)) if ctx else None
+    await _after_schedule_msg(msg, ctx, rec)
+
+
+@router.callback_query(F.data.startswith("rcsy:"))
+async def rc_sugg_yes(cb: CallbackQuery):
+    try:
+        _, sid, kind = cb.data.split(":", 2)
+        ctx = "s" + sid
+        rec = await _apply_schedule(cb.from_user.id, ctx, kind)
+        await _after_schedule(cb, ctx, rec)
+    except Exception:
+        logger.exception("rc_sugg_yes failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcsp:"))
+async def rc_sugg_pick(cb: CallbackQuery):
+    try:
+        sid = cb.data.split(":", 1)[1]
+        sug = await tasks_db.get_suggestion(sid)
+        if not sug or sug.get("uid") != cb.from_user.id or sug.get("status") == "accepted":
+            return await cb.answer("Вже оброблено або не знайдено.", show_alert=True)
+        await _rc_edit(cb, "📅 *Оберіть графік повторення:*", ikb_rc_schedule("s" + sid))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_sugg_pick failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcsn:"))
+async def rc_sugg_no(cb: CallbackQuery):
+    try:
+        sid = cb.data.split(":", 1)[1]
+        sug = await tasks_db.get_suggestion(sid)
+        if not sug or sug.get("uid") != cb.from_user.id:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        await tasks_db.update_suggestion(sid, {"status": "declined"})
+        await _rc_edit(cb, "Ок, не створюю.")
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_sugg_no failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcsx:"))
+async def rc_sugg_block(cb: CallbackQuery):
+    try:
+        sid = cb.data.split(":", 1)[1]
+        sug = await tasks_db.get_suggestion(sid)
+        if not sug or sug.get("uid") != cb.from_user.id:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        await tasks_db.update_suggestion(sid, {"status": "blocked"})
+        await _rc_edit(cb, "🔕 Більше не пропонуватиму це.")
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_sugg_block failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcskip:"))
+async def rc_skip_occurrence(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+        t = await tasks_db.get_task(tid)
+        if not t or t.get("uid") != cb.from_user.id:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        rid = t.get("recurring_task_id")
+        await tasks_db.delete_task(tid)
+        rec = await tasks_db.get_recurring(rid) if rid else None
+        text = "❌ Це виконання пропущено."
+        if rec and rec.get("next_date"):
+            text += f"\n📅 Наступне: {_pretty_date(rec['next_date'])}"
+        await _rc_edit(cb, text)
+        await cb.answer("Пропущено")
+    except Exception:
+        logger.exception("rc_skip_occurrence failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcmv:"))
+async def rc_move_menu(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+        await cb.message.edit_reply_markup(reply_markup=ikb_recurring_move(tid))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_move_menu failed")
+        await _safe_alert(cb)
+
+
+@router.callback_query(F.data.startswith("rcback:"))
+async def rc_move_back(cb: CallbackQuery):
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+        await cb.message.edit_reply_markup(reply_markup=ikb_recurring_notice(tid))
+        await cb.answer()
+    except Exception:
+        logger.exception("rc_move_back failed")
+        await _safe_alert(cb)
+
+
+def _tokens(text: str) -> set:
+    return {w[:5] for w in re.findall(r"\w+", (text or "").lower()) if len(w) > 2 and not w.isdigit()}
+
+
+def _is_similar(a: str, b: str) -> bool:
+    ta, tb = _tokens(a), _tokens(b)
+    if ta and tb and ta & tb:
+        return True
+    return difflib.SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio() >= 0.6
+
+
+def _norm_key(text: str) -> str:
+    return " ".join(sorted(_tokens(text)))
+
+
+def _recent(t: dict, days: int) -> bool:
+    try:
+        return datetime.now() - datetime.fromisoformat(t.get("created_at") or "") <= timedelta(days=days)
+    except ValueError:
+        return True
+
+
+def _already_handled(key: str, recs: list, sugs: list) -> bool:
+    for r in recs:
+        if difflib.SequenceMatcher(None, _norm_key(r.get("title", "")), key).ratio() >= 0.8:
+            return True
+    now = datetime.now()
+    for s in sugs:
+        if difflib.SequenceMatcher(None, s.get("key", ""), key).ratio() < 0.8:
+            continue
+        status = s.get("status")
+        if status in ("pending", "accepted", "blocked"):
+            return True
+        if status == "declined":
+            try:
+                if now - datetime.fromisoformat(s.get("updated_at", "")) < timedelta(days=DECLINE_COOLDOWN_DAYS):
+                    return True
+            except ValueError:
+                return True
+    return False
+
+
+async def _ai_groups(items: list[dict]) -> list[dict]:
+    lines = "\n".join(f"{i['id']}: {str(i['text'])[:120]}" for i in items)
+    prompt = (
+        "Ти аналізуєш історію задач користувача. Знайди групи задач, які описують ОДНУ Й ТУ САМУ "
+        "регулярну дію за змістом, навіть якщо формулювання, числа, відмінки чи сленг різні "
+        "(наприклад «Додати товар в Instagram», «Викласти новий товар в інсту»). "
+        "Різні за змістом дії не об'єднуй. Одноразові, випадкові та унікальні задачі не включай. "
+        "Кожна група має містити щонайменше 3 задачі.\n\n"
+        f"Задачі (id: текст):\n{lines}\n\n"
+        "Поверни ЛИШЕ JSON без пояснень:\n"
+        '{"groups": [{"task_ids": [числа], "is_recurring_candidate": true, "confidence": 0.0, '
+        '"normalized_title": "коротка узагальнена назва українською", '
+        '"suggested_frequency": "daily або weekdays або weekly або monthly"}]}'
+    )
+    data = await ai_service.generate_json(prompt, temperature=0.2)
+    groups = (data or {}).get("groups")
+    return groups if isinstance(groups, list) else []
+
+
+async def maybe_suggest_recurring(bot, uid: int, task: dict) -> None:
+    try:
+        if not ai_service.is_available():
+            return
+        state = await users_db.get_user_state(uid)
+        last = state.get("recurring_last_check")
+        if last:
+            try:
+                if datetime.now() - datetime.fromisoformat(last) < timedelta(hours=ANALYSIS_INTERVAL_HOURS):
+                    return
+            except ValueError:
+                pass
+
+        all_tasks = await tasks_db.get_user_tasks(uid)
+        history = [
+            t for t in all_tasks
+            if t.get("id") != task["id"] and not t.get("recurring_task_id")
+            and t.get("text") and _recent(t, HISTORY_DAYS)
+        ]
+        similar = [t for t in history if _is_similar(task["text"], t["text"])]
+        if len(similar) < SUGGEST_MIN_COUNT - 1:
+            return
+
+        await users_db.save_user_state(uid, {"recurring_last_check": datetime.now().isoformat()})
+
+        history.sort(key=lambda t: t.get("created_at") or "", reverse=True)
+        items = [task] + history[:60]
+        groups = await _ai_groups([{"id": t["id"], "text": t["text"]} for t in items])
+        if not groups:
+            return
+
+        by_id = {t["id"]: t for t in items}
+        recs = await tasks_db.list_recurring(uid)
+        sugs = await tasks_db.get_suggestions(uid)
+
+        for g in groups:
+            if not isinstance(g, dict) or g.get("is_recurring_candidate") is not True:
+                continue
+            try:
+                conf = float(g.get("confidence", 0))
+            except (TypeError, ValueError):
+                continue
+            ids = set()
+            for i in g.get("task_ids") or []:
+                try:
+                    ids.add(int(i))
+                except (TypeError, ValueError):
+                    pass
+            ids &= set(by_id)
+            if task["id"] not in ids or len(ids) < SUGGEST_MIN_COUNT or conf < SUGGEST_MIN_CONFIDENCE:
+                continue
+
+            title = str(g.get("normalized_title") or task["text"]).strip()[:100]
+            key = _norm_key(title)
+            if not key or _already_handled(key, recs, sugs):
+                continue
+
+            freq = g.get("suggested_frequency")
+            if freq not in FREQ_HINT:
+                freq = "daily"
+
+            group = [by_id[i] for i in ids]
+            times = Counter(
+                d.strftime("%H:%M") for d in (parse_due(t.get("due", "")) for t in group) if d
+            )
+            hhmm = times.most_common(1)[0][0] if times else "18:00"
+            cats = Counter(t.get("category") for t in group if t.get("category"))
+            labs = Counter(t.get("label") for t in group if t.get("label"))
+            now_iso = datetime.now().isoformat()
+
+            sid = await tasks_db.add_suggestion({
+                "uid": uid,
+                "key": key,
+                "title": title,
+                "frequency": freq,
+                "time": hhmm,
+                "category": cats.most_common(1)[0][0] if cats else "other",
+                "label": labs.most_common(1)[0][0] if labs else "medium",
+                "confidence": conf,
+                "task_ids": sorted(ids),
+                "status": "pending",
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            })
+            await bot.send_message(
+                uid,
+                f"🔁 Помітив, що ти регулярно виконуєш: *{_md(title)}*.\n\n"
+                f"Зробити це повторюваною таскою ({FREQ_HINT[freq]})?",
+                reply_markup=ikb_recurring_suggestion(sid),
+            )
+            break
+    except Exception:
+        logger.exception("maybe_suggest_recurring failed for uid=%s", uid)

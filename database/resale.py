@@ -1,4 +1,3 @@
-
 from datetime import datetime, timedelta
 
 from bson import ObjectId
@@ -11,6 +10,18 @@ resale_settings_col = resale_monitors_col.database["resale_user_settings"]
 
 MAX_SHOWN_PER_MONITOR = 1000
 MAX_LEARNED_KEYWORDS = 30
+
+ALL_UKRAINE_WORDS = (
+    "", "вся україна", "вся украина", "україна", "украина", "не має значення",
+    "не имеет значения", "немає", "нема", "-", "всі міста", "всі",
+)
+
+
+def normalize_location(value) -> str:
+    text = str(value or "").replace("🌎", "").strip()
+    if text.lower() in ALL_UKRAINE_WORDS:
+        return ""
+    return text
 
 
 def _oid(value):
@@ -31,13 +42,9 @@ def _empty_stats() -> dict:
     }
 
 
-# =========================================================
-# АВТОПОШУКИ
-# =========================================================
-
 async def add_monitor(uid: int, params: dict) -> str:
     now = datetime.now().isoformat()
-    location = params.get("location") or ""
+    location = normalize_location(params.get("location"))
     doc = {
         "uid": uid,
         "name": params.get("name") or params.get("category") or params.get("keywords") or "Автопошук",
@@ -50,12 +57,12 @@ async def add_monitor(uid: int, params: dict) -> str:
         "min_margin_percent": params.get("min_margin_percent"),
         "location": location,
         "radius_km": 100 if location else 0,
-        "condition": params.get("condition"),  # "used" | "new" | None
+        "condition": params.get("condition"),
         "extra_keywords": params.get("extra_keywords") or "",
         "exclude_words": params.get("exclude_words") or "",
         "domain": "olx.ua",
         "status": "active",
-        "shown": [],  # [{"url", "price", "at"}] — вже показані оголошення
+        "shown": [],
         "liked_keywords": [],
         "disliked_keywords": [],
         "blocked_similar": [],
@@ -74,6 +81,7 @@ async def update_monitor(monitor_id, uid: int, fields: dict) -> bool:
         return False
     fields = dict(fields)
     if "location" in fields:
+        fields["location"] = normalize_location(fields["location"])
         fields["radius_km"] = 100 if fields["location"] else 0
     result = await db_call(
         resale_monitors_col.update_one({"_id": oid, "uid": uid}, {"$set": fields})
@@ -151,7 +159,6 @@ async def increment_stat(monitor_id, field: str, amount: float = 1):
 
 
 def shown_map(monitor: dict) -> dict:
-    """url -> ціна на момент показу (None для старих записів 'seen')."""
     result: dict = {}
     for e in monitor.get("seen") or []:
         if e.get("url"):
@@ -163,7 +170,6 @@ def shown_map(monitor: dict) -> dict:
 
 
 async def mark_shown(monitor_id, items: list[dict]):
-    """Захист від повторів: запам'ятовує URL + ціну показаних оголошень."""
     oid = _oid(monitor_id)
     if oid is None or not items:
         return
@@ -194,7 +200,6 @@ async def mark_shown(monitor_id, items: list[dict]):
 
 
 async def add_learned_keyword(monitor_id, keyword: str, positive: bool):
-    """🎯 AI навчається на виборі користувача (⭐ Зберегти / ❌ Не цікавить)."""
     keyword = (keyword or "").strip().lower()
     if not keyword:
         return
@@ -213,7 +218,6 @@ async def add_learned_keyword(monitor_id, keyword: str, positive: bool):
 
 
 async def add_blocked_similar(monitor_id, keyword: str):
-    """🔕 Не шукати подібне — повне виключення товару з цього автопошуку."""
     keyword = (keyword or "").strip().lower()
     if not keyword:
         return
@@ -228,10 +232,6 @@ async def add_blocked_similar(monitor_id, keyword: str):
         raise_on_fail=False,
     )
 
-
-# =========================================================
-# КАНДИДАТИ (результати денного / вечірнього пошуку)
-# =========================================================
 
 async def upsert_candidate(monitor_id, uid: int, url: str, fields: dict):
     now = datetime.now().isoformat()
@@ -251,15 +251,6 @@ async def upsert_candidate(monitor_id, uid: int, url: str, fields: dict):
 
 
 async def get_known_candidates(monitor_id) -> dict:
-    """url -> {status, price, updated_at} усіх відомих кандидатів автопошуку.
-
-    НОВЕ: додано updated_at у проекцію — потрібно для _scan()
-    (services/resale_service.py), щоб оголошення, позначені колись
-    rejected/dismissed/gone, не блокувались НАЗАВЖДИ, якщо минуло вже
-    багато днів (RESALE_STALE_RECONSIDER_DAYS) — інакше автопошук міг
-    "застрягти" на 0 результатах навіть після виправлення інших багів,
-    просто тому що всі оголошення вже колись помилково відхилені.
-    """
     cursor = resale_candidates_col.find(
         {"monitor_id": str(monitor_id)}, {"url": 1, "status": 1, "price": 1, "updated_at": 1}
     )
@@ -298,7 +289,14 @@ async def get_active_candidates(monitor_id, cutoff_iso: str, limit: int = 30) ->
 
 
 async def get_report_candidates(monitor_id, cutoff_iso: str, limit: int) -> list[dict]:
-    return await get_active_candidates(monitor_id, cutoff_iso, limit)
+    cursor = (
+        resale_candidates_col.find(
+            {"monitor_id": str(monitor_id), "status": "new", "found_at": {"$gte": cutoff_iso}}
+        )
+        .sort([("profit", -1), ("below_market", -1), ("margin", -1), ("score", -1)])
+        .limit(limit)
+    )
+    return await db_call(cursor.to_list(length=limit), raise_on_fail=False) or []
 
 
 async def day_stats(monitor_id, day: str) -> dict:
@@ -332,10 +330,6 @@ async def cleanup_candidates(days: int = 14):
     await db_call(resale_candidates_col.delete_many({"day": {"$lt": cutoff}}), raise_on_fail=False)
 
 
-# =========================================================
-# НАЛАШТУВАННЯ КОРИСТУВАЧА (витрати для розрахунку прибутку)
-# =========================================================
-
 def _default_user_settings() -> dict:
     return {
         "delivery_cost": float(getattr(cfg, "RESALE_DELIVERY_COST", 80)),
@@ -361,10 +355,6 @@ async def set_user_setting(uid: int, key: str, value: float):
         raise_on_fail=False,
     )
 
-
-# =========================================================
-# ЗБЕРЕЖЕНІ МОЖЛИВОСТІ
-# =========================================================
 
 async def save_opportunity(uid: int, monitor_id, opp: dict) -> str:
     listing = opp.get("listing") or {}

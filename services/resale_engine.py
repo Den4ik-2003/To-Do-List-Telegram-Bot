@@ -1,50 +1,34 @@
-"""
-AI Resale Hunter — ядро аналізу оголошень OLX для перепродажу.
-
-Тут навмисно винесено ВСЮ логіку побудови промптів, форматування відповіді
-та калькуляції — окремо від aiogram-хендлерів (handlers/olx.py), щоб:
-  1) хендлер відповідав тільки за UX/keyboard/FSM;
-  2) цю логіку було легко покрити тестами;
-  3) додавання нового майданчика (FB Marketplace, Prom, Allegro) не
-     вимагало переписувати аналіз — досить дати сюди ту саму структуру
-     листингу (title/price/description/photos/params).
-"""
-
 import logging
 
 from services import ai_service
 
 logger = logging.getLogger("tasks_bot")
 
-DEFAULT_MARGIN_PERCENT = 20  # типова маржа перекупника, якщо користувач не задав свою
+DEFAULT_MARGIN_PERCENT = 20
 
 
-# =========================================================
-# 1. Побудова промпту для повного resale-аналізу
-# =========================================================
-
-def build_analysis_prompt(listing: dict, min_margin_percent: float | None = None) -> str:
-    """
-    listing: {
-      "source": "olx.ua" | "olx.pl" | ...,   # для майбутньої мультиплатформності
-      "id"/"url": унікальний ідентифікатор — ОБОВ'ЯЗКОВО в промпті,
-      "title", "price", "currency", "description", "location_text",
-      "views", "photos" (list[url]), "photos_count", "params" (list[str]),
-    }
-    """
+def build_analysis_prompt(listing: dict, min_margin_percent: float | None = None, ignore_location: bool = False) -> str:
     margin = min_margin_percent if min_margin_percent is not None else DEFAULT_MARGIN_PERCENT
     params_text = "\n".join(f"- {p}" for p in (listing.get("params") or [])) or "(не вказані окремо)"
     description = (listing.get("description") or "(опис відсутній)")[:1500]
     photos = listing.get("photos") or []
     photos_total = listing.get("photos_count") if listing.get("photos_count") is not None else len(photos)
 
-    # Фікс "однакових відповідей": явно вбиваємо в промпт унікальний ID/URL
-    # оголошення і вимагаємо базуватись ТІЛЬКИ на наданих нижче даних.
+    if ignore_location:
+        location_rule = (
+            "\nМісто продавця, відстань і близькість до покупця НЕ повинні впливати на оцінку: "
+            "покупка відбувається з доставкою, тому товар з будь-якого міста України оцінюється однаково.\n"
+        )
+        location_line = ""
+    else:
+        location_rule = ""
+        location_line = f"Локація: {listing.get('location_text') or 'не вказано'}\n"
+
     return f"""Ти — досвідчений перекупник, який оцінює КОНКРЕТНЕ оголошення на OLX
 перед покупкою для перепродажу. Аналізуй ЛИШЕ дані нижче, для цього
 конкретного оголошення (ID/URL: {listing.get('url') or listing.get('id')}).
 Не використовуй жодні висновки з інших оголошень.
-
+{location_rule}
 Тобі надано {len(photos)} фото з {photos_total} наявних у оголошенні —
 проаналізуй їх ВСІ РАЗОМ як єдиний товар: перевір, чи це справді один і
 той самий предмет на всіх фото, визнач стан, дефекти, комплектацію,
@@ -107,8 +91,7 @@ def build_analysis_prompt(listing: dict, min_margin_percent: float | None = None
 Джерело: {listing.get('source', 'olx.ua')}
 Назва: {listing.get('title') or '(без назви)'}
 Ціна продавця: {listing.get('price')} {listing.get('currency', 'UAH')}
-Локація: {listing.get('location_text') or 'не вказано'}
-Переглядів: {listing.get('views') if listing.get('views') is not None else 'невідомо'}
+{location_line}Переглядів: {listing.get('views') if listing.get('views') is not None else 'невідомо'}
 Фото в оголошенні: {photos_total} (передано на аналіз: {len(photos)})
 Характеристики:
 {params_text}
@@ -123,9 +106,8 @@ async def _call_ai_json(prompt: str, images: list[str] | None, temperature: floa
     return await ai_service.generate_json(prompt, temperature=temperature, images=images)
 
 
-async def analyze_listing(listing: dict, min_margin_percent: float | None = None) -> dict | None:
-    """Головна точка входу: повний AI resale-аналіз одного оголошення."""
-    prompt = build_analysis_prompt(listing, min_margin_percent)
+async def analyze_listing(listing: dict, min_margin_percent: float | None = None, ignore_location: bool = False) -> dict | None:
+    prompt = build_analysis_prompt(listing, min_margin_percent, ignore_location)
     photos = listing.get("photos") or []
     result = await _call_ai_json(prompt, images=photos or None, temperature=0.4)
     if not result:
@@ -141,10 +123,6 @@ async def analyze_listing(listing: dict, min_margin_percent: float | None = None
     result["photos_total"] = listing.get("photos_count") or len(photos)
     return result
 
-
-# =========================================================
-# 2. Форматування результату для Telegram
-# =========================================================
 
 _VERDICT_EMOJI = {"купувати": "🟢", "розглянути": "🟡", "не варто": "🔴"}
 _RISK_EMOJI = {"низький": "🟢", "середній": "🟡", "високий": "🔴"}
@@ -238,10 +216,6 @@ def format_analysis(listing: dict, a: dict, cached: bool = False) -> str:
     return "\n".join(lines)
 
 
-# =========================================================
-# 3. Генерація повідомлень продавцю (3 стратегії торгу)
-# =========================================================
-
 _NEGOTIATION_STYLES = {
     "soft": "М'який торг — невелика знижка, максимальний шанс домовитись.",
     "optimal": "Оптимальний торг — баланс між знижкою і шансом на згоду продавця.",
@@ -291,10 +265,6 @@ def format_negotiation_messages(messages: dict) -> str:
     return "\n".join(lines).strip()
 
 
-# =========================================================
-# 4. Калькулятор перепродажу
-# =========================================================
-
 def calculate_resale(
     buy_price: float,
     delivery: float = 0.0,
@@ -303,11 +273,6 @@ def calculate_resale(
     sell_price: float | None = None,
     target_margin_percent: float | None = None,
 ) -> dict:
-    """
-    Незалежний від AI детермінований розрахунок — навмисно НЕ через LLM,
-    щоб цифри були точні й відтворювані (AI лишається для оцінки ринкової
-    ціни, а не для арифметики).
-    """
     cost_base = buy_price + delivery + repair
     commission = (sell_price or 0) * commission_percent / 100 if sell_price else 0
     total_cost = cost_base + commission
@@ -356,16 +321,7 @@ def format_calculation(calc: dict, currency: str = "UAH") -> str:
     return "\n".join(lines)
 
 
-# =========================================================
-# 5. ДОДАНО: AI-генерація оголошення на перепродаж (п.16 ТЗ)
-# =========================================================
-
 def build_listing_generation_prompt(listing: dict, analysis: dict, target_sell_price: float | None = None) -> str:
-    """
-    Використовує дані попереднього resale-аналізу (без вигадування нових
-    характеристик) — щоб оголошення на перепродаж чесно відображало
-    реальний стан і дефекти купленого товару.
-    """
     condition = analysis.get("item_condition") or "не вказано"
     defects = "; ".join(analysis.get("defects") or []) or "не виявлено"
     brand = analysis.get("item_brand") or ""
@@ -444,19 +400,10 @@ def format_resale_listing(data: dict, currency: str = "UAH") -> str:
     return "\n".join(lines)
 
 
-# =========================================================
-# 6. ДОДАНО: TOP DEALS — порівняння вже проаналізованих оголошень (п.14 ТЗ)
-# =========================================================
-
 _MEDALS = ["🥇", "🥈", "🥉"]
 
 
 def rank_top_deals(trackers: list[dict], limit: int = 3) -> list[dict]:
-    """
-    trackers: документи з database.olx (тип listing, з заповненим
-    resale_analysis). Рейтинг детермінований (за resale_score, який уже
-    враховує прибуток/ROI/ліквідність/ризик) — без додаткового AI-запиту.
-    """
     scored = []
     for t in trackers:
         a = t.get("resale_analysis")
@@ -494,20 +441,10 @@ def format_top_deals(ranked: list[dict], currency: str = "UAH") -> str:
     return "\n".join(lines).strip()
 
 
-# =========================================================
-# 7. ДОДАНО: рекомендації в межах бюджету (п.15 ТЗ)
-# =========================================================
-
 _RISK_PENALTY = {"низький": 0, "середній": 10, "високий": 25}
 
 
 def recommend_purchases_within_budget(trackers: list[dict], budget: float) -> list[dict]:
-    """
-    Детермінований (без AI) відбір: серед відстежуваних оголошень
-    (status=watching) з наявним resale_analysis обирає ті, що влазять у
-    бюджет, сортуючи за resale_score, скоригованим на рівень ризику — а
-    НЕ просто за найбільшим ROI, як прямо вимагає п.15 ТЗ.
-    """
     candidates = []
     for t in trackers:
         if t.get("status") != "watching":

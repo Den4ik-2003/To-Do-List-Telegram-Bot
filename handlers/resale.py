@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 from datetime import datetime
@@ -32,10 +31,17 @@ _CONDITION_KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+_CITY_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🌎 Вся Україна")],
+        [KeyboardButton(text="Не має значення")],
+        [KeyboardButton(text=CANCEL_TEXT)],
+    ],
+    resize_keyboard=True,
+)
 _CONDITION_MAP = {"новий": "new", "вживаний": "used", "будь-який": None}
 _CONDITION_LABEL = {"new": "новий", "used": "вживаний", None: "будь-який"}
 
-# (ключ, питання, тип: text_req | text | num | cond)
 _STEPS = [
     ("name", "🏷 Назва автопошуку (напр. `Кросівки Nike`):", "text_req"),
     ("keywords", "🔑 Ключові слова для пошуку на OLX (напр. `nike air max`), або «немає»:", "text"),
@@ -45,7 +51,7 @@ _STEPS = [
     ("min_resale_price", "🔄 Бажана мінімальна ціна перепродажу (грн), або «немає»:", "num"),
     ("min_profit", "💵 Мінімальний очікуваний прибуток (грн), або «немає»:", "num"),
     ("min_margin_percent", "📈 Мінімальна маржа у %, або «немає»:", "num"),
-    ("location", "📍 Місто / область, або «немає» — вся Україна:", "text"),
+    ("location", "📍 Місто (необов'язково). Купівля з доставкою, тому за замовчуванням шукаю по всій Україні. Обери «🌎 Вся Україна» або введи конкретне місто:", "city"),
     ("condition", "🏷 Стан товару:", "cond"),
     ("extra_keywords", "➕ Додаткові ключові слова (бажані в назві/описі, через кому), або «немає»:", "text"),
     ("exclude_words", "🚫 Слова-виключення (через кому, напр. `чохол, запчастини`), або «немає»:", "text"),
@@ -102,10 +108,6 @@ def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-# =========================================================
-# КЛАВІАТУРИ
-# =========================================================
-
 def _ikb_resale_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Створити автопошук", callback_data="rsm_new")],
@@ -129,8 +131,6 @@ def _ikb_monitor(m: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
         [InlineKeyboardButton(text="🔍 Знайти зараз", callback_data=f"rsm_run:{mid}"),
          InlineKeyboardButton(text="📊 Статистика", callback_data=f"rsm_mstats:{mid}")],
-        # НОВЕ (п.33 ТЗ): дебаг-команда — показує розбивку причин відсіву
-        # останнього запуску без потреби лізти в логи сервера.
         [InlineKeyboardButton(text="🐞 Діагностика", callback_data=f"rsm_debug:{mid}")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"rsm_del:{mid}")],
     ])
@@ -179,10 +179,6 @@ async def _own_monitor(mid: str, uid: int) -> dict | None:
     return monitor
 
 
-# =========================================================
-# ВХІД
-# =========================================================
-
 @router.message(F.text.in_(["🔎 Знайти перепродаж", "📈 Статистика перепродажу"]))
 async def resale_menu(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
@@ -193,15 +189,12 @@ async def resale_menu(msg: Message, state: FSMContext):
     await msg.answer(
         "🔎 *Знайти перепродаж — AI-автопошуки OLX*\n\n"
         "Створи автопошуки, і я сам шукатиму товари, які вигідно купити та перепродати.\n"
+        "🌎 Пошук іде по всій Україні: місто продавця не впливає ні на пошук, ні на оцінку, ні на рейтинг (купівля з доставкою).\n"
         f"🕒 Кожен автопошук працює двічі на добу: збір ~{mh:02d}:{mm:02d}, звіт ~{eh:02d}:{em:02d}.\n"
         "📌 Я показую мало, але реально цікаві варіанти: до 3 на кожен автопошук.",
         reply_markup=_ikb_resale_menu(),
     )
 
-
-# =========================================================
-# МАЙСТЕР СТВОРЕННЯ / РЕДАГУВАННЯ
-# =========================================================
 
 async def _ask(msg: Message, state: FSMContext, idx: int):
     key, prompt, kind = _STEPS[idx]
@@ -209,10 +202,20 @@ async def _ask(msg: Message, state: FSMContext, idx: int):
     orig = fd.get("orig") or {}
     hint = ""
     if key in orig:
-        cur = _CONDITION_LABEL.get(orig[key]) if kind == "cond" else _show(orig[key])
+        if kind == "cond":
+            cur = _CONDITION_LABEL.get(orig[key])
+        elif kind == "city":
+            cur = orig[key] or "🌎 Вся Україна"
+        else:
+            cur = _show(orig[key])
         hint = f"\n_Зараз: {esc(cur)}. Введи «=», щоб лишити._"
     await state.update_data(idx=idx)
-    kb = _CONDITION_KB if kind == "cond" else kb_cancel()
+    if kind == "cond":
+        kb = _CONDITION_KB
+    elif kind == "city":
+        kb = _CITY_KB
+    else:
+        kb = kb_cancel()
     await msg.answer(f"*Крок {idx + 1}/{len(_STEPS)}*\n{prompt}{hint}", reply_markup=kb)
 
 
@@ -234,6 +237,7 @@ async def resale_edit_cb(cb: CallbackQuery, state: FSMContext):
         return await cb.message.answer("⚠️ Автопошук не знайдено.")
     orig = {key: monitor.get(key) for key, _, _ in _STEPS}
     orig["name"] = orig.get("name") or monitor.get("category")
+    orig["location"] = resale_db.normalize_location(monitor.get("location"))
     await state.clear()
     await state.set_state(ResaleMonitor.step)
     await state.update_data(idx=0, values={}, edit_id=mid, orig=orig)
@@ -264,6 +268,8 @@ async def rm_step(msg: Message, state: FSMContext):
         if low not in _CONDITION_MAP:
             return await msg.answer("⚠️ Обери варіант на клавіатурі:", reply_markup=_CONDITION_KB)
         value = _CONDITION_MAP[low]
+    elif kind == "city":
+        value = resale_db.normalize_location(text)
     elif kind == "text_req":
         if not text or text.lower() in NONE_WORDS:
             return await msg.answer("⚠️ Назва обов'язкова. Введи назву автопошуку:")
@@ -285,6 +291,7 @@ async def _finish(msg: Message, state: FSMContext, values: dict, edit_id: str | 
     await state.clear()
     if not (values.get("keywords") or values.get("category")):
         values["keywords"] = values.get("name") or ""
+    values["location"] = resale_db.normalize_location(values.get("location"))
 
     if edit_id:
         await resale_db.update_monitor(edit_id, uid, values)
@@ -293,8 +300,10 @@ async def _finish(msg: Message, state: FSMContext, values: dict, edit_id: str | 
         monitor_id, verb = await resale_db.add_monitor(uid, values), "створено"
 
     (_, _), (eh, em) = resale_service.schedule_times()
+    place = values["location"] or "🌎 Вся Україна"
     await msg.answer(
         f"✅ Автопошук «{esc(values.get('name'))}» {verb}!\n"
+        f"📍 Пошук: {esc(place)}\n"
         f"🕒 Далі він працює автоматично двічі на добу, звіт приходить ~{eh:02d}:{em:02d}.\n"
         "⏳ Запускаю перший збір у фоні, скажу, коли він завершиться.",
         reply_markup=kb_main(),
@@ -320,10 +329,6 @@ async def _first_collect(bot, monitor: dict):
     finally:
         resale_service.release(mid)
 
-
-# =========================================================
-# КЕРУВАННЯ АВТОПОШУКАМИ
-# =========================================================
 
 @router.callback_query(F.data == "rsm_list")
 async def resale_list_cb(cb: CallbackQuery):
@@ -411,8 +416,6 @@ async def resale_monitor_stats_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rsm_debug:"))
 async def resale_debug_cb(cb: CallbackQuery):
-    """НОВЕ (п.33 ТЗ): показує розбивку причин відсіву останнього запуску
-    без потреби лізти в серверні логи."""
     mid = cb.data.split(":", 1)[1]
     monitor = await _own_monitor(mid, cb.from_user.id)
     await cb.answer()
@@ -463,10 +466,6 @@ async def _run_now(bot, monitor: dict):
         resale_service.release(mid)
 
 
-# =========================================================
-# НАЛАШТУВАННЯ (витрати для розрахунку прибутку)
-# =========================================================
-
 async def _settings_text(uid: int) -> str:
     us = await resale_db.get_user_settings(uid)
     lines = ["⚙️ *Налаштування розрахунку прибутку*", "",
@@ -511,10 +510,6 @@ async def resale_setting_value(msg: Message, state: FSMContext):
     await msg.answer(await _settings_text(msg.from_user.id), reply_markup=_ikb_settings())
 
 
-# =========================================================
-# ІСТОРІЯ РЕЗУЛЬТАТІВ
-# =========================================================
-
 @router.callback_query(F.data == "rsm_history")
 async def resale_history_cb(cb: CallbackQuery):
     await cb.answer()
@@ -535,10 +530,6 @@ async def resale_history_cb(cb: CallbackQuery):
         )
     await cb.message.answer("\n".join(lines))
 
-
-# =========================================================
-# ЗБЕРЕЖЕНІ МОЖЛИВОСТІ
-# =========================================================
 
 async def _show_saved(target, uid: int):
     saved = await resale_db.get_saved(uid)
@@ -593,10 +584,6 @@ async def resale_saved_delete_cb(cb: CallbackQuery):
             pass
 
 
-# =========================================================
-# СТАТИСТИКА
-# =========================================================
-
 async def _show_stats(target: Message):
     uid = target.from_user.id
     monitors = await resale_db.get_user_monitors(uid)
@@ -612,11 +599,6 @@ async def resale_stats_cb(cb: CallbackQuery):
     saved = await resale_db.get_saved(uid)
     await cb.message.answer(resale_service.build_statistics_text(monitors, saved))
 
-
-# =========================================================
-# КНОПКИ ПІД ЗВІТОМ (працюють через id кандидата в БД, тому
-# не "протухають" після перезапуску бота)
-# =========================================================
 
 async def _own_candidate(cid: str, uid: int) -> dict | None:
     c = await resale_db.get_candidate(cid)

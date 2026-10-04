@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -35,7 +35,7 @@ from services.insights_service import detect_stalled_goal, generate_insight_text
 from utils.dates import parse_due
 from utils.formatting import build_daily_summary_text
 from keyboards.ai import ikb_insight_actions
-from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions
+from keyboards.tasks import ikb_rollover_actions, ikb_reminder_actions, ikb_recurring_notice
 from keyboards.settings import ikb_archive_clear
 from keyboards.shop_threads import ikb_threads_ask
 from keyboards.task_cleaner import ikb_cleaner_actions
@@ -85,10 +85,13 @@ async def reminder_task(bot: Bot):
                 due = parse_due(t.get("due", ""))
                 if not due:
                     continue
-                if due > now and due - now <= timedelta(minutes=REMINDER_BEFORE_MINUTES):
+                lead = t.get("reminder_minutes")
+                if lead is None:
+                    lead = REMINDER_BEFORE_MINUTES
+                if due > now and due - now <= timedelta(minutes=lead):
                     text = (
                         f"⏰ *Нагадування!*\n\n"
-                        f"Через {REMINDER_BEFORE_MINUTES} хв: *{t.get('text','')}*\n"
+                        f"Через {lead} хв: *{t.get('text','')}*\n"
                         f"{LABELS.get(t.get('label','idea'),{}).get('emoji','')} "
                         f"{LABELS.get(t.get('label','idea'),{}).get('name','')}\n"
                         f"🕐 {t.get('due','')}"
@@ -415,6 +418,32 @@ async def evening_plan_task(bot: Bot):
             logger.exception("evening_plan_task outer loop failed")
 
 
+async def recurring_tasks_task(bot: Bot):
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            due_list = await tasks_db.get_due_recurring(now_utc)
+            for rec in due_list:
+                try:
+                    task = await tasks_db.generate_occurrence(rec)
+                    if not task:
+                        continue
+                    text = (
+                        f"🔁 *Нова повторювана таска*\n\n"
+                        f"📌 {task['text']}\n"
+                        f"📅 Сьогодні\n"
+                        f"⏰ {task['due'][-5:]}"
+                    )
+                    await notification_service.safe_send(
+                        bot, rec["uid"], text, reply_markup=ikb_recurring_notice(task["id"])
+                    )
+                except Exception:
+                    logger.exception("recurring generation failed for %s", rec.get("_id"))
+        except Exception:
+            logger.exception("recurring_tasks_task loop failed")
+        await asyncio.sleep(30)
+
+
 def register_scheduler_jobs(bot: Bot):
     _spawn(reminder_task(bot), "reminder_task")
     _spawn(midnight_rollover_task(bot), "midnight_rollover_task")
@@ -425,4 +454,5 @@ def register_scheduler_jobs(bot: Bot):
     _spawn(thread_ideas_morning_task(bot), "thread_ideas_morning_task")
     _spawn(ai_cleaner_task(bot), "ai_cleaner_task")
     _spawn(evening_plan_task(bot), "evening_plan_task")
+    _spawn(recurring_tasks_task(bot), "recurring_tasks_task")
     logger.info("Зареєстровано %d фонових задач планувальника, посилання збережено (захист від GC)", len(_background_tasks))

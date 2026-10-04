@@ -61,6 +61,9 @@ orders_col = None
 
 templates_col = None
 
+recurring_tasks_col = None
+recurring_suggestions_col = None
+
 
 async def init_mongo(mongo_uri: str):
     global mongo_client, db, tasks_col, users_col, auth_col, counters_col
@@ -81,6 +84,7 @@ async def init_mongo(mongo_uri: str):
     global websites_col
     global orders_col
     global templates_col
+    global recurring_tasks_col, recurring_suggestions_col
 
     mongo_client = AsyncIOMotorClient(
         mongo_uri,
@@ -150,6 +154,9 @@ async def init_mongo(mongo_uri: str):
 
     templates_col = db["website_templates"]
 
+    recurring_tasks_col = db["recurring_tasks"]
+    recurring_suggestions_col = db["recurring_suggestions"]
+
     await ping()
     await _ensure_shop_indexes()
     await _ensure_github_indexes()
@@ -157,6 +164,7 @@ async def init_mongo(mongo_uri: str):
     await _ensure_websites_indexes()
     await _ensure_orders_indexes()
     await _ensure_templates_indexes()
+    await _ensure_recurring_indexes()
     return db
 
 
@@ -212,6 +220,23 @@ async def _ensure_templates_indexes():
         await templates_col.create_index([("uid", 1), ("updatedAt", -1)], name="uid_updated_idx")
     except Exception:
         logger.exception("Failed to ensure templates indexes")
+
+
+async def _ensure_recurring_indexes():
+    try:
+        await tasks_col.create_index(
+            [("recurring_task_id", 1), ("occurrence_date", 1)],
+            unique=True,
+            name="uniq_recurring_occurrence",
+            partialFilterExpression={"recurring_task_id": {"$type": "string"}},
+        )
+        await recurring_tasks_col.create_index(
+            [("active", 1), ("paused", 1), ("next_run_at", 1)], name="due_scan_idx"
+        )
+        await recurring_tasks_col.create_index([("uid", 1), ("created_at", 1)], name="uid_created_idx")
+        await recurring_suggestions_col.create_index([("uid", 1), ("key", 1)], name="uid_key_idx")
+    except Exception:
+        logger.exception("Failed to ensure recurring indexes")
 
 
 async def close_mongo() -> None:

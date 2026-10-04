@@ -13,3 +13,4 @@ curl_cffi
 apscheduler
 cryptography
 beautifulsoup4
+tzdata
