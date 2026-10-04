@@ -1,21 +1,4 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: database/jobs.py
 
-Додано відносно попередньої версії (для фічі "🌙 Автопошук вакансій"):
-- add_search_watch(): новий опціональний параметр title — людська назва
-  автопошуку (напр. "Frontend Developer", "Робота в Польщі"). Старі
-  виклики add_search_watch(uid, criteria, seen_ids) без title і далі
-  працюють ІДЕНТИЧНО — title просто буде None, і хендлер показує
-  criteria.profession як запасний варіант назви.
-- get_watch(): отримати один автопошук за id (опціонально з перевіркою
-  власника).
-- append_pending_digest() / get_and_clear_pending_digest(): накопичення
-  знайдених за день вакансій прямо в документі автопошуку — обідній
-  прогін лише додає туди знахідки, вечірній дістає й ОЧИЩАЄ (атомарно),
-  щоб сформувати єдиний вечірній підсумок без повторів.
-
-Решта функцій — без змін.
-"""
 
 from datetime import datetime
 from collections import Counter
@@ -184,9 +167,6 @@ async def mark_applied(uid: int, vacancy: dict) -> None:
         await save_vacancy(uid, vacancy, status="applied")
 
 
-# =========================================================
-# НОВЕ: 🌙 Автопошук — накопичення знахідок для вечірнього дайджесту
-# =========================================================
 
 _PENDING_DIGEST_CAP = 20
 _PENDING_DIGEST_FIELDS = (

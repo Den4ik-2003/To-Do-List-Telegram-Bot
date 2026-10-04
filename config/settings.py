@@ -122,24 +122,10 @@ RESALE_PACKING_COST = 20
 RESALE_COMMISSION_PERCENT = 0
 RESALE_MIN_CANDIDATE_SCORE = 30
 
-# =========================================================
-# НОВЕ: переробка модуля "Пошук перепродажу через OLX"
-# (виправлення бага "129 знайдено -> 0 відібрано" + видимість pipeline)
-# =========================================================
-
-# Чи вмикати детальне діагностичне логування парсера ціни OLX API
-# (лог OLX_API_PRICE_SCHEMA_UNRECOGNIZED, коли структуру ціни не розпізнано).
 RESALE_DEBUG_LOGGING = os.environ.get("RESALE_DEBUG_LOGGING", "true").strip().lower() == "true"
 
-# п.38 ТЗ: якщо за основними критеріями 0 можливостей, пробуємо ті самі вже
-# проаналізовані (БЕЗ повторних AI-запитів) оголошення з послабленими
-# min_profit/min_margin і чесно позначаємо їх як "relaxed" в звіті.
 RESALE_RELAXED_FALLBACK_ENABLED = os.environ.get("RESALE_RELAXED_FALLBACK_ENABLED", "true").strip().lower() == "true"
 RESALE_RELAXED_MARGIN_DROP_PERCENT = float(os.environ.get("RESALE_RELAXED_MARGIN_DROP_PERCENT", "5"))
 RESALE_RELAXED_PROFIT_DROP_PERCENT = float(os.environ.get("RESALE_RELAXED_PROFIT_DROP_PERCENT", "30"))
 
-# Через скільки днів дозволяти повторний розгляд оголошення, яке вже було
-# позначене rejected/dismissed/gone — щоб автопошук не "застрягав" на 0
-# назавжди, якщо ціна не змінюється, а критерії відсіву колись були
-# завищені/помилкові.
 RESALE_STALE_RECONSIDER_DAYS = int(os.environ.get("RESALE_STALE_RECONSIDER_DAYS", "30"))

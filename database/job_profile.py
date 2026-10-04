@@ -1,24 +1,4 @@
-"""
-ЗМІНЕНИЙ ФАЙЛ: database/job_profile.py
 
-НОВЕ (розширений профіль + фільтр збігу):
-- PROFILE_FIELDS / PROFILE_LABELS — єдине місце, де описано ВСІ поля
-  профілю та їхній порядок (handlers/job_profile.py будує з цього майстер
-  заповнення). Додано нові поля: level, projects, certifications,
-  relocation, industries, dealbreakers, available_from.
-- skipped_fields — поля, на які користувач відповів «-» (свідомо порожні),
-  щоб бот не питав їх знову у режимі «Доповнити порожні».
-- get_profile_status() — скільки полів заповнено, який відсоток і чого
-  не вистачає.
-- format_profile_for_ai() — готовий текст профілю (усі непорожні поля з
-  підписами) для промпту оцінки збігу вакансій. Якщо
-  services/jobs_service.py збирає промпт із фіксованого списку полів —
-  підключи цю функцію, тоді AI побачить і нові поля.
-- should_send_profile_hint() / mark_profile_hint_sent() — не частіше ніж
-  раз на PROFILE_HINT_EVERY_DAYS днів нагадати про неповний профіль.
-
-Попередні функції (digest_seen_ids, digest_enabled тощо) — без змін.
-"""
 
 from datetime import datetime, timedelta
 
@@ -26,7 +6,6 @@ from database.mongo import job_profiles_col, db_call
 
 DIGEST_SEEN_LIMIT = 500
 
-# Порядок = порядок питань у майстрі заповнення.
 PROFILE_FIELDS = (
     "profession",
     "level",
@@ -111,10 +90,6 @@ async def has_profile(uid: int) -> bool:
     return bool(doc and doc.get("profession"))
 
 
-# =========================================================
-# НОВЕ: повнота профілю
-# =========================================================
-
 def get_profile_status(profile: dict | None) -> dict:
     """Поле вважається «готовим», якщо воно заповнене АБО користувач
     свідомо пропустив його через «-» (skipped_fields).
@@ -175,10 +150,6 @@ async def mark_profile_hint_sent(uid: int) -> None:
     )
 
 
-# =========================================================
-# 🌙 Вечірній підбір вакансій за профілем
-# =========================================================
-
 async def get_digest_seen_ids(uid: int) -> set[str]:
     doc = await get_profile(uid)
     return set((doc or {}).get("digest_seen_ids") or [])
@@ -189,7 +160,6 @@ async def add_digest_seen_ids(uid: int, new_ids: list[str]) -> None:
         return
     existing = await get_digest_seen_ids(uid)
     existing.update(new_ids)
-    # тримаємо лише останні DIGEST_SEEN_LIMIT, щоб документ не ріс безмежно
     trimmed = list(existing)[-DIGEST_SEEN_LIMIT:]
     await db_call(
         job_profiles_col.update_one({"uid": uid}, {"$set": {"digest_seen_ids": trimmed}}, upsert=True),
@@ -199,8 +169,7 @@ async def add_digest_seen_ids(uid: int, new_ids: list[str]) -> None:
 
 async def is_digest_enabled(uid: int) -> bool:
     doc = await get_profile(uid)
-    # за замовчуванням увімкнено — якщо профіль заповнений, юзер явно
-    # зацікавлений у підборі вакансій
+  
     return bool((doc or {}).get("digest_enabled", True))
 
 

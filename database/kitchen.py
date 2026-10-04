@@ -1,40 +1,4 @@
-"""
-НОВИЙ ФАЙЛ: database/kitchen.py
 
-Шар роботи з БД для фічі 🍳 Кухня. Раніше цього файлу не існувало взагалі —
-звідси AttributeError: module 'database.kitchen' has no attribute
-'add_history' (і, ймовірно, впав би так само на будь-якій іншій функції
-з handlers/kitchen.py, якби добрався до неї раніше).
-
-Реалізує РІВНО ті функції, які викликає handlers/kitchen.py:
-  add_history, get_history, get_history_item,
-  is_favorite, add_favorite, remove_favorite_by_title, remove_favorite,
-  get_favorites, get_favorite,
-  add_shopping_items, get_shopping_items, toggle_shopping_item,
-  clear_checked_shopping_items,
-  save_cooking_session, clear_cooking_session, get_cooking_session
-
-Використовує вже наявні колекції з database/mongo.py:
-  recipe_history_col, favorite_recipes_col, shopping_items_col, cooking_sessions_col
-і той самий db_call()/DBUnavailable() підхід, що й у database/olx.py —
-щоб помилки MongoDB прокидались нагору так само, як їх уже очікує
-handlers/kitchen.py (try/except DBUnavailable → DB_ERROR_TEXT).
-
-ВАЖЛИВО про формат id:
-- kitchen_fav_open_cb / kitchen_fav_del_cb в handlers/kitchen.py роблять
-  `rid = int(cb.data.split(":", 1)[1])` — тобто обране ідентифікується
-  ЦІЛИМ числом (не Mongo ObjectId). Тому add_favorite генерує власний
-  послідовний цілочисельний id через counters_col (той самий механізм,
-  що вже використовується для задач/id-шних сутностей бота), а не
-  повертає ObjectId.
-- kitchen_hist_open_cb, навпаки, працює з рядковим _id
-  (`hid = cb.data.split(":", 1)[1]`, а kitchen_history_cb явно робить
-  `str(h["_id"])` перед побудовою клавіатури) — тобто історія
-  ідентифікується стандартним Mongo ObjectId, переведеним у рядок.
-- kitchen_shop_toggle_cb так само оперує рядковим Mongo ObjectId
-  (`item_id = cb.data.split(":", 1)[1]`, і `str(i["_id"])` при формуванні
-  клавіатури) — тобто список покупок теж на ObjectId.
-"""
 
 import logging
 from datetime import datetime
@@ -53,8 +17,6 @@ from database.mongo import (
 
 logger = logging.getLogger("tasks_bot")
 
-# Скільки останніх рецептів зберігати в історії на користувача —
-# щоб колекція не росла безмежно для активних користувачів.
 MAX_HISTORY_PER_USER = 30
 
 
@@ -75,9 +37,6 @@ async def _next_seq(name: str) -> int:
     return doc["seq"]
 
 
-# ============================================================
-# 📜 ІСТОРІЯ РЕЦЕПТІВ
-# ============================================================
 
 async def add_history(uid: int, recipe: dict) -> str:
     """Додає рецепт в історію користувача. Повертає рядковий Mongo _id запису."""
