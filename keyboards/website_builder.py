@@ -1,4 +1,3 @@
-
 from aiogram.types import InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -33,6 +32,37 @@ def ikb_wb_result(has_github: bool, has_netlify: bool, has_db_id: bool = False) 
         b.row(InlineKeyboardButton(text="📨 Бот для замовлень", callback_data="wb_bot_manage"))
         b.row(InlineKeyboardButton(text="🗑 Видалити", callback_data="wb_delete_start"))
     b.row(InlineKeyboardButton(text="❌ Скасувати", callback_data="wb_cancel"))
+    return b.as_markup()
+
+
+def ikb_wb_instagram_result(site_url: str | None, github_url: str | None) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    links = []
+    if site_url:
+        links.append(InlineKeyboardButton(text="🌐 Відкрити сайт", url=site_url))
+    if github_url:
+        links.append(InlineKeyboardButton(text="📁 GitHub", url=github_url))
+    if links:
+        b.row(*links)
+    b.row(InlineKeyboardButton(text="✏️ Змінити сайт", callback_data="wb_refine_start"))
+    b.row(InlineKeyboardButton(text="🔄 Створити заново", callback_data="wb_ig_regen"))
+    b.row(InlineKeyboardButton(text="🗑 Видалити", callback_data="wb_delete_start"))
+    return b.as_markup()
+
+
+def ikb_wb_ig_retry() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🔄 Спробувати ще раз", callback_data="wb_ig_retry_url"))
+    return b.as_markup()
+
+
+def ikb_wb_ig_deploy_retry() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🔁 Повторити deployment", callback_data="wb_ig_retry_deploy"))
+    b.row(
+        InlineKeyboardButton(text="✏️ Змінити сайт", callback_data="wb_refine_start"),
+        InlineKeyboardButton(text="📦 Завантажити ZIP", callback_data="wb_download_zip"),
+    )
     return b.as_markup()
 
 

@@ -1,5 +1,4 @@
-
-
+import asyncio
 import base64
 import io
 import logging
@@ -20,6 +19,7 @@ from database import templates as templates_db
 from database import orders as orders_db
 from services import ai_service, github_crypto, github_api, netlify_service, github_zip
 from services import website_builder_service, product_asset_service, cloudinary_service
+from services import instagram_service
 from services.website_builder_service import CloneFetchError
 from services.planner_service import check_ai_limit
 from keyboards.main_menu import kb_main, kb_cancel, kb_category, CATEGORY_WEBSITE
@@ -27,6 +27,7 @@ from keyboards.website_builder import (
     ikb_wb_result, ikb_wb_sites_list, ikb_wb_product_confirm, ikb_wb_delete_confirm,
     ikb_wb_history, ikb_wb_bot_manage, kb_photo_done,
     ikb_wb_templates_list, ikb_wb_template_delete_confirm,
+    ikb_wb_instagram_result, ikb_wb_ig_retry, ikb_wb_ig_deploy_retry,
 )
 
 logger = logging.getLogger("tasks_bot")
@@ -39,8 +40,16 @@ _pending_photo: dict[int, dict] = {}
 _pending_bot: dict[int, dict] = {}
 _pending_template: dict[int, dict] = {}
 _pending_save_template: dict[int, dict] = {}
+_pending_ig: dict[int, dict] = {}
 
 MAX_QUALITY_FIX_ROUNDS = 1
+IG_MAX_IMAGES = 9
+IG_VISION_IMAGES = 3
+IG_REFINE_GUARD = (
+    "\n\nВажливо: не вигадуй факти про бізнес, товари, ціни, відгуки та контакти. "
+    "Якщо даних бракує — використовуй лише те, що вказано в цій інструкції, або «Ціна за запитом». "
+    "Не видаляй посилання на Instagram, наявні фото та форму замовлення."
+)
 
 
 class WebsiteBuilder(StatesGroup):
@@ -59,10 +68,19 @@ class WebsiteBuilder(StatesGroup):
     waiting_template_images = State()
     waiting_template_description = State()
     waiting_template_save_name = State()
+    waiting_ig_url = State()
+    waiting_ig_extra = State()
 
 
 def _fail(reason: str) -> str:
     return f"❌ {reason}"
+
+
+def _md(text) -> str:
+    out = str(text if text is not None else "")
+    for ch in ("_", "*", "`", "["):
+        out = out.replace(ch, "\\" + ch)
+    return out
 
 
 async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
@@ -164,6 +182,29 @@ async def _apply_quality_pipeline(uid: int, result: dict) -> dict:
     return result
 
 
+async def _gh_push(token: str, pending: dict) -> str:
+    if pending.get("github_repo"):
+        owner, repo, branch = pending["github_owner"], pending["github_repo"], pending["branch"]
+    else:
+        user = await github_api.verify_token(token)
+        login = (user or {}).get("login") or ""
+        base_slug = pending.get("site_name") or "ai-website"
+        repo_name = base_slug
+        for suffix in range(2, 20):
+            if not await github_api.repo_exists(token, login, repo_name):
+                break
+            repo_name = f"{base_slug}-{suffix}"
+        created = await github_api.create_repo(token, repo_name, private=True)
+        if not created:
+            raise RuntimeError("github repo create failed")
+        owner, repo, branch = created["owner"], created["repo"], created["default_branch"]
+        pending["github_owner"], pending["github_repo"], pending["branch"] = owner, repo, branch
+
+    files_bytes = {p: c.encode("utf-8") for p, c in pending["files"].items()}
+    files_bytes.update(pending.get("assets", {}))
+    return await github_api.deploy_files(token, owner, repo, branch, files_bytes, pending["commit_message"])
+
+
 # =========================================================
 # Вхід
 # =========================================================
@@ -214,6 +255,324 @@ async def wb_list_entry(msg: Message, state: FSMContext):
     if not sites:
         return await msg.answer("📭 Ще немає жодного збереженого сайту.")
     await msg.answer("📂 *Мої сайти*", reply_markup=ikb_wb_sites_list(sites))
+
+
+# =========================================================
+# 📸 Сайт з Instagram
+# =========================================================
+
+_IG_PROMPT = (
+    "📸 Надішли посилання на Instagram профіль магазину.\n\n"
+    "Наприклад:\nhttps://www.instagram.com/example_shop/"
+)
+
+
+def _steps_text(done: list[str], current: str | None) -> str:
+    lines = [f"✅ {s}" for s in done]
+    if current:
+        lines.append(f"⏳ {current}")
+    return "\n".join(lines)
+
+
+@router.message(F.text == "📸 Створити сайт з Instagram")
+async def wb_ig_entry(msg: Message, state: FSMContext):
+    await state.clear()
+    if not ai_service.is_available():
+        return await msg.answer("🤖 AI зараз недоступний (не налаштовано ключ на сервері).")
+    await state.set_state(WebsiteBuilder.waiting_ig_url)
+    await msg.answer(_IG_PROMPT, reply_markup=kb_cancel())
+
+
+@router.callback_query(F.data == "wb_ig_retry_url")
+async def wb_ig_retry_url(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(WebsiteBuilder.waiting_ig_url)
+    await cb.message.answer(_IG_PROMPT, reply_markup=kb_cancel())
+
+
+@router.message(WebsiteBuilder.waiting_ig_url)
+async def wb_ig_url_received(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    username = instagram_service.parse_instagram_url(msg.text or "")
+    if not username:
+        return await msg.answer(
+            "❌ Це не схоже на правильне Instagram-посилання.\n\n"
+            "Надішли посилання у форматі https://www.instagram.com/example_shop/"
+        )
+
+    await state.clear()
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        return await msg.answer(f"📊 Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день).", reply_markup=kb_main())
+
+    wait = await msg.answer("⏳ Аналізую Instagram...\n\n" + _steps_text([], "Отримую дані профілю"))
+    try:
+        profile = await instagram_service.fetch_profile(username)
+    except instagram_service.InstagramError as e:
+        return await _safe_edit(wait, e.user_message, reply_markup=ikb_wb_ig_retry())
+    except Exception:
+        logger.exception("Instagram fetch crashed for uid=%s username=%s", uid, username)
+        return await _safe_edit(wait, "❌ Не вдалося отримати дані Instagram-профілю.", reply_markup=ikb_wb_ig_retry())
+
+    if instagram_service.profile_is_thin(profile):
+        _pending_ig[uid] = {"profile": profile}
+        await state.set_state(WebsiteBuilder.waiting_ig_extra)
+        await _safe_edit(wait, "⚠️ У профілі мало інформації.")
+        return await msg.answer(
+            "✏️ Напиши, що відомо про магазин: назву, чим торгує, товари й ціни, контакти (Telegram, телефон, email), "
+            "бажаний стиль. Або напиши «-», щоб створити сайт лише з наявних даних. Нічого вигадувати не буду.",
+            reply_markup=kb_cancel(),
+        )
+
+    await _ig_continue(wait, uid, profile, "", done=["Дані Instagram-профілю отримано"])
+
+
+@router.message(WebsiteBuilder.waiting_ig_extra)
+async def wb_ig_extra_received(msg: Message, state: FSMContext):
+    await state.clear()
+    uid = msg.from_user.id
+    ctx = _pending_ig.pop(uid, None)
+    if not ctx:
+        return await msg.answer("Сесія застаріла, почни заново.", reply_markup=kb_main())
+    text = (msg.text or "").strip()
+    extra = "" if text == "-" else text[:2000]
+    wait = await msg.answer(_steps_text(["Дані Instagram-профілю отримано"], "Готую сайт"))
+    await _ig_continue(wait, uid, ctx["profile"], extra, done=["Дані Instagram-профілю отримано"])
+
+
+async def _ig_prepare_media(uid: int, profile: dict) -> dict:
+    sources = []
+    if profile.get("profile_pic_url"):
+        sources.append(("profile", profile["profile_pic_url"], "", None))
+    for i, p in enumerate(profile.get("posts") or [], 1):
+        if p.get("image_url"):
+            sources.append((f"post-{i}", p["image_url"], p.get("caption") or "", p.get("permalink")))
+    sources = sources[:IG_MAX_IMAGES]
+
+    async def one(kind: str, url: str, caption: str, link: str | None):
+        raw = await instagram_service.download_image(url)
+        if not raw:
+            return None
+        try:
+            data = product_asset_service.optimize_image(raw)
+        except Exception:
+            data = raw
+        hosted = None
+        try:
+            public_id = product_asset_service.build_public_id(f"ig-{profile['username']}-{kind}", uid)
+            hosted = await cloudinary_service.upload_image(data, public_id=public_id)
+        except Exception:
+            logger.exception("Instagram image upload to Cloudinary failed (%s)", kind)
+        path = f"assets/{kind}.jpg"
+        return {
+            "kind": kind, "caption": caption, "link": link,
+            "ref": hosted or path, "path": path, "bytes": data,
+        }
+
+    results = await asyncio.gather(*[one(*s) for s in sources])
+    items = [r for r in results if r]
+
+    assets = {r["path"]: r["bytes"] for r in items}
+    refs = [{"kind": r["kind"], "caption": r["caption"], "link": r["link"], "ref": r["ref"]} for r in items]
+    vision = [
+        f"data:image/jpeg;base64,{base64.b64encode(r['bytes']).decode()}"
+        for r in items[:IG_VISION_IMAGES]
+    ]
+    return {"refs": refs, "assets": assets, "vision": vision}
+
+
+def _ig_final_text(pending: dict, updated: bool) -> str:
+    site_url = pending.get("netlify_url") or ""
+    gh_url = f"https://github.com/{pending['github_owner']}/{pending['github_repo']}"
+    admin = pending.get("netlify_admin_url") or site_url
+    title = "✅ Сайт оновлено!" if updated else "✅ Сайт готовий!"
+    return "\n".join([
+        title,
+        "",
+        "📸 Instagram:",
+        f"@{_md(pending.get('ig_username', ''))}",
+        "",
+        "🌐 Сайт:",
+        site_url,
+        "",
+        "📁 GitHub:",
+        gh_url,
+        "",
+        "🚀 Netlify:",
+        admin,
+    ])
+
+
+async def _ig_deploy(wait: Message, uid: int, done: list[str] | None = None, updated: bool = False) -> bool:
+    pending = _pending.get(uid)
+    if not pending:
+        await _safe_edit(wait, "Сесія застаріла, почни заново.")
+        return False
+    done = list(done or [])
+    failure = "❌ Сайт згенерований, але deployment не завершився."
+
+    token = await _get_github_token(uid)
+    if not token:
+        await _safe_edit(
+            wait,
+            f"{failure}\n\n🔐 GitHub не підключено. Підключи його в «⚙️ Налаштування GitHub» "
+            "і натисни «🔁 Повторити deployment».",
+            reply_markup=ikb_wb_ig_deploy_retry(),
+        )
+        return False
+
+    repo_label = "Оновлюю GitHub repository" if pending.get("github_repo") else "Створюю GitHub repository і завантажую файли"
+    wait = await _safe_edit(wait, _steps_text(done, repo_label))
+    try:
+        await _gh_push(token, pending)
+    except Exception:
+        logger.exception("Instagram flow: GitHub deploy failed for uid=%s", uid)
+        try:
+            await _persist_pending(uid, pending)
+        except Exception:
+            logger.exception("Instagram flow: persist after GitHub failure failed uid=%s", uid)
+        await _safe_edit(
+            wait,
+            f"{failure}\n\nНе вдалося записати файли в GitHub. Перевір права токена (repo) і повтори.",
+            reply_markup=ikb_wb_ig_deploy_retry(),
+        )
+        return False
+
+    done.append("GitHub repository оновлено")
+    await _persist_pending(uid, pending)
+
+    if not NETLIFY_TOKEN:
+        await _safe_edit(
+            wait,
+            f"{failure}\n\nNetlify недоступний (не налаштовано ключ на сервері).",
+            reply_markup=ikb_wb_ig_deploy_retry(),
+        )
+        return False
+
+    wait = await _safe_edit(wait, _steps_text(done, "Деплою на Netlify"))
+    try:
+        files = _all_deploy_files(pending)
+        if pending.get("netlify_site_id"):
+            info = await netlify_service.redeploy_site(NETLIFY_TOKEN, pending["netlify_site_id"], files)
+        else:
+            info = await netlify_service.deploy_new_site(NETLIFY_TOKEN, files, desired_name=pending.get("site_name"))
+    except Exception:
+        logger.exception("Instagram flow: Netlify deploy failed for uid=%s", uid)
+        info = None
+
+    if not info or not info.get("url"):
+        await _safe_edit(
+            wait,
+            f"{failure}\n\nНе вдалося задеплоїти на Netlify. Файли вже в GitHub, повтори deployment.",
+            reply_markup=ikb_wb_ig_deploy_retry(),
+        )
+        return False
+
+    pending["netlify_site_id"] = info["site_id"]
+    pending["netlify_url"] = info["url"]
+    pending["netlify_admin_url"] = info.get("admin_url")
+    await _persist_pending(uid, pending)
+
+    gh_url = f"https://github.com/{pending['github_owner']}/{pending['github_repo']}"
+    await _safe_edit(
+        wait,
+        _ig_final_text(pending, updated),
+        reply_markup=ikb_wb_instagram_result(info["url"], gh_url),
+    )
+    return True
+
+
+async def _ig_continue(
+    wait: Message, uid: int, profile: dict, extra: str,
+    media: dict | None = None, base: dict | None = None, done: list[str] | None = None,
+) -> None:
+    done = list(done or [])
+    try:
+        if media is None:
+            wait = await _safe_edit(wait, _steps_text(done, "Завантажую фото профілю й контенту"))
+            media = await _ig_prepare_media(uid, profile)
+            done.append(f"Фото підготовлено: {len(media['refs'])}")
+
+        wait = await _safe_edit(wait, _steps_text(done, "Аналізую магазин, стиль і товари та генерую сайт (AI)"))
+        result = await instagram_service.generate_site(profile, extra, media["refs"], media["vision"])
+        if not result:
+            return await _safe_edit(
+                wait,
+                _fail("AI не зміг сформувати сайт із даних профілю. Спробуй ще раз або дай більше інформації."),
+                reply_markup=ikb_wb_ig_retry(),
+            )
+        await ai_usage_db.increment_usage(uid)
+        done.append("Сайт згенеровано")
+
+        wait = await _safe_edit(wait, _steps_text(done, "Перевіряю якість коду"))
+        result = await _apply_quality_pipeline(uid, result)
+        result["site_name"] = instagram_service.site_slug(profile["username"])
+        done.append("Якість перевірено")
+
+        if base:
+            await _save_version_snapshot(uid, base)
+            base["files"] = _inject_site_id(result["files"], base["db_id"])
+            base["summary"] = result["summary"]
+            base["commit_message"] = result["commit_message"]
+            base["quality_fixed"] = result.get("quality_fixed")
+            pending = base
+        else:
+            pending = {
+                "mode": "instagram", "db_id": None,
+                "github_owner": None, "github_repo": None, "branch": None,
+                "netlify_site_id": None, "netlify_url": None, "netlify_admin_url": None,
+                "assets": dict(media["assets"]), "checklist": [], "notify_bot_connected": False,
+                "ig_auto": True, "ig_username": profile["username"], "ig_url": profile["url"],
+                "ig_profile": profile, "ig_extra": extra,
+                "ig_refs": media["refs"], "ig_vision": media["vision"],
+                **result,
+            }
+            _pending[uid] = pending
+
+        await _persist_pending(uid, pending)
+        await _ig_deploy(wait, uid, done, updated=bool(base))
+    except Exception:
+        logger.exception("Instagram flow crashed for uid=%s", uid)
+        await _safe_edit(
+            wait,
+            _fail("Сталася помилка під час створення сайту. Спробуй ще раз."),
+            reply_markup=ikb_wb_ig_retry(),
+        )
+
+
+@router.callback_query(F.data == "wb_ig_retry_deploy")
+async def wb_ig_retry_deploy(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending:
+        return await cb.answer("Немає активного сайту, почни заново", show_alert=True)
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Повторюю deployment...")
+    await _ig_deploy(wait, uid, updated=bool(pending.get("netlify_url")))
+
+
+@router.callback_query(F.data == "wb_ig_regen")
+async def wb_ig_regen(cb: CallbackQuery):
+    uid = cb.from_user.id
+    pending = _pending.get(uid)
+    if not pending or not pending.get("ig_profile") or not pending.get("db_id"):
+        return await cb.answer("Немає активного Instagram-сайту, почни заново", show_alert=True)
+
+    allowed, _ = await check_ai_limit(uid)
+    if not allowed:
+        return await cb.answer(f"Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день)", show_alert=True)
+
+    await cb.answer()
+    wait = await cb.message.answer("⏳ Створюю сайт заново...")
+    media = {
+        "refs": pending.get("ig_refs") or [],
+        "assets": pending.get("assets") or {},
+        "vision": pending.get("ig_vision") or [],
+    }
+    await _ig_continue(
+        wait, uid, pending["ig_profile"], pending.get("ig_extra") or "",
+        media=media, base=pending, done=["Дані профілю взято з попереднього збору"],
+    )
 
 
 # =========================================================
@@ -505,6 +864,8 @@ async def wb_save_template_name(msg: Message, state: FSMContext):
 @router.message(WebsiteBuilder.waiting_photo_description, F.text == "❌ Скасувати")
 @router.message(WebsiteBuilder.waiting_bot_token, F.text == "❌ Скасувати")
 @router.message(WebsiteBuilder.waiting_bot_chat_id, F.text == "❌ Скасувати")
+@router.message(WebsiteBuilder.waiting_ig_url, F.text == "❌ Скасувати")
+@router.message(WebsiteBuilder.waiting_ig_extra, F.text == "❌ Скасувати")
 async def wb_cancel_flow(msg: Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
@@ -512,6 +873,7 @@ async def wb_cancel_flow(msg: Message, state: FSMContext):
     _pending_clarify.pop(uid, None)
     _pending_photo.pop(uid, None)
     _pending_bot.pop(uid, None)
+    _pending_ig.pop(uid, None)
     await msg.answer("Скасовано.", reply_markup=kb_main())
 
 
@@ -810,24 +1172,9 @@ async def wb_deploy_gh(cb: CallbackQuery):
     wait = await cb.message.answer("⏳ Деплою у GitHub...")
 
     try:
-        if pending.get("github_repo"):
-            owner, repo, branch = pending["github_owner"], pending["github_repo"], pending["branch"]
-        else:
-            base_slug = pending["site_name"] or "ai-website"
-            repo_name = base_slug
-            for suffix in range(2, 20):
-                if not await github_api.repo_exists(token, cb.from_user.username or "me", repo_name):
-                    break
-                repo_name = f"{base_slug}-{suffix}"
-            created = await github_api.create_repo(token, repo_name, private=True)
-            if not created:
-                return await _safe_edit(wait, _fail("Не вдалося створити репозиторій на GitHub. Перевір права токена (потрібен repo)."))
-            owner, repo, branch = created["owner"], created["repo"], created["default_branch"]
-            pending["github_owner"], pending["github_repo"], pending["branch"] = owner, repo, branch
-
-        files_bytes = {p: c.encode("utf-8") for p, c in pending["files"].items()}
-        files_bytes.update(pending.get("assets", {}))
-        commit_sha = await github_api.deploy_files(token, owner, repo, branch, files_bytes, pending["commit_message"])
+        commit_sha = await _gh_push(token, pending)
+    except RuntimeError:
+        return await _safe_edit(wait, _fail("Не вдалося створити репозиторій на GitHub. Перевір права токена (потрібен repo)."))
     except Exception:
         logger.exception("Website Builder GitHub deploy crashed for uid=%s", uid)
         return await _safe_edit(wait, _fail("Помилка під час запису в GitHub. Спробуй ще раз пізніше."))
@@ -837,7 +1184,7 @@ async def wb_deploy_gh(cb: CallbackQuery):
     await _safe_edit(
         wait,
         f"✅ Задеплоєно в GitHub!\nCommit: `{commit_sha[:7]}`\n"
-        f"https://github.com/{owner}/{repo}",
+        f"https://github.com/{pending['github_owner']}/{pending['github_repo']}",
     )
     await cb.message.answer(
         _result_text(pending),
@@ -950,7 +1297,8 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
         return await msg.answer(f"📊 Вичерпано денний ліміт AI-запитів ({AI_DAILY_LIMIT}/день).", reply_markup=kb_main())
 
     wait = await msg.answer("⏳ Вношу правки...")
-    result = await website_builder_service.refine_site(pending["files"], msg.text or "")
+    instruction = (msg.text or "") + (IG_REFINE_GUARD if pending.get("ig_auto") else "")
+    result = await website_builder_service.refine_site(pending["files"], instruction)
     if not result:
         return await _safe_edit(wait, _fail("AI не зміг застосувати ці правки. Спробуй переформулювати."))
 
@@ -961,7 +1309,7 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
     pending["files"] = result["files"]
     pending["summary"] = result["summary"]
     pending["commit_message"] = result["commit_message"]
-    if result.get("site_name"):
+    if result.get("site_name") and not pending.get("ig_auto"):
         pending["site_name"] = result["site_name"]
     if result.get("quality_fixed"):
         pending["quality_fixed"] = result["quality_fixed"]
@@ -975,6 +1323,12 @@ async def wb_refine_apply(msg: Message, state: FSMContext):
         await wait.delete()
     except Exception:
         pass
+
+    if pending.get("ig_auto"):
+        deploy_wait = await msg.answer("⏳ Оновлюю GitHub і Netlify...")
+        await _ig_deploy(deploy_wait, uid, ["Правки внесено"], updated=True)
+        return
+
     await msg.answer(
         "✏️ Готово. Не забудь передеплоїти (GitHub/Netlify), щоб зміни стали видимими на сайті.\n\n"
         + _result_text(pending),
