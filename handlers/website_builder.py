@@ -77,17 +77,35 @@ def _fail(reason: str) -> str:
 
 
 def _md(text) -> str:
+    """Екранує спецсимволи legacy Markdown (бот працює з ParseMode.MARKDOWN)."""
     out = str(text if text is not None else "")
     for ch in ("_", "*", "`", "["):
         out = out.replace(ch, "\\" + ch)
     return out
 
 
+def _is_parse_error(e: TelegramBadRequest) -> bool:
+    return "can't parse entities" in str(e).lower()
+
+
 async def _safe_edit(target: Message, text: str, **kwargs) -> Message:
+    """Редагує повідомлення; якщо не вийшло — шле нове.
+    Якщо проблема в розмітці (Markdown) — повторює простим текстом без parse_mode."""
     try:
         return await target.edit_text(text, **kwargs)
-    except TelegramBadRequest:
-        return await target.answer(text, **kwargs)
+    except TelegramBadRequest as e:
+        if _is_parse_error(e):
+            plain = {**kwargs, "parse_mode": None}
+            try:
+                return await target.edit_text(text, **plain)
+            except TelegramBadRequest:
+                return await target.answer(text, **plain)
+        try:
+            return await target.answer(text, **kwargs)
+        except TelegramBadRequest as e2:
+            if _is_parse_error(e2):
+                return await target.answer(text, **{**kwargs, "parse_mode": None})
+            raise
 
 
 async def _get_github_token(uid: int) -> str | None:
@@ -98,16 +116,16 @@ async def _get_github_token(uid: int) -> str | None:
 
 
 def _result_text(pending: dict) -> str:
-    files_list = "\n".join(f"• {p}" for p in pending["files"])
+    files_list = "\n".join(f"• {_md(p)}" for p in pending["files"])
     lines = [
-        f"🌐 *{pending['site_name']}*",
+        f"🌐 *{_md(pending['site_name'])}*",
         "",
-        pending["summary"],
+        _md(pending["summary"]),
         "",
         f"Файли:\n{files_list}",
     ]
     if pending.get("github_repo"):
-        lines.append(f"\n📦 GitHub: {pending['github_owner']}/{pending['github_repo']}")
+        lines.append(f"\n📦 GitHub: {_md(pending['github_owner'])}/{_md(pending['github_repo'])}")
     if pending.get("netlify_url"):
         lines.append(f"🌍 Netlify: {pending['netlify_url']}")
     if pending.get("checklist"):
@@ -261,9 +279,16 @@ async def wb_list_entry(msg: Message, state: FSMContext):
 # 📸 Сайт з Instagram
 # =========================================================
 
+# УВАГА: бот працює з parse_mode=MARKDOWN, тому в цих текстах не має бути
+# символів "_", "*", "`", "[" (наприклад, example_shop ламав розмітку).
+# Додатково ці тексти надсилаються з parse_mode=None.
 _IG_PROMPT = (
     "📸 Надішли посилання на Instagram профіль магазину.\n\n"
-    "Наприклад:\nhttps://www.instagram.com/example_shop/"
+    "Наприклад:\nhttps://www.instagram.com/username/"
+)
+_IG_BAD_URL = (
+    "❌ Це не схоже на правильне Instagram-посилання.\n\n"
+    "Надішли посилання у форматі https://www.instagram.com/username/"
 )
 
 
@@ -280,14 +305,14 @@ async def wb_ig_entry(msg: Message, state: FSMContext):
     if not ai_service.is_available():
         return await msg.answer("🤖 AI зараз недоступний (не налаштовано ключ на сервері).")
     await state.set_state(WebsiteBuilder.waiting_ig_url)
-    await msg.answer(_IG_PROMPT, reply_markup=kb_cancel())
+    await msg.answer(_IG_PROMPT, reply_markup=kb_cancel(), parse_mode=None)
 
 
 @router.callback_query(F.data == "wb_ig_retry_url")
 async def wb_ig_retry_url(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.set_state(WebsiteBuilder.waiting_ig_url)
-    await cb.message.answer(_IG_PROMPT, reply_markup=kb_cancel())
+    await cb.message.answer(_IG_PROMPT, reply_markup=kb_cancel(), parse_mode=None)
 
 
 @router.message(WebsiteBuilder.waiting_ig_url)
@@ -295,10 +320,7 @@ async def wb_ig_url_received(msg: Message, state: FSMContext):
     uid = msg.from_user.id
     username = instagram_service.parse_instagram_url(msg.text or "")
     if not username:
-        return await msg.answer(
-            "❌ Це не схоже на правильне Instagram-посилання.\n\n"
-            "Надішли посилання у форматі https://www.instagram.com/example_shop/"
-        )
+        return await msg.answer(_IG_BAD_URL, parse_mode=None)
 
     await state.clear()
     allowed, _ = await check_ai_limit(uid)
@@ -694,7 +716,7 @@ async def wb_template_zip_received(msg: Message, state: FSMContext, bot):
     await state.set_state(WebsiteBuilder.waiting_template_images)
     await _safe_edit(
         wait,
-        f"✅ Шаблон «{project_name}» завантажено ({len(text_files)} текстових файлів, "
+        f"✅ Шаблон «{_md(project_name)}» завантажено ({len(text_files)} текстових файлів, "
         f"{len(binary_files)} ресурсів).\n\n"
         "🖼 Можеш додатково надіслати скріншоти бажаного вигляду (необов'язково) або одразу "
         "натисни «✅ Готово», щоб перейти до опису змін.",
@@ -811,7 +833,7 @@ async def wb_tpl_use(cb: CallbackQuery, state: FSMContext):
     _pending_template[uid] = {"files": tpl.get("files", {}), "assets": {}, "images": [], "name": tpl.get("name", "template")}
     await state.set_state(WebsiteBuilder.waiting_template_images)
     await cb.message.answer(
-        f"📦 Шаблон «{tpl.get('name')}» обрано.\n\n"
+        f"📦 Шаблон «{_md(tpl.get('name'))}» обрано.\n\n"
         "🖼 Можеш надіслати скріншоти бажаного вигляду (необов'язково) або натисни «✅ Готово».",
         reply_markup=kb_photo_done(),
     )
@@ -847,7 +869,7 @@ async def wb_save_template_name(msg: Message, state: FSMContext):
 
     name = (msg.text or "").strip()[:60] or pending.get("site_name") or "template"
     await templates_db.create_template(uid, name, dict(pending["files"]))
-    await msg.answer(f"✅ Шаблон «{name}» збережено. Знайти його можна в «📦 Мій шаблон».", reply_markup=kb_main())
+    await msg.answer(f"✅ Шаблон «{_md(name)}» збережено. Знайти його можна в «📦 Мій шаблон».", reply_markup=kb_main())
 
 
 # =========================================================
@@ -938,7 +960,7 @@ async def _start_requirements_check(
             "mode": mode, "description": description, "source_url": source_url, "checklist": checklist,
         }
         await state.set_state(WebsiteBuilder.waiting_clarification)
-        q_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        q_text = "\n".join(f"{i + 1}. {_md(q)}" for i, q in enumerate(questions))
         return await _safe_edit(
             wait,
             "🤔 Перед генерацією потрібні уточнення:\n\n" + q_text +
@@ -997,7 +1019,7 @@ async def _generate_and_show(
     except Exception:
         pass
     if warning_text:
-        await wait.answer(warning_text)
+        await wait.answer(warning_text, parse_mode=None)
     await wait.answer(_result_text(_pending[uid]), reply_markup=ikb_wb_result(False, False, False))
 
 
@@ -1070,7 +1092,7 @@ async def wb_photo_description_received(msg: Message, state: FSMContext):
                     "checklist": checklist, "images": ctx["images"],
                 }
                 await state.set_state(WebsiteBuilder.waiting_clarification)
-                q_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(analysis["clarifying_questions"]))
+                q_text = "\n".join(f"{i + 1}. {_md(q)}" for i, q in enumerate(analysis["clarifying_questions"]))
                 return await _safe_edit(
                     wait,
                     "🤔 Перед генерацією потрібні уточнення:\n\n" + q_text +
@@ -1151,7 +1173,7 @@ async def wb_download_zip(cb: CallbackQuery):
         await wait.delete()
     except Exception:
         pass
-    await cb.message.answer_document(doc, caption=f"📦 {filename}")
+    await cb.message.answer_document(doc, caption=f"📦 {filename}", parse_mode=None)
 
 
 @router.callback_query(F.data == "wb_deploy_gh")
@@ -1383,7 +1405,7 @@ async def wb_product_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.set_state(WebsiteBuilder.waiting_product_photo)
     await cb.message.answer(
-        f"🖼 Надішли фото товару для сайту «{pending['site_name']}».\n"
+        f"🖼 Надішли фото товару для сайту «{_md(pending['site_name'])}».\n"
         "У підписі до фото можеш одразу вказати назву/ціну/розміри тощо "
         "(напр. «Nike Tech Fleece, чорний, 2999 грн, розміри M/L/XL»).",
         reply_markup=kb_cancel(),
@@ -1447,9 +1469,9 @@ async def _show_product_confirmation(target: Message, data: dict) -> None:
     price_line = f"{data['price_uah']:.0f} грн" if data.get("price_uah") else "не вказано"
     text = (
         "🖼 *Перевір дані товару перед додаванням:*\n\n"
-        f"📝 Назва: {data['title']}\n"
-        f"📄 Опис: {data.get('description', '—')}\n"
-        f"🏷 Категорія: {data.get('category', '—')}\n"
+        f"📝 Назва: {_md(data['title'])}\n"
+        f"📄 Опис: {_md(data.get('description', '—'))}\n"
+        f"🏷 Категорія: {_md(data.get('category', '—'))}\n"
         f"💵 Ціна: {price_line}"
     )
     await _safe_edit(target, text, reply_markup=ikb_wb_product_confirm())
@@ -1520,7 +1542,7 @@ async def wb_product_confirm(cb: CallbackQuery):
         return await _safe_edit(wait, _fail(
             "Не вдалося завантажити фото в Cloudinary. Перевір CLOUDINARY_CLOUD_NAME/"
             "CLOUDINARY_UPLOAD_PRESET на сервері (і що preset увімкнено як unsigned) і спробуй ще раз."
-        ))
+        ), parse_mode=None)
 
     await _safe_edit(wait, "⏳ Додаю картку товару на сайт...")
 
@@ -1545,7 +1567,7 @@ async def wb_product_confirm(cb: CallbackQuery):
 
     await _safe_edit(
         wait,
-        f"✅ Товар «{data['title']}» додано!\n"
+        f"✅ Товар «{_md(data['title'])}» додано!\n"
         f"🖼 Фото вже назавжди доступне на Cloudinary: {image_url}\n\n"
         "Саме фото деплоїти окремо не треба (воно вже онлайн), але щоб картка товару "
         "зʼявилась на сайті — передеплой (GitHub/Netlify).",
@@ -1570,17 +1592,27 @@ async def wb_orders_view(cb: CallbackQuery):
     await cb.answer()
     orders = await orders_db.get_orders_for_site(uid, pending["db_id"], limit=ORDERS_DISPLAY_LIMIT)
     if not orders:
-        return await cb.message.answer(f"📭 Замовлень для «{pending['site_name']}» ще немає.")
+        return await cb.message.answer(f"📭 Замовлень для «{_md(pending['site_name'])}» ще немає.")
 
-    lines = [f"📦 *Замовлення* — {pending['site_name']}\n"]
+    lines = [f"📦 *Замовлення* — {_md(pending['site_name'])}\n"]
     for o in orders:
         date = (o.get("created_at") or "")[:16].replace("T", " ")
         status = "✅ доставлено" if o.get("delivered") else "⚠️ не доставлено"
         lines.append(
-            f"🛒 {date} ({status})\n👤 {o.get('name', '—')}\n📞 {o.get('phone', '—')}\n"
-            f"📦 {o.get('product', '—')}\n💬 {o.get('comment') or '—'}\n"
+            f"🛒 {date} ({status})\n👤 {_md(o.get('name', '—'))}\n📞 {_md(o.get('phone', '—'))}\n"
+            f"📦 {_md(o.get('product', '—'))}\n💬 {_md(o.get('comment') or '—')}\n"
         )
-    await cb.message.answer("\n".join(lines))
+    await _answer_safe(cb.message, "\n".join(lines))
+
+
+async def _answer_safe(target: Message, text: str, **kwargs) -> Message:
+    """answer() з фолбеком на простий текст, якщо Markdown не розпарсився."""
+    try:
+        return await target.answer(text, **kwargs)
+    except TelegramBadRequest as e:
+        if _is_parse_error(e):
+            return await target.answer(text, **{**kwargs, "parse_mode": None})
+        raise
 
 
 # =========================================================
@@ -1683,7 +1715,7 @@ async def wb_checklist_check(cb: CallbackQuery):
 
     await _save_version_snapshot(uid, pending)
     fixed = await website_builder_service.fix_missing_requirements(pending["files"], missing)
-    missing_list = "\n".join(f"• {m}" for m in missing)
+    missing_list = "\n".join(f"• {_md(m)}" for m in missing)
     if not fixed:
         return await _safe_edit(wait, f"⚠️ Знайдено невиконані пункти, але AI не зміг їх доопрацювати:\n{missing_list}")
 
@@ -1753,6 +1785,7 @@ async def wb_bot_connect_start(cb: CallbackQuery, state: FSMContext):
         "🔑 Надішли токен бота, отриманий від @BotFather.\n"
         "Токен зберігається на сервері в зашифрованому вигляді і ніколи не потрапляє у код сайту.",
         reply_markup=kb_cancel(),
+        parse_mode=None,
     )
 
 
@@ -1784,6 +1817,7 @@ async def wb_bot_token_received(msg: Message, state: FSMContext):
         f"Тепер напиши боту @{bot_username} команду /start (щоб він міг тобі писати), "
         "а потім надішли сюди свій Telegram chat_id (число). Дізнатись його можна, "
         "написавши боту @userinfobot.",
+        parse_mode=None,
     )
 
 
@@ -1798,14 +1832,14 @@ async def wb_bot_chat_id_received(msg: Message, state: FSMContext):
 
     chat_id = (msg.text or "").strip()
     if not chat_id.lstrip("-").isdigit():
-        return await msg.answer("⚠️ chat_id має бути числом. Спробуй ще раз:")
+        return await msg.answer("⚠️ chat_id має бути числом. Спробуй ще раз:", parse_mode=None)
 
     encrypted = github_crypto.encrypt_token(ctx["token"])
     await websites_db.set_notification_bot(uid, pending["db_id"], encrypted, chat_id)
     pending["notify_bot_connected"] = True
 
     await msg.answer(
-        f"✅ Бот @{ctx['bot_username']} підключено — замовлення тепер надходитимуть у нього.\n\n"
+        f"✅ Бот @{_md(ctx['bot_username'])} підключено — замовлення тепер надходитимуть у нього.\n\n"
         + _result_text(pending),
         reply_markup=ikb_wb_result(
             bool(pending.get("github_repo")), bool(pending.get("netlify_url")), True
@@ -1850,14 +1884,14 @@ async def wb_delete_start(cb: CallbackQuery):
 
     will_delete = []
     if pending.get("github_repo"):
-        will_delete.append(f"📦 GitHub-репозиторій {pending['github_owner']}/{pending['github_repo']}")
+        will_delete.append(f"📦 GitHub-репозиторій {_md(pending['github_owner'])}/{_md(pending['github_repo'])}")
     if pending.get("netlify_url"):
         will_delete.append(f"🌍 Netlify-сайт {pending['netlify_url']}")
     will_delete.append("🗂 Запис і всі дані сайту в боті")
 
     details = "\n".join(f"• {p}" for p in will_delete)
     await cb.message.answer(
-        f"⚠️ Точно видалити «{pending['site_name']}» НАЗАВЖДИ?\n\n"
+        f"⚠️ Точно видалити «{_md(pending['site_name'])}» НАЗАВЖДИ?\n\n"
         f"Буде видалено:\n{details}\n\n"
         "Цю дію не можна скасувати.",
         reply_markup=ikb_wb_delete_confirm(),
@@ -1922,5 +1956,6 @@ async def wb_delete_confirm(cb: CallbackQuery):
     else:
         text = f"✅ «{site_name}» видалено повністю — з GitHub, Netlify і бота."
 
-    await _safe_edit(wait, text)
+    # Текст містить сирі назви/URL (можливі "_"), тому без Markdown
+    await _safe_edit(wait, text, parse_mode=None)
     await cb.message.answer("🏠 Головне меню:", reply_markup=kb_category(CATEGORY_WEBSITE))
