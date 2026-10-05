@@ -145,7 +145,7 @@ async def tick(bot, session, state, username, chat_id, tz):
 
 
 async def run(bot):
-    token = os.getenv("GITHUB_TOKEN", "").strip()
+    token = os.getenv("GITHUB_TOKEN", "").strip().strip("\"'")
     username = os.getenv("GITHUB_USERNAME", "").strip()
     chat_raw = os.getenv("OWNER_CHAT_ID", "").strip()
     interval = int(os.getenv("DEPLOY_POLL_INTERVAL", "60") or 60)
