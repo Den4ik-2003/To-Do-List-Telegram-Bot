@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import logging
 import sys
 
 from database import orders as orders_db
 from database import websites as websites_db
 from services import order_notify_service
+from services import deploy_notifier_service
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -227,11 +229,17 @@ async def main() -> None:
     olx_scheduler.start()
     logger.info("OLX/resale/site-watch/jobs scheduler started")
 
+    deploy_task = asyncio.create_task(deploy_notifier_service.run(bot))
+    logger.info("GitHub deploy notifier started")
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Starting polling...")
         await dp.start_polling(bot)
     finally:
+        deploy_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await deploy_task
         olx_scheduler.shutdown(wait=False)
         await health_runner.cleanup()
         await close_mongo()
