@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from html import escape
@@ -7,11 +8,8 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
-POLL_INTERVAL = int(os.getenv("DEPLOY_POLL_INTERVAL", "60"))
-TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
+logger = logging.getLogger("deploy_notifier")
+
 STATE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "deploy_notifier_state.json",
@@ -33,12 +31,14 @@ def save_state(state):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f)
     except Exception as e:
-        print(f"DEPLOY NOTIFIER STATE ERROR: {e}")
+        logger.error("State save error: %s", e)
 
 
 async def fetch_json(session, url, params=None):
     async with session.get(url, params=params) as response:
         if response.status != 200:
+            body = await response.text()
+            logger.error("GitHub %s -> %s %s", url, response.status, body[:200])
             return None
         return await response.json()
 
@@ -64,11 +64,11 @@ async def fetch_details(session, repo, before, head):
     return {"commits": [], "total": 0, "files": 0, "url": f"https://github.com/{repo}/commit/{head}"}
 
 
-def build_message(event, details):
+def build_message(event, details, tz):
     repo = event["repo"]["name"]
     payload = event["payload"]
     branch = payload.get("ref", "").replace("refs/heads/", "")
-    moment = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00")).astimezone(TIMEZONE)
+    moment = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00")).astimezone(tz)
     head = payload.get("head", "")
 
     lines = [
@@ -102,10 +102,8 @@ def build_message(event, details):
     return "\n".join(lines)
 
 
-async def tick(bot, session, state):
-    events = await fetch_json(
-        session, f"{API}/users/{GITHUB_USERNAME}/events", {"per_page": 100}
-    )
+async def tick(bot, session, state, username, chat_id, tz):
+    events = await fetch_json(session, f"{API}/users/{username}/events", {"per_page": 100})
     if events is None:
         return
 
@@ -133,8 +131,8 @@ async def tick(bot, session, state):
             session, event["repo"]["name"], payload.get("before", ""), head
         )
         await bot.send_message(
-            OWNER_CHAT_ID,
-            build_message(event, details),
+            chat_id,
+            build_message(event, details, tz),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -147,21 +145,53 @@ async def tick(bot, session, state):
 
 
 async def run(bot):
-    if not (GITHUB_TOKEN and GITHUB_USERNAME and OWNER_CHAT_ID):
-        print("DEPLOY NOTIFIER DISABLED: set GITHUB_TOKEN, GITHUB_USERNAME, OWNER_CHAT_ID")
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    username = os.getenv("GITHUB_USERNAME", "").strip()
+    chat_raw = os.getenv("OWNER_CHAT_ID", "").strip()
+    interval = int(os.getenv("DEPLOY_POLL_INTERVAL", "60") or 60)
+    tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
+
+    missing = [
+        name
+        for name, value in (
+            ("GITHUB_TOKEN", token),
+            ("GITHUB_USERNAME", username),
+            ("OWNER_CHAT_ID", chat_raw),
+        )
+        if not value
+    ]
+    if missing:
+        logger.error("Deploy notifier disabled, missing env: %s", ", ".join(missing))
+        return
+
+    try:
+        chat_id = int(chat_raw)
+    except ValueError:
+        logger.error("OWNER_CHAT_ID must be a number, got: %s", chat_raw)
         return
 
     headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     state = load_state()
 
+    try:
+        await bot.send_message(
+            chat_id,
+            f"✅ Деплой-нотифікатор запущено для <b>{escape(username)}</b>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Cannot send startup message to %s: %s", chat_id, e)
+
     async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             try:
-                await tick(bot, session, state)
+                await tick(bot, session, state, username, chat_id, tz)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                print(f"DEPLOY NOTIFIER ERROR: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+                logger.error("Deploy notifier error: %s", e)
+            await asyncio.sleep(interval)
