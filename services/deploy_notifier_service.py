@@ -2,9 +2,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
 from html import escape
-from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -49,7 +47,6 @@ async def fetch_details(session, repo, before, head):
         if data:
             return {
                 "commits": data.get("commits", []),
-                "total": data.get("total_commits", len(data.get("commits", []))),
                 "files": len(data.get("files", [])),
                 "url": data.get("html_url", ""),
             }
@@ -57,52 +54,63 @@ async def fetch_details(session, repo, before, head):
     if data:
         return {
             "commits": [data],
-            "total": 1,
             "files": len(data.get("files", [])),
             "url": data.get("html_url", ""),
         }
-    return {"commits": [], "total": 0, "files": 0, "url": f"https://github.com/{repo}/commit/{head}"}
+    return {"commits": [], "files": 0, "url": f"https://github.com/{repo}/commit/{head}"}
 
 
-def build_message(event, details, tz):
-    repo = event["repo"]["name"]
-    payload = event["payload"]
-    branch = payload.get("ref", "").replace("refs/heads/", "")
-    moment = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00")).astimezone(tz)
-    head = payload.get("head", "")
-
-    lines = [
-        "🚀 <b>Новий деплой на GitHub</b>",
-        "",
-        f"📦 <b>Репозиторій:</b> <a href=\"https://github.com/{repo}\">{escape(repo)}</a>",
-        f"🌿 <b>Гілка:</b> {escape(branch)}",
-        f"🕒 <b>Дата:</b> {moment.strftime('%d.%m.%Y %H:%M:%S')}",
-        f"🔑 <b>Коміт:</b> <code>{escape(head[:7])}</code>",
-        f"📝 <b>Комітів:</b> {details['total']}",
-    ]
-    if details["files"]:
-        lines.append(f"📄 <b>Змінено файлів:</b> {details['files']}")
-
+def pick_author(event, details):
     commits = details["commits"]
     if commits:
-        lines.append("")
-        lines.append("<b>Коміти:</b>")
-        for commit in commits[-5:]:
-            info = commit.get("commit", {})
-            message = (info.get("message", "") or "").split("\n")[0][:80]
-            author = (info.get("author", {}) or {}).get("name", "")
-            lines.append(f"• {escape(message)} — <i>{escape(author)}</i>")
-        if len(commits) > 5:
-            lines.append(f"… і ще {len(commits) - 5}")
+        last = commits[-1]
+        name = ((last.get("commit", {}) or {}).get("author", {}) or {}).get("name", "")
+        if name:
+            return name
+    return (event.get("actor", {}) or {}).get("login", "") or "—"
 
+
+def last_commit_title(details):
+    commits = details["commits"]
+    if not commits:
+        return ""
+    message = ((commits[-1].get("commit", {}) or {}).get("message", "") or "").split("\n")[0]
+    return message[:80]
+
+
+def build_message(event, details):
+    repo = event["repo"]["name"]
+    payload = event["payload"]
+    is_new = payload.get("before", "") == ZERO_SHA
+    author = pick_author(event, details)
+    repo_link = f"<a href=\"https://github.com/{repo}\">{escape(repo)}</a>"
+
+    if is_new:
+        lines = [
+            "🚀 <b>Новий деплой</b>",
+            "",
+            f"📦 репо: {repo_link}",
+            f"👤 хто: <b>{escape(author)}</b>",
+        ]
+        return "\n".join(lines)
+
+    lines = [
+        "🛠 <b>Доробка</b>",
+        "",
+        f"📦 репо: {repo_link}",
+        f"👤 хто: <b>{escape(author)}</b>",
+    ]
+    if details["files"]:
+        lines.append(f"📄 файлів: {details['files']} оновлено")
+    title = last_commit_title(details)
+    if title:
+        lines.append(f"📝 {escape(title)}")
     if details["url"]:
-        lines.append("")
-        lines.append(f"🔗 <a href=\"{escape(details['url'])}\">Переглянути зміни</a>")
-
+        lines.append(f"🔗 <a href=\"{escape(details['url'])}\">зміни</a>")
     return "\n".join(lines)
 
 
-async def tick(bot, session, state, username, chat_id, tz):
+async def tick(bot, session, state, username, chat_id):
     events = await fetch_json(session, f"{API}/users/{username}/events", {"per_page": 100})
     if events is None:
         return
@@ -132,7 +140,7 @@ async def tick(bot, session, state, username, chat_id, tz):
         )
         await bot.send_message(
             chat_id,
-            build_message(event, details, tz),
+            build_message(event, details),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -149,7 +157,6 @@ async def run(bot):
     username = os.getenv("GITHUB_USERNAME", "").strip()
     chat_raw = os.getenv("OWNER_CHAT_ID", "").strip()
     interval = int(os.getenv("DEPLOY_POLL_INTERVAL", "60") or 60)
-    tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 
     missing = [
         name
@@ -177,19 +184,10 @@ async def run(bot):
     }
     state = load_state()
 
-    try:
-        await bot.send_message(
-            chat_id,
-            f"✅ Деплой-нотифікатор запущено для <b>{escape(username)}</b>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error("Cannot send startup message to %s: %s", chat_id, e)
-
     async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             try:
-                await tick(bot, session, state, username, chat_id, tz)
+                await tick(bot, session, state, username, chat_id)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
