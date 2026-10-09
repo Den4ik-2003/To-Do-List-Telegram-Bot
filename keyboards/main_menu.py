@@ -18,9 +18,7 @@ CATEGORY_WEBSITE = "🌐 AI Website Builder"
 MAIN_CATEGORIES = {
     CATEGORY_TASKS_AI: [
         "📋 Мої задачі", "🏆 Мій прогрес",
-        "🤖 AI Планер",
-        "💬 AI Чат", "✍️ Редактор",
-        "⚖️ Рішення", "🎬 Що подивитися сьогодні",
+        "🤖 AI Планер", "💬 AI Чат", "🎬 Що подивитися сьогодні",
         "🎙 Голосова задача",
     ],
     CATEGORY_FINANCE: [
