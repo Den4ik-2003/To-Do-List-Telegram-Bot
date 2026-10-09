@@ -121,7 +121,6 @@ def register_routers(dp: Dispatcher) -> None:
         evening_plan,
         ai_chat,
         voice,
-        translator,
         nearby,
         decision,
         product_photo,
@@ -162,7 +161,6 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(evening_plan.router)
     dp.include_router(ai_chat.router)
     dp.include_router(voice.router)
-    dp.include_router(translator.router)
     dp.include_router(nearby.router)
     dp.include_router(decision.router)
     dp.include_router(product_photo.router)
