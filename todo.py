@@ -135,7 +135,6 @@ def register_routers(dp: Dispatcher) -> None:
         weather,
         receipts,
         olx,
-        autoria,
         movie,
         site_watch,
         job_profile,
@@ -172,7 +171,6 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(weather.router)
     dp.include_router(receipts.router)
     dp.include_router(olx.router)
-    dp.include_router(autoria.router)
     dp.include_router(movie.router)
     dp.include_router(site_watch.router)
     dp.include_router(job_profile.router)
