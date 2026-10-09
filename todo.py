@@ -28,7 +28,6 @@ logger = logging.getLogger("tasks_bot")
 ROUTER_MODULES: tuple[str, ...] = (
     "start",
     "tasks",
-    "voice_task",
     "kitchen",
     "worktime",
     "ai_planner",
