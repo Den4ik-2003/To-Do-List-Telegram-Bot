@@ -122,7 +122,6 @@ def register_routers(dp: Dispatcher) -> None:
         ai_chat,
         voice,
         nearby,
-        decision,
         product_photo,
         resale,
         business,
@@ -147,7 +146,6 @@ def register_routers(dp: Dispatcher) -> None:
         shop_threads,
         posts,
         github_deploy,
-        ai_developer,
         website_builder,
         settings as settings_handlers,
     )
@@ -162,7 +160,6 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(ai_chat.router)
     dp.include_router(voice.router)
     dp.include_router(nearby.router)
-    dp.include_router(decision.router)
     dp.include_router(product_photo.router)
     dp.include_router(resale.router)
     dp.include_router(business.router)
@@ -186,7 +183,6 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(shop_threads.router)
     dp.include_router(posts.router)
     dp.include_router(github_deploy.router)
-    dp.include_router(ai_developer.router)
     dp.include_router(website_builder.router)
     dp.include_router(settings_handlers.router)
     dp.include_router(menu.router)
