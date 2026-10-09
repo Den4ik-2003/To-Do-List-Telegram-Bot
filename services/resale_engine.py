@@ -38,6 +38,9 @@ def build_analysis_prompt(listing: dict, min_margin_percent: float | None = None
 
 КРИТИЧНО: якщо не впевнений у бренді/моделі/ціні — НЕ вигадуй. Вкажи
 нижчу впевненість (confidence) і перелічи, чого не вистачає (missing_data).
+Але ЗАВЖДИ давай числові оцінки resale_price_min, resale_price_max,
+expected_profit, roi_percent та resale_score, навіть якщо маржа невелика
+або дані неповні.
 
 Відповідай ЛИШЕ у форматі JSON, без пояснень поза ним, за такою схемою:
 {{
@@ -77,8 +80,9 @@ def build_analysis_prompt(listing: dict, min_margin_percent: float | None = None
 }}
 
 Розрахунки:
-- expected_profit = (середина діапазону resale_price) - ціна продавця - орієнтовні
-  витрати на доставку/чистку/ремонт, якщо вони очевидні з опису/фото.
+- expected_profit = (середина діапазону resale_price) - ціна продавця - витрати
+  на чистку/ремонт, якщо вони очевидні з опису/фото. Доставку та упакування
+  НЕ враховуй у розрахунку взагалі.
 - roi_percent = expected_profit / ціна_покупки * 100.
 - Користувач хоче мінімальну маржу {margin}%. Якщо угода не дає такої маржі
   навіть при optimal_offer — це видно з verdict і resale_score, а не приховується.
@@ -273,7 +277,7 @@ def calculate_resale(
     sell_price: float | None = None,
     target_margin_percent: float | None = None,
 ) -> dict:
-    cost_base = buy_price + delivery + repair
+    cost_base = buy_price + repair
     commission = (sell_price or 0) * commission_percent / 100 if sell_price else 0
     total_cost = cost_base + commission
 
@@ -294,12 +298,10 @@ def calculate_resale(
         })
         result["breakeven_price"] = round(total_cost, 2)
 
-    if target_margin_percent is not None:
-        if sell_price:
-            extra_costs = delivery + repair
-            commission_share = commission_percent / 100
-            max_buy = sell_price * (1 - commission_share - target_margin_percent / 100) - extra_costs
-            result["max_buy_price"] = round(max_buy, 2)
+    if target_margin_percent is not None and sell_price:
+        commission_share = commission_percent / 100
+        max_buy = sell_price * (1 - commission_share - target_margin_percent / 100) - repair
+        result["max_buy_price"] = round(max_buy, 2)
 
     return result
 

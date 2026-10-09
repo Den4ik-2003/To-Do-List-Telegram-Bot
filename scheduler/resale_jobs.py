@@ -1,5 +1,3 @@
-
-
 import logging
 
 from aiogram import Bot
@@ -15,8 +13,9 @@ logger = logging.getLogger("tasks_bot")
 async def _collect(monitor: dict) -> dict:
     res = await resale_service.scan_monitor(monitor)
     logger.info(
-        "resale collect monitor=%s: scanned=%s analyzed=%s selected=%s error=%s",
-        monitor.get("_id"), res["scanned"], res["analyzed"], res["selected"], res["error"],
+        "resale collect monitor=%s: scanned=%s analyzed=%s selected=%s relaxed=%s fallback=%s error=%s",
+        monitor.get("_id"), res["scanned"], res["analyzed"], res["selected"],
+        res.get("selected_relaxed", 0), res.get("selected_fallback", 0), res["error"],
     )
     return res
 
@@ -36,6 +35,13 @@ async def _process_evening(bot: Bot, monitor: dict):
         error = res.get("error")
     except Exception:
         logger.exception("resale: вечірній збір упав для monitor=%s", monitor.get("_id"))
+    if not error:
+        try:
+            forced = await resale_service.ensure_daily_result(monitor)
+            if forced:
+                error = forced.get("error")
+        except Exception:
+            logger.exception("resale: гарантований результат упав для monitor=%s", monitor.get("_id"))
     try:
         await resale_service.send_report(bot, monitor, error=error)
     except Exception:
@@ -48,7 +54,7 @@ async def _run_phase(bot: Bot, phase: str):
     for m in monitors:
         mid = str(m["_id"])
         if not resale_service.try_acquire(mid):
-            continue  # цей автопошук саме зараз виконується вручну
+            continue
         try:
             if phase == "midday":
                 await _process_midday(m)

@@ -332,8 +332,6 @@ async def cleanup_candidates(days: int = 14):
 
 def _default_user_settings() -> dict:
     return {
-        "delivery_cost": float(getattr(cfg, "RESALE_DELIVERY_COST", 80)),
-        "packing_cost": float(getattr(cfg, "RESALE_PACKING_COST", 20)),
         "commission_percent": float(getattr(cfg, "RESALE_COMMISSION_PERCENT", 0)),
     }
 

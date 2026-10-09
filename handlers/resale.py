@@ -58,8 +58,6 @@ _STEPS = [
 ]
 
 _SETTING_LABELS = {
-    "delivery_cost": ("🚚 Доставка", "грн"),
-    "packing_cost": ("📦 Пакування", "грн"),
     "commission_percent": ("💳 Комісія з продажу", "%"),
 }
 
@@ -191,7 +189,7 @@ async def resale_menu(msg: Message, state: FSMContext):
         "Створи автопошуки, і я сам шукатиму товари, які вигідно купити та перепродати.\n"
         "🌎 Пошук іде по всій Україні: місто продавця не впливає ні на пошук, ні на оцінку, ні на рейтинг (купівля з доставкою).\n"
         f"🕒 Кожен автопошук працює двічі на добу: збір ~{mh:02d}:{mm:02d}, звіт ~{eh:02d}:{em:02d}.\n"
-        "📌 Я показую мало, але реально цікаві варіанти: до 3 на кожен автопошук.",
+        "📌 Щодня щонайменше один результат на кожен автопошук, до 3 найкращих.",
         reply_markup=_ikb_resale_menu(),
     )
 
@@ -430,7 +428,8 @@ async def resale_debug_cb(cb: CallbackQuery):
     await cb.message.answer(
         f"🐞 *Діагностика останнього запуску*\n\n{breakdown}\n\n"
         f"Знайдено: {last.get('scanned', 0)}, проаналізовано: {last.get('analyzed', 0)}, "
-        f"відібрано: {last.get('selected', 0)}, з послабленими критеріями: {last.get('selected_relaxed', 0)}"
+        f"відібрано: {last.get('selected', 0)}, з послабленими критеріями: {last.get('selected_relaxed', 0)}, "
+        f"найкращий з наявних: {last.get('selected_fallback', 0)}"
     )
 
 
@@ -455,7 +454,15 @@ async def _run_now(bot, monitor: dict):
         except Exception:
             logger.exception("resale: recheck (ручний) упав, monitor=%s", mid)
         res = await resale_service.scan_monitor(monitor)
-        await resale_service.send_report(bot, monitor, error=res.get("error"))
+        error = res.get("error")
+        if not error:
+            try:
+                forced = await resale_service.ensure_daily_result(monitor)
+                if forced:
+                    error = forced.get("error")
+            except Exception:
+                logger.exception("resale: ensure_daily_result (ручний) упав, monitor=%s", mid)
+        await resale_service.send_report(bot, monitor, error=error)
     except Exception:
         logger.exception("resale: ручний пошук упав, monitor=%s", mid)
         try:
@@ -469,7 +476,7 @@ async def _run_now(bot, monitor: dict):
 async def _settings_text(uid: int) -> str:
     us = await resale_db.get_user_settings(uid)
     lines = ["⚙️ *Налаштування розрахунку прибутку*", "",
-             "Ці витрати віднімаються від очікуваного прибутку кожного варіанта:", ""]
+             "Доставка й пакування в прибутку не враховуються. Віднімається лише:", ""]
     for key, (label, unit) in _SETTING_LABELS.items():
         lines.append(f"{label}: {us[key]:.0f} {unit}")
     return "\n".join(lines)
