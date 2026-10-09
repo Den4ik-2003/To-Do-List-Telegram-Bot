@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import importlib
 import logging
 import sys
 
@@ -20,6 +21,48 @@ from database.mongo import init_mongo, close_mongo
 from database.users import load_authorized_uids
 
 logger = logging.getLogger("tasks_bot")
+
+
+# Порядок підключення роутерів ВАЖЛИВИЙ (aiogram перевіряє їх по черзі).
+# Це той самий порядок, що був у оригінальному коді.
+ROUTER_MODULES: tuple[str, ...] = (
+    "start",
+    "tasks",
+    "voice_task",
+    "kitchen",
+    "worktime",
+    "ai_planner",
+    "evening_plan",
+    "ai_chat",
+    "voice",
+    "nearby",
+    "product_photo",
+    "resale",
+    "business",
+    "insights",
+    "goals",
+    "projects",
+    "statistics",
+    "currency",
+    "countdown",
+    "weather",
+    "receipts",
+    "olx",
+    "movie",
+    "site_watch",
+    "job_profile",
+    "jobs",
+    "shops",
+    "shop_templates",
+    "shop_articles",
+    "shop_threads",
+    "posts",
+    "github_deploy",
+    "website_builder",
+    "settings",
+    "menu",
+    "finances",
+)
 
 
 async def handle_order(request: web.Request) -> web.Response:
@@ -110,81 +153,57 @@ def setup_logging() -> None:
 
 
 def register_routers(dp: Dispatcher) -> None:
-    from handlers import (
-        start,
-        menu,
-        tasks,
-        voice_task,
-        kitchen,
-        worktime,
-        ai_planner,
-        evening_plan,
-        ai_chat,
-        voice,
-        nearby,
-        product_photo,
-        resale,
-        business,
-        insights,
-        goals,
-        projects,
-        finances,
-        statistics,
-        currency,
-        countdown,
-        weather,
-        receipts,
-        olx,
-        movie,
-        site_watch,
-        job_profile,
-        jobs,
-        shops,
-        shop_templates,
-        shop_articles,
-        shop_threads,
-        posts,
-        github_deploy,
-        website_builder,
-        settings as settings_handlers,
-    )
+    """Підключає роутери з пакета handlers у фіксованому порядку.
 
-    dp.include_router(start.router)
-    dp.include_router(tasks.router)
-    dp.include_router(voice_task.router)
-    dp.include_router(kitchen.router)
-    dp.include_router(worktime.router)
-    dp.include_router(ai_planner.router)
-    dp.include_router(evening_plan.router)
-    dp.include_router(ai_chat.router)
-    dp.include_router(voice.router)
-    dp.include_router(nearby.router)
-    dp.include_router(product_photo.router)
-    dp.include_router(resale.router)
-    dp.include_router(business.router)
-    dp.include_router(insights.router)
-    dp.include_router(goals.router)
-    dp.include_router(projects.router)
-    dp.include_router(statistics.router)
-    dp.include_router(currency.router)
-    dp.include_router(countdown.router)
-    dp.include_router(weather.router)
-    dp.include_router(receipts.router)
-    dp.include_router(olx.router)
-    dp.include_router(movie.router)
-    dp.include_router(site_watch.router)
-    dp.include_router(job_profile.router)
-    dp.include_router(jobs.router)
-    dp.include_router(shops.router)
-    dp.include_router(shop_templates.router)
-    dp.include_router(shop_articles.router)
-    dp.include_router(shop_threads.router)
-    dp.include_router(posts.router)
-    dp.include_router(github_deploy.router)
-    dp.include_router(website_builder.router)
-    dp.include_router(settings_handlers.router)
-    dp.include_router(menu.router)
-    dp.include_router(finances.router)
+    Якщо якогось модуля немає (наприклад, не закомічений у git) або він
+    падає при імпорті, бот НЕ crash-иться: проблема логується, а решта
+    роутерів підключається як зазвичай.
+    """
+    loaded: list[str] = []
+    failed: list[str] = []
+
+    for name in ROUTER_MODULES:
+        module_path = f"handlers.{name}"
+        try:
+            module = importlib.import_module(module_path)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_path:
+                logger.error(
+                    "Модуль %s не знайдено (файл відсутній у репозиторії або "
+                    "неправильна назва/регістр). Роутер пропущено.",
+                    module_path,
+                )
+            else:
+                logger.exception(
+                    "Модуль %s не імпортується: бракує залежності '%s'. Роутер пропущено.",
+                    module_path,
+                    exc.name,
+                )
+            failed.append(name)
+            continue
+        except Exception:
+            logger.exception("Помилка під час імпорту %s. Роутер пропущено.", module_path)
+            failed.append(name)
+            continue
+
+        router = getattr(module, "router", None)
+        if router is None:
+            logger.error("У модулі %s немає змінної 'router'. Роутер пропущено.", module_path)
+            failed.append(name)
+            continue
+
+        try:
+            dp.include_router(router)
+        except Exception:
+            logger.exception("Не вдалося підключити роутер %s. Пропущено.", module_path)
+            failed.append(name)
+            continue
+
+        loaded.append(name)
+
+    logger.info("Підключено роутерів: %d/%d", len(loaded), len(ROUTER_MODULES))
+    if failed:
+        logger.warning("Не підключені роутери: %s", ", ".join(failed))
 
 
 async def main() -> None:
