@@ -1,5 +1,3 @@
-
-
 import logging
 import re
 from datetime import datetime, timedelta
@@ -139,10 +137,6 @@ async def _build_context(uid: int) -> dict:
         "state": state,
     }
 
-
-# =========================================================
-# 🔥 One Thing дня
-# =========================================================
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
@@ -334,10 +328,6 @@ XP: {ctx['state'].get('xp', 0)}
     }
 
 
-# =========================================================
-# НОВЕ: фаззі-дедуп проти вже активних задач
-# =========================================================
-
 _NORM_RE = re.compile(r"[^\w\s]", re.UNICODE)
 
 
@@ -354,7 +344,6 @@ def _is_similar(a: str, b: str, threshold: float = 0.72) -> bool:
         return False
     if na == nb:
         return True
-    # одна задача повністю "всередині" іншої (напр. коротший переказ довшої)
     if len(na) >= 6 and len(nb) >= 6 and (na in nb or nb in na):
         return True
     return SequenceMatcher(None, na, nb).ratio() >= threshold
@@ -370,22 +359,11 @@ def _dedup_against_existing(candidate_tasks: list[dict], existing_texts: list[st
         if _is_similar_to_any(t["text"], existing_texts):
             continue
         result.append(t)
-        # щойно прийняту задачу теж враховуємо, щоб не пропустити два
-        # майже однакових НОВИХ кандидати одночасно
         existing_texts.append(t["text"])
     return result
 
 
-# =========================================================
-# НОВЕ: 🌙 План на завтра (вечірній флоу, без погодинного розпису)
-# =========================================================
-
 async def generate_tomorrow_plan(uid: int, hours: float) -> dict | None:
-    """Формує список НОВИХ задач на завтра під заявлену кількість годин.
-    На відміну від generate_daily_plan — БЕЗ конкретного часу (time) для
-    кожної задачі, лише список у порядку пріоритету з estimated_minutes.
-    Має подвійний захист від дублів: інструкція в промпті + програмний
-    фаззі-фільтр проти УСІХ активних задач (а не лише топ-20 з промпту)."""
     if not ai_service.is_available():
         return None
     allowed, _ = await check_ai_limit(uid)
@@ -480,12 +458,6 @@ async def generate_tomorrow_plan(uid: int, hours: float) -> dict | None:
 
 
 async def save_tomorrow_tasks(uid: int, tasks: list[dict]) -> int:
-    """Зберігає підтверджені задачі на завтра. Другий рубіж захисту від
-    дублів: звіряє з усіма задачами, вже запланованими на завтра в БД
-    (get_tasks_due_date), а не лише з тими, що бачив AI під час генерації.
-    Розставляє due послідовно від 09:00 (для коректної роботи нагадувань/
-    rollover) — це НЕ показується користувачу як погодинний план, лише
-    зберігається у полі due кожної задачі."""
     tomorrow = datetime.now() + timedelta(days=1)
     tomorrow_str = tomorrow.strftime("%d.%m.%Y")
     existing = await tasks_db.get_tasks_due_date(uid, tomorrow_str)

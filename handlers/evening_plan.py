@@ -1,5 +1,3 @@
-
-
 import asyncio
 import logging
 
@@ -14,7 +12,6 @@ from database.mongo import DBUnavailable
 from services import planner_service
 from keyboards.evening_plan import ikb_evening_hours, ikb_evening_generating, ikb_evening_plan_preview
 from keyboards.main_menu import kb_cancel, kb_main
-from handlers.common import require_auth
 
 logger = logging.getLogger("tasks_bot")
 router = Router(name="evening_plan")
@@ -100,10 +97,11 @@ async def _generate_and_show(target, uid: int, hours: float, edit: bool):
 
 
 @router.callback_query(F.data.startswith("evplan_hours:"))
-async def evplan_hours_cb(cb: CallbackQuery, state: FSMContext):
-    if not await require_auth(cb.message, state):
-        return await cb.answer()
-    hours = int(cb.data.split(":")[1])
+async def evplan_hours_cb(cb: CallbackQuery):
+    try:
+        hours = float(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        return await cb.answer("Некоректне значення.", show_alert=True)
     await cb.answer()
     await _generate_and_show(cb, cb.from_user.id, hours, edit=True)
 

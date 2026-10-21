@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -15,7 +16,6 @@ from config.settings import (
     AI_CLEANER_STALE_DAYS,
     AI_CLEANER_WEEKDAY,
     AI_CLEANER_TIME,
-    EVENING_PLAN_TIME,
     EVENING_PLAN_ENABLED,
 )
 from config import settings as _settings
@@ -53,9 +53,21 @@ INSIGHT_CHECK_TIME = "12:00"
 THREADS_MORNING_TIME = getattr(_settings, "THREADS_MORNING_TIME", "08:30")
 THREADS_SHOP_GAP_SECONDS = 300
 
+PLAN_ASK_TIME = getattr(_settings, "PLAN_ASK_TIME", "09:00")
+BOT_TIMEZONE = getattr(_settings, "BOT_TIMEZONE", "Europe/Kyiv")
+
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _local_tz():
+    for name in (BOT_TIMEZONE, "Europe/Kiev"):
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            continue
+    return timezone(timedelta(hours=3))
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -383,18 +395,20 @@ async def evening_plan_task(bot: Bot):
             await asyncio.sleep(1800)
             continue
         try:
-            hh, mm = map(int, EVENING_PLAN_TIME.split(":"))
+            hh, mm = map(int, PLAN_ASK_TIME.split(":"))
         except ValueError:
-            hh, mm = 22, 0
-        now = datetime.now()
+            hh, mm = 9, 0
+        tz = _local_tz()
+        now = datetime.now(tz)
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target <= now:
-            target += timedelta(days=1)
-        logger.info("evening_plan_task: сплю до %s (локальний час сервера)", target.isoformat())
-        await asyncio.sleep((target - now).total_seconds())
+            target = (target + timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        wait = (target.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()
+        logger.info("evening_plan_task: сплю до %s (%s)", target.isoformat(), getattr(tz, "key", "UTC+3"))
+        await asyncio.sleep(max(wait, 1))
         try:
             uids = await get_all_uids()
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_str = datetime.now(tz).strftime("%Y-%m-%d")
             logger.info("evening_plan_task: старт розсилки для %d користувачів", len(uids))
             sent = 0
             for uid in uids:
@@ -407,7 +421,7 @@ async def evening_plan_task(bot: Bot):
                     await save_user_state(uid, {"last_evening_plan_date": today_str})
                     await bot.send_message(
                         uid,
-                        "🌙 *Плануємо завтра?*\n\nСкільки годин плануєте працювати завтра?",
+                        "📅 *Плануємо завтра?*\n\nСкільки годин плануєте працювати завтра?",
                         reply_markup=ikb_evening_hours(),
                     )
                     sent += 1

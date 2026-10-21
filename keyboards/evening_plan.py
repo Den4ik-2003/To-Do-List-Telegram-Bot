@@ -1,5 +1,3 @@
-
-
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config.settings import EVENING_PLAN_HOUR_OPTIONS
