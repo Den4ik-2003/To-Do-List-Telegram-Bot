@@ -1,23 +1,7 @@
-"""
-services/olx_service.py
-
-НОВЕ (виправлення бага "129 знайдено -> 0 відібрано"):
-- normalize_price_text(): єдина функція нормалізації тексту ціни (п.6 ТЗ),
-  розрізняє "договірна"/"обмін"/"безкоштовно" від справжньої відсутності
-  ціни, замість того щоб все зводити до None.
-- _offer_price(): пробує більше форматів JSON-відповіді OLX API (пряма
-  форма price.value без обгортки regularPrice, рядкова ціна, альтернативні
-  ключі salePrice/priceBudget/priceValue). Якщо жоден формат не підійшов —
-  пишеться один раз у лог OLX_API_PRICE_SCHEMA_UNRECOGNIZED з фрагментом
-  сирого offer, щоб було видно, що саме змінилося в API OLX.
-- _parse_listing_html(): тепер заповнює price_type ("fixed"/"negotiable"/
-  "exchange"/"free"/"unknown") поряд із price/currency.
-
-Решта функцій (пошук, пагінація, деталі оголошення, фото, аудит) — БЕЗ ЗМІН.
-"""
-
+import asyncio
 import json
 import logging
+import os
 import re
 from urllib.parse import quote
 
@@ -48,8 +32,6 @@ CURRENCY_MAP = {
     "$": "USD", "USD": "USD",
 }
 
-# НОВЕ (п.6 ТЗ): маркери типу ціни, які не є "звичайним числом", але й НЕ є
-# відсутністю даних — їх треба відрізняти від справжнього "ціна не вказана".
 NEGOTIABLE_WORDS = ("договірна", "договірний", "do negocjacji", "cena do negocjacji")
 EXCHANGE_WORDS = ("обмін", "обмен", "zamiana")
 FREE_WORDS = ("безкоштовно", "даром", "za darmo")
@@ -66,29 +48,56 @@ API_URL = "https://www.{domain}/api/v1/offers/"
 API_LIMIT = 40
 MAX_SUBQUERIES = 3
 
+REQUEST_ATTEMPTS = 3
+RETRY_STATUSES = (403, 429, 500, 502, 503, 504)
+
 _LISTING_HREF_RE = re.compile(r"-ID[a-zA-Z0-9]+\.html")
 
-# Тексти сторінки, за якими видно, що OLX справді знайшов 0 оголошень
-# (а не віддав заглушку / іншу розмітку).
 NO_RESULTS_MARKERS = (
     "не знайшли", "нічого не знайдено", "не знайдено жодного",
     "nie znaleźliśmy", "we couldn't find",
 )
 BLOCK_MARKERS = ("captcha", "just a moment", "access denied", "cf-chl", "attention required")
 
-# OLX сам додає цей reason до картки, коли розширений пошук НЕ дав жодного
-# реального збігу і сайт підсовує випадкові оголошення з фіду, аби блок
-# "схожі"/список не був порожнім. Такі картки — НЕ результати пошуку і їх
-# треба відкидати, інакше видача виглядає як рандомний набір товарів
-# (диван, чоботи, молоток замість реально схожих оголошень).
 FALLBACK_REASON_MARKERS = (
     "extendedsearchnoresultslastresort",
 )
 
-# Скільки різних offer-ів без розпізнаної ціни залогувати за раз процесу
-# (щоб не спамити лог, якщо OLX справді змінив схему для всього API).
 _MAX_PRICE_SCHEMA_WARNINGS = 5
 _price_schema_warned: set[str] = set()
+
+
+def _proxies() -> dict | None:
+    url = os.getenv("OLX_PROXY_URL", "").strip()
+    if not url:
+        return None
+    return {"http": url, "https": url}
+
+
+def _session(headers: dict | None = None) -> AsyncSession:
+    kwargs: dict = {"impersonate": IMPERSONATE}
+    if headers:
+        kwargs["headers"] = headers
+    proxies = _proxies()
+    if proxies:
+        kwargs["proxies"] = proxies
+    return AsyncSession(**kwargs)
+
+
+async def _get(url: str, headers: dict, params: dict | None = None, timeout: int = 20):
+    resp = None
+    for attempt in range(REQUEST_ATTEMPTS):
+        try:
+            async with _session(headers) as session:
+                resp = await session.get(url, params=params, timeout=timeout, allow_redirects=True)
+        except Exception:
+            logger.exception("OLX request failed (спроба %s/%s) url=%s", attempt + 1, REQUEST_ATTEMPTS, url)
+            resp = None
+        if resp is not None and resp.status_code not in RETRY_STATUSES:
+            return resp
+        if attempt < REQUEST_ATTEMPTS - 1:
+            await asyncio.sleep(1.5 * (attempt + 1))
+    return resp
 
 
 def _parse_price(text: str) -> tuple[float, str] | None:
@@ -106,17 +115,6 @@ def _parse_price(text: str) -> tuple[float, str] | None:
 
 
 def normalize_price_text(text: str | None) -> dict:
-    """
-    НОВЕ (п.6 ТЗ): єдина точка класифікації тексту ціни. Повертає
-    {"price": float|None, "currency": str|None,
-     "price_type": "fixed"|"negotiable"|"exchange"|"free"|"unknown"}.
-
-    Не замінює наявний _parse_price (щоб не ламати існуючі виклики), а
-    доповнює його — розрізняє "договірна"/"обмін"/"безкоштовно" від
-    справжньої відсутності даних. Раніше все це зводилось просто до
-    price=None, і такі оголошення неможливо було відрізнити від зламаного
-    парсера.
-    """
     if not text:
         return {"price": None, "currency": None, "price_type": "unknown"}
     low = text.strip().lower()
@@ -147,8 +145,6 @@ def _api_headers(domain: str) -> dict:
 
 
 def _is_fallback_card(href: str) -> bool:
-    """True, якщо OLX сам позначив цю картку як "останній резерв"
-    (реального збігу за запитом немає)."""
     return any(marker in href for marker in FALLBACK_REASON_MARKERS)
 
 
@@ -205,7 +201,7 @@ def _parse_listing_html(html: str, default_currency: str) -> dict:
         "price": None, "currency": default_currency, "title": None,
         "description": None, "location_text": None, "views": None,
         "photos": [], "photos_count": None, "params": [],
-        "price_type": "unknown",  # НОВЕ (п.6 ТЗ)
+        "price_type": "unknown",
     }
 
     price_el = soup.select_one('[data-testid="ad-price-container"]') or soup.select_one('[data-testid="ad-price"]')
@@ -285,17 +281,14 @@ async def fetch_listing_details(url: str) -> dict | None:
     headers = _domain_headers(domain)
     default_currency = DOMAIN_CONFIG.get(domain, DOMAIN_CONFIG["olx.ua"])["default_currency"]
 
-    try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=headers) as session:
-            resp = await session.get(url, timeout=20, allow_redirects=True)
-            final_url = str(resp.url)
-            if resp.status_code != 200:
-                logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status_code, url, final_url)
-                return None
-            html = resp.text
-    except Exception:
-        logger.exception("OLX listing fetch failed for %s", url)
+    resp = await _get(url, headers, timeout=20)
+    if resp is None:
         return None
+    final_url = str(resp.url)
+    if resp.status_code != 200:
+        logger.warning("OLX listing fetch status=%s for %s (final_url=%s)", resp.status_code, url, final_url)
+        return None
+    html = resp.text
 
     logger.info("OLX listing fetch OK, final_url=%s, html_len=%s", final_url, len(html))
 
@@ -318,10 +311,6 @@ async def fetch_listing_price(url: str) -> tuple[float, str] | None:
 
 
 def _guess_image_mime(url: str) -> str:
-    """Для 🔍 Аудит мого оголошення — грубе визначення MIME за розширенням
-    у URL, щоб коректно сформувати data:URI для vision-запиту. OLX CDN інколи
-    не віддає розширення в чистому вигляді (query-параметри після нього),
-    тому спочатку відрізаємо все після "?"."""
     lower = url.split("?")[0].lower()
     if lower.endswith(".png"):
         return "image/png"
@@ -333,8 +322,6 @@ def _guess_image_mime(url: str) -> str:
 
 
 async def fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
-    """Для 🔍 Аудит мого оголошення — завантажує сирі байти фото з OLX CDN
-    для подальшого vision-аналізу. Повертає (bytes, mime) або None."""
     try:
         async with AsyncSession(impersonate=IMPERSONATE, timeout=15) as session:
             resp = await session.get(url, timeout=15)
@@ -371,13 +358,7 @@ def _build_search_url(
     return base
 
 
-# =========================================================
-# Пошук оголошень (багатоступеневий)
-# =========================================================
-
 def _split_queries(title_query: str) -> list[str]:
-    """'покерний набір, покер, фішки' -> ['покерний набір', 'покер', 'фішки'].
-    Дублі (без урахування регістру) відкидаються, максимум MAX_SUBQUERIES."""
     parts = [p.strip() for p in re.split(r"[,;\n]", title_query or "") if p.strip()]
     seen: set[str] = set()
     out: list[str] = []
@@ -406,14 +387,6 @@ def _listing_id(url: str, fallback=None) -> str:
 
 
 def _offer_price(offer: dict) -> tuple[float, str | None] | None:
-    """
-    ЗМІНЕНО: тепер пробує більше форматів ціни в JSON-відповіді OLX API.
-    Раніше, якщо OLX повертав ціну у форматі, який тут не розпізнавався,
-    функція давала None для КОЖНОГО offer в результатах — а виклик
-    _scan() в resale_service.py тоді одразу відкидав усі оголошення ще ДО
-    спроби довантажити повну сторінку. Саме це й було причиною бага
-    "129 знайдено -> 0 відібрано, 0 проаналізовано".
-    """
     for p in offer.get("params") or []:
         if isinstance(p, dict) and p.get("key") == "price":
             val = p.get("value") or {}
@@ -431,8 +404,6 @@ def _offer_price(offer: dict) -> tuple[float, str | None] | None:
                 return float(reg["value"]), reg.get("currencyCode") or reg.get("currency")
             except (TypeError, ValueError):
                 pass
-        # НОВЕ: пряма форма {"value": ..., "currencyCode"/"currency": ...}
-        # без обгортки regularPrice — трапляється в спрощених відповідях API.
         if price.get("value") is not None:
             try:
                 return float(price["value"]), price.get("currencyCode") or price.get("currency")
@@ -441,13 +412,10 @@ def _offer_price(offer: dict) -> tuple[float, str | None] | None:
     elif isinstance(price, (int, float)):
         return float(price), None
     elif isinstance(price, str):
-        # НОВЕ: рядкова ціна прямо в полі "price" ("1 200 грн", "договірна" тощо)
         parsed = _parse_price(price)
         if parsed:
             return parsed
 
-    # НОВЕ: додаткові альтернативні ключі, якими різні версії API OLX іноді
-    # позначають ціну замість "price".
     for alt_key in ("salePrice", "priceBudget", "priceValue"):
         alt = offer.get(alt_key)
         if isinstance(alt, (int, float)):
@@ -472,11 +440,6 @@ def _offer_location(offer: dict) -> str:
 
 
 def _warn_price_schema_once(offer: dict, offer_id) -> None:
-    """НОВЕ: якщо ціну з JSON-offer не вдалось розпізнати жодним із
-    відомих форматів — логуємо (обмежено, щоб не заспамити) фрагмент
-    сирого offer. Це реалізує ідею п.46 ТЗ (PARSER_SCHEMA_CHANGED):
-    якщо OLX змінив структуру API, це буде видно в логах одразу, а не
-    приховано за тихим "0 можливостей"."""
     if not RESALE_DEBUG_LOGGING:
         return
     key = str(offer_id)
@@ -491,8 +454,6 @@ def _warn_price_schema_once(offer: dict, offer_id) -> None:
 
 
 def _offer_to_result(offer: dict, domain: str, cfg: dict) -> dict | None:
-    """Приводить оголошення з JSON (API або prerendered state) до того
-    самого формату, що й HTML-картка."""
     if not isinstance(offer, dict):
         return None
     url = offer.get("url")
@@ -521,8 +482,6 @@ def _offer_to_result(offer: dict, domain: str, cfg: dict) -> dict | None:
 
 async def _search_via_api(query: str, max_price: float | None, condition: str | None,
                           domain: str, cfg: dict) -> list[dict] | None:
-    """Ступінь 1: JSON-ендпоінт OLX. None — API не спрацював (пробуємо HTML),
-    [] — API відповів, але оголошень нема."""
     params: dict = {"offset": 0, "limit": API_LIMIT, "query": query}
     if max_price:
         params["filter_float_price:to"] = int(max_price)
@@ -530,15 +489,16 @@ async def _search_via_api(query: str, max_price: float | None, condition: str | 
         params["filter_enum_state[0]"] = CONDITION_PARAM_MAP[condition]
 
     url = API_URL.format(domain=domain)
+    resp = await _get(url, _api_headers(domain), params=params, timeout=20)
+    if resp is None:
+        return None
+    if resp.status_code != 200:
+        logger.warning("OLX API search status=%s query=%r", resp.status_code, query)
+        return None
     try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=_api_headers(domain)) as session:
-            resp = await session.get(url, params=params, timeout=20)
-            if resp.status_code != 200:
-                logger.warning("OLX API search status=%s query=%r", resp.status_code, query)
-                return None
-            data = resp.json()
+        data = resp.json()
     except Exception:
-        logger.exception("OLX API search failed query=%r", query)
+        logger.exception("OLX API search: некоректний JSON query=%r", query)
         return None
 
     offers = data.get("data") if isinstance(data, dict) else None
@@ -561,7 +521,6 @@ async def _search_via_api(query: str, max_price: float | None, condition: str | 
 
 
 def _parse_cards(soup: BeautifulSoup, domain: str, cfg: dict) -> tuple[list[dict], int]:
-    """Ступінь 2: класичні картки [data-cy="l-card"]."""
     cards = soup.select('[data-cy="l-card"]')
     results = []
     fallback_skipped = 0
@@ -598,8 +557,6 @@ def _parse_cards(soup: BeautifulSoup, domain: str, cfg: dict) -> tuple[list[dict
 
 
 def _cards_by_links(soup: BeautifulSoup, domain: str, cfg: dict) -> list[dict]:
-    """Ступінь 3: якщо OLX перейменував data-cy — шукаємо посилання на
-    оголошення (…-IDxxxx.html) і збираємо дані з найближчого контейнера."""
     results = []
     seen: set[str] = set()
     for a in soup.find_all("a", href=True):
@@ -635,7 +592,6 @@ def _cards_by_links(soup: BeautifulSoup, domain: str, cfg: dict) -> list[dict]:
 
 
 def _find_ads(node, depth: int = 0):
-    """Шукає в JSON-стані сторінки непорожній масив ads з оголошеннями."""
     if depth > 8:
         return None
     if isinstance(node, dict):
@@ -655,7 +611,6 @@ def _find_ads(node, depth: int = 0):
 
 
 def _parse_prerendered_ads(html: str, domain: str, cfg: dict) -> list[dict]:
-    """Ступінь 4: дані з window.__PRERENDERED_STATE__ (JSON-рядок у HTML)."""
     idx = html.find("__PRERENDERED_STATE__")
     if idx == -1:
         return []
@@ -693,19 +648,14 @@ def _diagnose_html(html: str) -> dict:
 
 async def _search_via_html(query: str, max_price: float | None, location: str, radius_km: int,
                            domain: str, condition: str | None, cfg: dict) -> list[dict] | None:
-    """Ступені 2-4. None — сторінка не розпізнана (блок / нова розмітка),
-    [] — OLX справді нічого не знайшов."""
     url = _build_search_url(domain, query, max_price, location, radius_km, condition)
-    try:
-        async with AsyncSession(impersonate=IMPERSONATE, headers=_domain_headers(domain)) as session:
-            resp = await session.get(url, timeout=20, allow_redirects=True)
-            if resp.status_code != 200:
-                logger.warning("OLX search fetch status=%s for %s", resp.status_code, url)
-                return None
-            html = resp.text
-    except Exception:
-        logger.exception("OLX search fetch failed for %s", url)
+    resp = await _get(url, _domain_headers(domain), timeout=20)
+    if resp is None:
         return None
+    if resp.status_code != 200:
+        logger.warning("OLX search fetch status=%s for %s", resp.status_code, url)
+        return None
+    html = resp.text
 
     soup = BeautifulSoup(html, "html.parser")
     results, fallback_skipped = _parse_cards(soup, domain, cfg)
@@ -722,9 +672,8 @@ async def _search_via_html(query: str, max_price: float | None, location: str, r
     if results:
         return results
     if cards_found:
-        return []  # були лише fallback-картки — реальних збігів немає
+        return []
 
-    # data-cy="l-card" не знайдено — пробуємо запасні способи
     results = _cards_by_links(soup, domain, cfg)
     if results:
         logger.info("OLX search: картки знайдено за посиланнями (l-card відсутні) query=%r n=%s", query, len(results))
@@ -761,8 +710,8 @@ async def _search_single(query: str, max_price: float | None, location: str, rad
         return html_result
 
     if api_result == []:
-        return []  # API відповів «порожньо», HTML нічого не додав
-    return html_result  # [] або None
+        return []
+    return html_result
 
 
 async def search_listings(
@@ -773,9 +722,6 @@ async def search_listings(
     domain: str = "olx.ua",
     condition: str | None = None,
 ) -> list[dict] | None:
-    """Повертає список оголошень, [] якщо OLX нічого не знайшов, або None
-    при технічному збої (усі запити провалились). Запит із комами
-    розбивається на кілька пошуків, результати об'єднуються."""
     queries = _split_queries(title_query)
     merged: dict[str, dict] = {}
     failures = 0

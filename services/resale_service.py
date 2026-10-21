@@ -21,7 +21,6 @@ def _cfg(name: str, default):
 
 
 FETCH_CONCURRENCY = 3
-REPORT_SIZE = 3
 CANDIDATE_TTL_HOURS = 36
 PRICE_DROP_RATIO = 0.9
 SAME_PRICE_TOLERANCE = 0.05
@@ -33,12 +32,16 @@ SOFT_REASONS = (
 )
 
 
+def _daily_target() -> int:
+    return max(int(_cfg("RESALE_DAILY_TARGET", 5)), 1)
+
+
 def _max_ai_per_run() -> int:
-    return int(_cfg("RESALE_MAX_AI_PER_MONITOR", 5))
+    return int(_cfg("RESALE_MAX_AI_PER_MONITOR", 6))
 
 
 def _max_rounds() -> int:
-    return int(_cfg("RESALE_MAX_AI_ROUNDS", 3))
+    return int(_cfg("RESALE_MAX_AI_ROUNDS", 5))
 
 
 def _min_score() -> float:
@@ -450,9 +453,10 @@ async def scan_monitor(monitor: dict, force: bool = False) -> dict:
 
 async def ensure_daily_result(monitor: dict) -> dict | None:
     mid = str(monitor["_id"])
+    target = _daily_target()
     cutoff = (datetime.now() - timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
-    existing = await resale_db.get_report_candidates(mid, cutoff, 1)
-    if existing:
+    existing = await resale_db.get_report_candidates(mid, cutoff, target)
+    if len(existing) >= target:
         return None
     return await scan_monitor(monitor, force=True)
 
@@ -561,10 +565,13 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict, force: bool = Fals
         return out, rej
 
     day = datetime.now().strftime("%Y-%m-%d")
+    target = _daily_target()
+    day_now = await resale_db.day_stats(mid, day)
+    need = max(target - int(day_now.get("selected", 0) or 0), 1)
+    debug["need"] = need
 
     fresh, rej = _filter(False, False)
     if not fresh:
-        day_now = await resale_db.day_stats(mid, day)
         if force or day_now.get("selected", 0) == 0:
             fresh, rej = _filter(True, False)
             debug["known_reconsidered"] = len(fresh)
@@ -590,6 +597,7 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict, force: bool = Fals
 
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
     relaxed_pool: list[tuple[dict, dict, float]] = []
+    taken_urls: set[str] = set()
 
     async def _fetch(r: dict):
         async with sem:
@@ -656,6 +664,7 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict, force: bool = Fals
             opp, reason = build_opportunity(listing, analysis, monitor, median, market_n, us)
             if opp:
                 await _store_candidate(mid, uid, listing, analysis, opp, day, {"price_drop_from": drops.get(url)})
+                taken_urls.add(url)
                 res["selected"] += 1
             else:
                 _bump(debug, f"reject_{reason}")
@@ -676,43 +685,52 @@ async def _scan(monitor: dict, uid: int, mid: str, res: dict, force: bool = Fals
         cursor += size
         rounds += 1
         ok = await _process_batch(batch)
-        if not ok or res["selected"] > 0:
+        if not ok or res["selected"] >= need:
             break
     debug["rounds"] = rounds
 
-    if res["selected"] == 0 and relaxed_pool and _relaxed_enabled():
+    missing = need - res["selected"]
+    if missing > 0 and relaxed_pool and _relaxed_enabled():
         base_profit = _num(monitor.get("min_profit"))
         base_profit = DEFAULT_MIN_PROFIT if base_profit is None else base_profit
         base_margin = _num(monitor.get("min_margin_percent"))
         base_margin = DEFAULT_MIN_MARGIN if base_margin is None else base_margin
         for profit_factor, margin_factor in _relaxed_levels():
+            left = missing - res["selected_relaxed"]
+            if left <= 0:
+                break
             relaxed_monitor = dict(monitor)
             relaxed_monitor["min_profit"] = base_profit * profit_factor
             relaxed_monitor["min_margin_percent"] = base_margin * margin_factor
             picked = []
             for listing, analysis, _price in relaxed_pool:
+                if listing["url"] in taken_urls:
+                    continue
                 opp, _reason = build_opportunity(listing, analysis, relaxed_monitor, median, market_n, us)
                 if opp:
                     picked.append((opp, listing, analysis))
-            if picked:
-                picked.sort(key=lambda x: x[0]["profit"], reverse=True)
-                for opp, listing, analysis in picked[:REPORT_SIZE]:
-                    await _store_candidate(mid, uid, listing, analysis, opp, day, {"relaxed": True})
-                res["selected_relaxed"] = len(picked[:REPORT_SIZE])
-                debug["relaxed_selected"] = res["selected_relaxed"]
-                break
+            picked.sort(key=lambda x: x[0]["profit"], reverse=True)
+            for opp, listing, analysis in picked[:left]:
+                await _store_candidate(mid, uid, listing, analysis, opp, day, {"relaxed": True})
+                taken_urls.add(listing["url"])
+                res["selected_relaxed"] += 1
+        debug["relaxed_selected"] = res["selected_relaxed"]
 
-    if res["selected"] == 0 and res["selected_relaxed"] == 0 and relaxed_pool:
-        best = None
+    missing = need - res["selected"] - res["selected_relaxed"]
+    if missing > 0 and relaxed_pool:
+        ranked = []
         for listing, analysis, _price in relaxed_pool:
+            if listing["url"] in taken_urls:
+                continue
             opp, _reason = build_opportunity(listing, analysis, monitor, median, market_n, us, mode="fallback")
-            if opp and (best is None or (opp["profit"], opp["score"]) > (best[0]["profit"], best[0]["score"])):
-                best = (opp, listing, analysis)
-        if best:
-            opp, listing, analysis = best
+            if opp and opp["profit"] > 0:
+                ranked.append((opp, listing, analysis))
+        ranked.sort(key=lambda x: (x[0]["profit"], x[0]["score"]), reverse=True)
+        for opp, listing, analysis in ranked[:missing]:
             await _store_candidate(mid, uid, listing, analysis, opp, day, {"relaxed": True, "fallback": True})
-            res["selected_fallback"] = 1
-            debug["fallback_selected"] = 1
+            taken_urls.add(listing["url"])
+            res["selected_fallback"] += 1
+        debug["fallback_selected"] = res["selected_fallback"]
 
     logger.info("resale debug monitor=%s query=%r: %s", mid, query, debug)
 
@@ -781,7 +799,10 @@ def format_report(monitor: dict, items: list[dict], day: dict, us: dict, error: 
     lines = [f"🔎 *Автопошук: {name}*", ""]
 
     if not items:
-        lines.append("😐 Сьогодні варіантів для перепродажу не знайшов: OLX не віддав придатних оголошень.")
+        if error == "search_failed":
+            lines.append("😐 Сьогодні варіантів для перепродажу не знайшов.")
+        else:
+            lines.append("😐 Сьогодні варіантів для перепродажу не знайшов: OLX не віддав придатних оголошень.")
         last_debug = (monitor.get("last_run") or {}).get("debug") or {}
         breakdown = format_debug_breakdown(last_debug)
         if breakdown:
@@ -838,7 +859,7 @@ def ikb_report(items: list[dict]) -> InlineKeyboardMarkup:
 async def send_report(bot, monitor: dict, error: str | None = None) -> int:
     mid = str(monitor["_id"])
     cutoff = (datetime.now() - timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
-    items = await resale_db.get_report_candidates(mid, cutoff, REPORT_SIZE)
+    items = await resale_db.get_report_candidates(mid, cutoff, _daily_target())
     day = await resale_db.day_stats(mid, datetime.now().strftime("%Y-%m-%d"))
     us = await resale_db.get_user_settings(monitor["uid"])
 
@@ -875,11 +896,11 @@ def format_scan_summary(res: dict, first: bool = False) -> str:
     )
     if res.get("selected_relaxed"):
         text += (
-            f"\nℹ️ За основними критеріями нічого не пройшло, але знайдено "
+            f"\nℹ️ За основними критеріями не вистачило, додано "
             f"{res['selected_relaxed']} варіант(и) після послаблення фільтрів — побачиш їх у звіті."
         )
     if res.get("selected_fallback"):
-        text += "\n🔸 Додав найкращий з наявних варіантів, щоб у звіті був хоча б один результат."
+        text += f"\n🔸 Додано ще {res['selected_fallback']} найкращих з наявних варіантів, щоб звіт був повнішим."
     if res.get("selected", 0) == 0 and not res.get("selected_relaxed") and not res.get("selected_fallback"):
         breakdown = format_debug_breakdown(res.get("debug") or {})
         if breakdown:
